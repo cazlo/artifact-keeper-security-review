@@ -6529,7 +6529,7 @@ paths:
       tags:
       - repository-labels
       summary: List all labels on a repository
-      operationId: list_labels
+      operationId: list_repo_labels
       parameters:
       - name: key
         in: path
@@ -6552,7 +6552,7 @@ paths:
       tags:
       - repository-labels
       summary: Set all labels on a repository (replaces existing)
-      operationId: set_labels
+      operationId: set_repo_labels
       parameters:
       - name: key
         in: path
@@ -6582,7 +6582,7 @@ paths:
       tags:
       - repository-labels
       summary: Add or update a single label
-      operationId: add_label
+      operationId: add_repo_label
       parameters:
       - name: key
         in: path
@@ -6617,7 +6617,7 @@ paths:
       tags:
       - repository-labels
       summary: Delete a label by key
-      operationId: delete_label
+      operationId: delete_repo_label
       parameters:
       - name: key
         in: path
@@ -8371,7 +8371,7 @@ paths:
       tags:
       - peers
       summary: List all sync policies
-      operationId: list_policies
+      operationId: list_sync_policies
       responses:
         '200':
           description: List of sync policies
@@ -8387,7 +8387,7 @@ paths:
       tags:
       - peers
       summary: Create a new sync policy
-      operationId: create_policy
+      operationId: create_sync_policy
       requestBody:
         content:
           application/json:
@@ -8431,7 +8431,7 @@ paths:
       tags:
       - peers
       summary: Preview what a policy would match (dry-run)
-      operationId: preview_policy
+      operationId: preview_sync_policy
       requestBody:
         content:
           application/json:
@@ -8454,7 +8454,7 @@ paths:
       tags:
       - peers
       summary: Get a sync policy by ID
-      operationId: get_policy
+      operationId: get_sync_policy
       parameters:
       - name: id
         in: path
@@ -8480,7 +8480,7 @@ paths:
       tags:
       - peers
       summary: Update a sync policy
-      operationId: update_policy
+      operationId: update_sync_policy
       parameters:
       - name: id
         in: path
@@ -8514,7 +8514,7 @@ paths:
       tags:
       - peers
       summary: Delete a sync policy
-      operationId: delete_policy
+      operationId: delete_sync_policy
       parameters:
       - name: id
         in: path
