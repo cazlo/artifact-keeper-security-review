@@ -14215,7 +14215,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UserResponse"
+                  "$ref": "#/components/schemas/AdminUserResponse"
                 }
               }
             }
@@ -14299,7 +14299,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UserResponse"
+                  "$ref": "#/components/schemas/AdminUserResponse"
                 }
               }
             }
@@ -15260,6 +15260,60 @@
               "null"
             ],
             "format": "int32"
+          }
+        }
+      },
+      "AdminUserResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "username",
+          "email",
+          "auth_provider",
+          "is_active",
+          "is_admin",
+          "must_change_password",
+          "created_at"
+        ],
+        "properties": {
+          "auth_provider": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "email": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "is_admin": {
+            "type": "boolean"
+          },
+          "last_login_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "must_change_password": {
+            "type": "boolean"
+          },
+          "username": {
+            "type": "string"
           }
         }
       },
@@ -18124,7 +18178,7 @@
             ]
           },
           "user": {
-            "$ref": "#/components/schemas/UserResponse"
+            "$ref": "#/components/schemas/AdminUserResponse"
           }
         }
       },
@@ -26175,7 +26229,7 @@
           "items": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/UserResponse"
+              "$ref": "#/components/schemas/AdminUserResponse"
             }
           },
           "pagination": {
