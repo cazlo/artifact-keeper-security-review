@@ -2347,6 +2347,42 @@
         ]
       }
     },
+    "/api/v1/admin/storage-gc": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "POST /api/v1/admin/storage-gc",
+        "operationId": "run_storage_gc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StorageGcRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "GC result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageGcResult"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/admin/telemetry/crashes": {
       "get": {
         "tags": [
@@ -3032,6 +3068,197 @@
             }
           }
         }
+      }
+    },
+    "/api/v1/artifacts/{id}/labels": {
+      "get": {
+        "tags": [
+          "artifact-labels"
+        ],
+        "summary": "List all labels on an artifact",
+        "operationId": "list_artifact_labels",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Artifact ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Labels retrieved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactLabelsListResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Artifact not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "artifact-labels"
+        ],
+        "summary": "Set all labels on an artifact (replaces existing)",
+        "operationId": "set_artifact_labels",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Artifact ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetArtifactLabelsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Labels updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactLabelsListResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Artifact not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/artifacts/{id}/labels/{label_key}": {
+      "post": {
+        "tags": [
+          "artifact-labels"
+        ],
+        "summary": "Add or update a single label on an artifact",
+        "operationId": "add_artifact_label",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Artifact ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "label_key",
+            "in": "path",
+            "description": "Label key to set",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddArtifactLabelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Label added/updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactLabelResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Artifact not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "artifact-labels"
+        ],
+        "summary": "Delete a label by key from an artifact",
+        "operationId": "delete_artifact_label",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Artifact ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "label_key",
+            "in": "path",
+            "description": "Label key to remove",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Label removed"
+          },
+          "404": {
+            "description": "Artifact not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
       }
     },
     "/api/v1/artifacts/{id}/metadata": {
@@ -13089,6 +13316,374 @@
         ]
       }
     },
+    "/api/v1/service-accounts": {
+      "get": {
+        "tags": [
+          "service_accounts"
+        ],
+        "summary": "List all service accounts",
+        "operationId": "list_service_accounts",
+        "responses": {
+          "200": {
+            "description": "List of service accounts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceAccountListResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not admin"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "service_accounts"
+        ],
+        "summary": "Create a new service account",
+        "operationId": "create_service_account",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateServiceAccountRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Service account created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceAccountResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "403": {
+            "description": "Not admin"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/service-accounts/repo-selector/preview": {
+      "post": {
+        "tags": [
+          "service_accounts"
+        ],
+        "summary": "Preview which repositories match a given repo selector.",
+        "description": "Does not create or modify anything. Useful for testing selectors before\nattaching them to a token.",
+        "operationId": "preview_repo_selector",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewRepoSelectorRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Matched repositories",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreviewRepoSelectorResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid selector"
+          },
+          "403": {
+            "description": "Not admin"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/service-accounts/{id}": {
+      "get": {
+        "tags": [
+          "service_accounts"
+        ],
+        "summary": "Get a service account by ID",
+        "operationId": "get_service_account",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Service account ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Service account details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceAccountResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "service_accounts"
+        ],
+        "summary": "Delete a service account",
+        "operationId": "delete_service_account",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Service account ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "service_accounts"
+        ],
+        "summary": "Update a service account",
+        "operationId": "update_service_account",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Service account ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateServiceAccountRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceAccountResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/service-accounts/{id}/tokens": {
+      "get": {
+        "tags": [
+          "service_accounts"
+        ],
+        "summary": "List tokens for a service account",
+        "operationId": "list_tokens",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Service account ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Token list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenListResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Service account not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "service_accounts"
+        ],
+        "summary": "Create a token for a service account",
+        "operationId": "create_token",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Service account ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Token created (value shown once)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateTokenResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Service account not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/service-accounts/{id}/tokens/{token_id}": {
+      "delete": {
+        "tags": [
+          "service_accounts"
+        ],
+        "summary": "Revoke a token from a service account",
+        "operationId": "revoke_token",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Service account ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "token_id",
+            "in": "path",
+            "description": "Token ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Token revoked"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/setup/status": {
       "get": {
         "tags": [
@@ -15201,6 +15796,14 @@
           }
         }
       },
+      "AddArtifactLabelRequest": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "string"
+          }
+        }
+      },
       "AddBuildArtifactsRequest": {
         "type": "object",
         "required": [
@@ -15677,6 +16280,16 @@
               "type": "string"
             }
           },
+          "match_tags": {
+            "type": "object",
+            "description": "Tag selectors (AND semantics). Key = tag key, value = required tag value.\nEmpty value means \"key must exist with any value\".",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "max_age_days": {
             "type": [
               "integer",
@@ -15773,6 +16386,69 @@
           "total_issues": {
             "type": "integer",
             "format": "int32"
+          }
+        }
+      },
+      "ArtifactLabelEntrySchema": {
+        "type": "object",
+        "required": [
+          "key"
+        ],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        }
+      },
+      "ArtifactLabelResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "artifact_id",
+          "key",
+          "value",
+          "created_at"
+        ],
+        "properties": {
+          "artifact_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        }
+      },
+      "ArtifactLabelsListResponse": {
+        "type": "object",
+        "required": [
+          "items",
+          "total"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ArtifactLabelResponse"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       },
@@ -16981,6 +17657,12 @@
               "boolean",
               "null"
             ]
+          },
+          "cleanup_stale_uploads": {
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         }
       },
@@ -16989,7 +17671,8 @@
         "required": [
           "audit_logs_deleted",
           "backups_deleted",
-          "peers_marked_offline"
+          "peers_marked_offline",
+          "stale_uploads_deleted"
         ],
         "properties": {
           "audit_logs_deleted": {
@@ -17001,6 +17684,10 @@
             "format": "int64"
           },
           "peers_marked_offline": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "stale_uploads_deleted": {
             "type": "integer",
             "format": "int64"
           }
@@ -17911,6 +18598,13 @@
           "format": {
             "type": "string"
           },
+          "format_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Custom format key for WASM plugin format handlers (e.g. \"rpm-custom\")."
+          },
           "is_public": {
             "type": [
               "boolean",
@@ -18078,6 +18772,25 @@
           }
         }
       },
+      "CreateServiceAccountRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description"
+          },
+          "name": {
+            "type": "string",
+            "description": "Name for the service account (will be prefixed with \"svc-\")"
+          }
+        }
+      },
       "CreateSyncPolicyPayload": {
         "type": "object",
         "required": [
@@ -18129,6 +18842,75 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "CreateTokenRequest": {
+        "type": "object",
+        "required": [
+          "name",
+          "scopes"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expires_in_days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "repo_selector": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Dynamic repository selector (match by labels, formats, name pattern).\nMutually exclusive with `repository_ids`. When set, matched repos are\nresolved at auth time so new repos that match the selector are picked up\nautomatically."
+          },
+          "repository_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Explicit repository IDs to restrict access to. Mutually exclusive with `repo_selector`."
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "CreateTokenResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "token",
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "token": {
+            "type": "string"
           }
         }
       },
@@ -19450,7 +20232,8 @@
           "created",
           "updated",
           "removed",
-          "policies_evaluated"
+          "policies_evaluated",
+          "retroactive_tasks_queued"
         ],
         "properties": {
           "created": {
@@ -19462,6 +20245,10 @@
             "minimum": 0
           },
           "removed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "retroactive_tasks_queued": {
             "type": "integer",
             "minimum": 0
           },
@@ -21153,6 +21940,27 @@
           }
         }
       },
+      "MatchedRepoResponse": {
+        "type": "object",
+        "description": "A single matched repository in the preview response.",
+        "required": [
+          "id",
+          "key",
+          "format"
+        ],
+        "properties": {
+          "format": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "key": {
+            "type": "string"
+          }
+        }
+      },
       "MatchedRepoSchema": {
         "type": "object",
         "required": [
@@ -22706,6 +23514,39 @@
           },
           "repo_selector": {
             "type": "object"
+          }
+        }
+      },
+      "PreviewRepoSelectorRequest": {
+        "type": "object",
+        "description": "Request body for previewing which repositories a selector matches.",
+        "required": [
+          "repo_selector"
+        ],
+        "properties": {
+          "repo_selector": {
+            "type": "object",
+            "description": "The repository selector to evaluate."
+          }
+        }
+      },
+      "PreviewRepoSelectorResponse": {
+        "type": "object",
+        "description": "Response for the repo selector preview endpoint.",
+        "required": [
+          "matched_repositories",
+          "total"
+        ],
+        "properties": {
+          "matched_repositories": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MatchedRepoResponse"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       },
@@ -24298,6 +25139,97 @@
           }
         }
       },
+      "ServiceAccountListResponse": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ServiceAccountSummaryResponse"
+            }
+          }
+        }
+      },
+      "ServiceAccountResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "username",
+          "is_active",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "username": {
+            "type": "string"
+          }
+        }
+      },
+      "ServiceAccountSummaryResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "username",
+          "is_active",
+          "token_count",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "token_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "username": {
+            "type": "string"
+          }
+        }
+      },
       "ServiceHealthEntry": {
         "type": "object",
         "description": "A health check result for a single service.",
@@ -24335,6 +25267,20 @@
           },
           "status": {
             "type": "string"
+          }
+        }
+      },
+      "SetArtifactLabelsRequest": {
+        "type": "object",
+        "required": [
+          "labels"
+        ],
+        "properties": {
+          "labels": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ArtifactLabelEntrySchema"
+            }
           }
         }
       },
@@ -24679,6 +25625,50 @@
               "integer",
               "null"
             ],
+            "format": "int64"
+          }
+        }
+      },
+      "StorageGcRequest": {
+        "type": "object",
+        "description": "Request body for storage GC.",
+        "properties": {
+          "dry_run": {
+            "type": "boolean",
+            "description": "When true, report what would be deleted without actually deleting."
+          }
+        }
+      },
+      "StorageGcResult": {
+        "type": "object",
+        "description": "Result of a storage GC run.",
+        "required": [
+          "dry_run",
+          "storage_keys_deleted",
+          "artifacts_removed",
+          "bytes_freed",
+          "errors"
+        ],
+        "properties": {
+          "artifacts_removed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "bytes_freed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "storage_keys_deleted": {
+            "type": "integer",
             "format": "int64"
           }
         }
@@ -25157,6 +26147,86 @@
         "properties": {
           "enabled": {
             "type": "boolean"
+          }
+        }
+      },
+      "TokenInfoResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "token_prefix",
+          "scopes",
+          "created_at",
+          "is_expired",
+          "repository_ids"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "is_expired": {
+            "type": "boolean"
+          },
+          "last_used_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "name": {
+            "type": "string"
+          },
+          "repo_selector": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Dynamic repository selector, if configured."
+          },
+          "repository_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Explicit repository IDs this token is restricted to (from join table)."
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "token_prefix": {
+            "type": "string"
+          }
+        }
+      },
+      "TokenListResponse": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TokenInfoResponse"
+            }
           }
         }
       },
@@ -26019,6 +27089,23 @@
           }
         }
       },
+      "UpdateServiceAccountRequest": {
+        "type": "object",
+        "properties": {
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_active": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
       "UpdateSigningConfigPayload": {
         "type": "object",
         "properties": {
@@ -26639,6 +27726,10 @@
       "description": "Artifact health scoring and quality gates"
     },
     {
+      "name": "service_accounts",
+      "description": "Service account management"
+    },
+    {
       "name": "health",
       "description": "Health and readiness checks"
     },
@@ -26649,6 +27740,10 @@
     {
       "name": "peer-instance-labels",
       "description": "Peer instance label management"
+    },
+    {
+      "name": "artifact-labels",
+      "description": "Artifact label management"
     }
   ]
 }
