@@ -1204,6 +1204,31 @@
         ]
       }
     },
+    "/api/v1/admin/search/reindex": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Trigger a full reindex of all artifacts and repositories in Meilisearch.",
+        "description": "The reindex runs asynchronously in the background. The endpoint returns\nimmediately with a confirmation that the task was started.",
+        "operationId": "trigger_reindex",
+        "responses": {
+          "200": {
+            "description": "Reindex started in background",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReindexResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Meilisearch is not configured"
+          }
+        }
+      }
+    },
     "/api/v1/admin/settings": {
       "get": {
         "tags": [
@@ -10809,6 +10834,95 @@
         ]
       }
     },
+    "/api/v1/repositories/{key}/cache-ttl": {
+      "get": {
+        "tags": [
+          "repositories"
+        ],
+        "summary": "Get the proxy cache TTL for a repository",
+        "operationId": "get_cache_ttl",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Repository key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current cache TTL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CacheTtlResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Repository not found"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "repositories"
+        ],
+        "summary": "Set the proxy cache TTL for a repository",
+        "operationId": "set_cache_ttl",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Repository key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetCacheTtlRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Cache TTL updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CacheTtlResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid TTL value"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "404": {
+            "description": "Repository not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/repositories/{key}/download/{path}": {
       "get": {
         "tags": [
@@ -17273,6 +17387,22 @@
           }
         }
       },
+      "CacheTtlResponse": {
+        "type": "object",
+        "required": [
+          "repository_key",
+          "cache_ttl_seconds"
+        ],
+        "properties": {
+          "cache_ttl_seconds": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "repository_key": {
+            "type": "string"
+          }
+        }
+      },
       "ChangePasswordRequest": {
         "type": "object",
         "required": [
@@ -21540,6 +21670,12 @@
             "type": "string",
             "format": "date-time"
           },
+          "cron_schedule": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "description": {
             "type": [
               "string",
@@ -23981,22 +24117,17 @@
       },
       "ReindexResponse": {
         "type": "object",
+        "description": "Response returned when a reindex is triggered.",
         "required": [
-          "message",
-          "artifacts_indexed",
-          "repositories_indexed"
+          "status",
+          "message"
         ],
         "properties": {
-          "artifacts_indexed": {
-            "type": "integer",
-            "format": "int64"
-          },
           "message": {
             "type": "string"
           },
-          "repositories_indexed": {
-            "type": "integer",
-            "format": "int64"
+          "status": {
+            "type": "string"
           }
         }
       },
@@ -25284,6 +25415,18 @@
           }
         }
       },
+      "SetCacheTtlRequest": {
+        "type": "object",
+        "required": [
+          "cache_ttl_seconds"
+        ],
+        "properties": {
+          "cache_ttl_seconds": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
       "SetLabelsRequest": {
         "type": "object",
         "required": [
@@ -25893,6 +26036,8 @@
       "SystemSettings": {
         "type": "object",
         "required": [
+          "storage_backend",
+          "storage_path",
           "allow_anonymous_download",
           "max_upload_size_bytes",
           "retention_days",
@@ -25923,6 +26068,12 @@
           "retention_days": {
             "type": "integer",
             "format": "int32"
+          },
+          "storage_backend": {
+            "type": "string"
+          },
+          "storage_path": {
+            "type": "string"
           }
         }
       },
