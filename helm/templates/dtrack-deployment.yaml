@@ -17,6 +17,8 @@ metadata:
     app.kubernetes.io/component: dependency-track
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "artifact-keeper.dtrack.selectorLabels" . | nindent 6 }}
@@ -41,10 +43,27 @@ spec:
       topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
       {{- if .Values.postgres.enabled }}
       initContainers:
         - name: wait-for-postgres
           image: {{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
           command: ["/bin/sh", "-c"]
           args:
             - |
@@ -58,6 +77,12 @@ spec:
         - name: dtrack-api
           image: "{{ .Values.dependencyTrack.image.repository }}:{{ .Values.dependencyTrack.image.tag }}"
           imagePullPolicy: IfNotPresent
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           ports:
             - name: http
               containerPort: 8080
@@ -113,7 +138,12 @@ spec:
           volumeMounts:
             - name: dtrack-data
               mountPath: /data
+            - name: tmp
+              mountPath: /tmp
       volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
         - name: dtrack-data
           persistentVolumeClaim:
             claimName: {{ include "artifact-keeper.fullname" . }}-dtrack
@@ -237,9 +267,25 @@ spec:
       topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
       containers:
         - name: dtrack-init
           image: alpine:3.20
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
           command: ["/bin/sh", "-c"]
           args:
             - |

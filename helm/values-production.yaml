@@ -36,6 +36,15 @@ backend:
   serviceAccount:
     annotations:
       eks.amazonaws.com/role-arn: ""  # Set to IRSA role ARN
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/component: backend
+            topologyKey: kubernetes.io/hostname
 
 web:
   replicaCount: 3
@@ -48,10 +57,25 @@ web:
     limits:
       cpu: "2"
       memory: 2Gi
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/component: web
+            topologyKey: kubernetes.io/hostname
 
 edge:
   enabled: true
   replicaCount: 2
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
 
 # Disable in-cluster postgres — use RDS
 postgres:
@@ -118,6 +142,21 @@ secrets:
   jwtSecret: ""
   s3AccessKey: ""
   s3SecretKey: ""
+
+# External Secrets Operator pulls secrets from AWS Secrets Manager.
+# The RDS module already stores the DB password in Secrets Manager,
+# so this extends that pattern to all application secrets.
+externalSecrets:
+  enabled: true
+  storeName: aws-secrets-manager
+  storeKind: ClusterSecretStore
+  refreshInterval: 1h
+  secrets:
+    jwtSecret: artifact-keeper/production/jwt-secret
+    dbCredentials: artifact-keeper/production/db-credentials
+    s3Keys: artifact-keeper/production/s3-keys
+    meilisearchKey: artifact-keeper/production/meilisearch-key
+    dtAdminPassword: artifact-keeper/production/dt-admin-password
 
 networkPolicy:
   enabled: true

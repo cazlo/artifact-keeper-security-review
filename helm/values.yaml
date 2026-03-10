@@ -153,7 +153,11 @@ web:
     limits:
       cpu: "1"
       memory: 1Gi
+      ephemeral-storage: 2Gi
 
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
   # -- Per-component scheduling (overrides global)
   tolerations: []
   affinity: {}
@@ -184,6 +188,9 @@ edge:
     limits:
       cpu: 500m
       memory: 512Mi
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
   # -- Per-component scheduling (overrides global)
   tolerations: []
   affinity: {}
@@ -348,6 +355,27 @@ secrets:
   jwtSecret: "dev-secret-change-in-production"
   s3AccessKey: "minioadmin"
   s3SecretKey: "minioadmin-secret"
+
+# -- External Secrets Operator
+# When enabled, ExternalSecret CRDs replace the static Secret template.
+# Requires External Secrets Operator installed on the cluster and a
+# SecretStore or ClusterSecretStore configured for your provider.
+externalSecrets:
+  enabled: false
+  # Name of the SecretStore or ClusterSecretStore to reference.
+  # If storeKind is ClusterSecretStore, the store must already exist.
+  storeName: aws-secrets-manager
+  storeKind: ClusterSecretStore
+  # Refresh interval for syncing secrets from the provider
+  refreshInterval: 1h
+  # AWS Secrets Manager paths for each secret. These must match the
+  # secret names in your AWS Secrets Manager configuration.
+  secrets:
+    jwtSecret: artifact-keeper/${ENVIRONMENT}/jwt-secret
+    dbCredentials: artifact-keeper/${ENVIRONMENT}/db-credentials
+    s3Keys: artifact-keeper/${ENVIRONMENT}/s3-keys
+    meilisearchKey: artifact-keeper/${ENVIRONMENT}/meilisearch-key
+    dtAdminPassword: artifact-keeper/${ENVIRONMENT}/dt-admin-password
 
 # -- Network policies
 networkPolicy:
