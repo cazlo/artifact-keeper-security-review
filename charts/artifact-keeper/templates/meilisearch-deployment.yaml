@@ -59,6 +59,9 @@ spec:
             capabilities:
               drop:
                 - ALL
+              add:
+                - CHOWN
+                - FOWNER
           resources:
             requests:
               cpu: 10m
