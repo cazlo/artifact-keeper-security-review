@@ -78,6 +78,8 @@ const defaultProps = {
   editRepo: null,
   onEditSubmit: vi.fn(),
   editPending: false,
+  onUpstreamAuthUpdate: vi.fn(),
+  upstreamAuthPending: false,
   deleteOpen: false,
   onDeleteOpenChange: vi.fn(),
   deleteRepo: null,
@@ -460,5 +462,406 @@ describe('RepoDialogs - Delete Dialog', () => {
     const confirmDialog = screen.getByTestId('confirm-dialog');
     fireEvent.click(within(confirmDialog).getByRole('button', { name: /confirm delete/i }));
     expect(onDeleteConfirm).toHaveBeenCalledWith('test-repo');
+  });
+});
+
+describe('RepoDialogs - Upstream Auth (Create)', () => {
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it('shows upstream auth section when remote type is selected', () => {
+    render(<RepoDialogs {...defaultProps} />);
+
+    const dialog = screen.getByRole('dialog');
+    const selects = within(dialog).getAllByTestId('mock-select');
+    fireEvent.change(selects[1], { target: { value: 'remote' } });
+
+    expect(within(dialog).getByText('Upstream Authentication')).toBeTruthy();
+  });
+
+  it('does not show upstream auth section for local type', () => {
+    render(<RepoDialogs {...defaultProps} />);
+
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).queryByText('Upstream Authentication')).toBeNull();
+  });
+
+  it('shows username and password fields when basic auth is selected', () => {
+    render(<RepoDialogs {...defaultProps} />);
+
+    const dialog = screen.getByRole('dialog');
+    const selects = within(dialog).getAllByTestId('mock-select');
+    fireEvent.change(selects[1], { target: { value: 'remote' } });
+
+    // After switching to remote, re-query selects: Format=0, Type=1, AuthType=2
+    const updatedSelects = within(dialog).getAllByTestId('mock-select');
+    fireEvent.change(updatedSelects[2], { target: { value: 'basic' } });
+
+    expect(within(dialog).getByPlaceholderText('Username')).toBeTruthy();
+    expect(within(dialog).getByPlaceholderText('Password or access token')).toBeTruthy();
+  });
+
+  it('shows only token field when bearer auth is selected', () => {
+    render(<RepoDialogs {...defaultProps} />);
+
+    const dialog = screen.getByRole('dialog');
+    const selects = within(dialog).getAllByTestId('mock-select');
+    fireEvent.change(selects[1], { target: { value: 'remote' } });
+
+    const updatedSelects = within(dialog).getAllByTestId('mock-select');
+    fireEvent.change(updatedSelects[2], { target: { value: 'bearer' } });
+
+    expect(within(dialog).getByPlaceholderText('Bearer token')).toBeTruthy();
+    expect(within(dialog).queryByPlaceholderText('Username')).toBeNull();
+  });
+
+  it('includes auth fields in submit data for basic auth', async () => {
+    const onCreateSubmit = vi.fn();
+    const user = userEvent.setup();
+    render(<RepoDialogs {...defaultProps} onCreateSubmit={onCreateSubmit} />);
+
+    const dialog = screen.getByRole('dialog');
+    await user.type(within(dialog).getByPlaceholderText('my-repo'), 'auth-test');
+    await user.type(within(dialog).getByPlaceholderText('My Repository'), 'Auth Test');
+
+    // Select remote type
+    const selects = within(dialog).getAllByTestId('mock-select');
+    fireEvent.change(selects[1], { target: { value: 'remote' } });
+
+    // Fill upstream URL
+    await user.type(within(dialog).getByPlaceholderText('https://registry.npmjs.org'), 'https://example.com');
+
+    // Select basic auth
+    const updatedSelects = within(dialog).getAllByTestId('mock-select');
+    fireEvent.change(updatedSelects[2], { target: { value: 'basic' } });
+
+    // Fill auth fields
+    await user.type(within(dialog).getByPlaceholderText('Username'), 'myuser');
+    await user.type(within(dialog).getByPlaceholderText('Password or access token'), 'mypass');
+
+    // Submit
+    await user.click(within(dialog).getByRole('button', { name: /^create$/i }));
+
+    expect(onCreateSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        upstream_auth_type: 'basic',
+        upstream_username: 'myuser',
+        upstream_password: 'mypass',
+      })
+    );
+  });
+
+  it('does not include auth fields when auth type is none', async () => {
+    const onCreateSubmit = vi.fn();
+    const user = userEvent.setup();
+    render(<RepoDialogs {...defaultProps} onCreateSubmit={onCreateSubmit} />);
+
+    const dialog = screen.getByRole('dialog');
+    await user.type(within(dialog).getByPlaceholderText('my-repo'), 'no-auth');
+    await user.type(within(dialog).getByPlaceholderText('My Repository'), 'No Auth');
+
+    // Select remote type
+    const selects = within(dialog).getAllByTestId('mock-select');
+    fireEvent.change(selects[1], { target: { value: 'remote' } });
+
+    // Fill upstream URL
+    await user.type(within(dialog).getByPlaceholderText('https://registry.npmjs.org'), 'https://example.com');
+
+    // Leave auth as "none" (default), submit
+    await user.click(within(dialog).getByRole('button', { name: /^create$/i }));
+
+    expect(onCreateSubmit).toHaveBeenCalledTimes(1);
+    const submitData = onCreateSubmit.mock.calls[0][0];
+    expect(submitData.upstream_auth_type).toBeUndefined();
+    expect(submitData.upstream_username).toBeUndefined();
+    expect(submitData.upstream_password).toBeUndefined();
+  });
+
+  it('resets auth fields when switching from remote to local', () => {
+    render(<RepoDialogs {...defaultProps} />);
+
+    const dialog = screen.getByRole('dialog');
+    const selects = within(dialog).getAllByTestId('mock-select');
+    // Switch to remote
+    fireEvent.change(selects[1], { target: { value: 'remote' } });
+
+    // Select basic auth
+    const remoteSelects = within(dialog).getAllByTestId('mock-select');
+    fireEvent.change(remoteSelects[2], { target: { value: 'basic' } });
+
+    // Verify fields appear
+    expect(within(dialog).getByPlaceholderText('Username')).toBeTruthy();
+
+    // Switch back to local
+    const selectsAgain = within(dialog).getAllByTestId('mock-select');
+    fireEvent.change(selectsAgain[1], { target: { value: 'local' } });
+
+    // Switch back to remote
+    const selectsLocal = within(dialog).getAllByTestId('mock-select');
+    fireEvent.change(selectsLocal[1], { target: { value: 'remote' } });
+
+    // Auth type should be back to "none", no username/password fields
+    expect(within(dialog).queryByPlaceholderText('Username')).toBeNull();
+    expect(within(dialog).queryByPlaceholderText('Password or access token')).toBeNull();
+    expect(within(dialog).queryByPlaceholderText('Bearer token')).toBeNull();
+  });
+});
+
+const mockRemoteEditRepo = {
+  ...mockEditRepo,
+  key: 'remote-repo',
+  name: 'Remote Repo',
+  repo_type: 'remote' as const,
+  upstream_url: 'https://registry.npmjs.org',
+  upstream_auth_configured: true,
+  upstream_auth_type: 'basic' as string | null,
+};
+
+describe('RepoDialogs - Upstream Auth (Edit)', () => {
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it('shows auth configured indicator for remote repo with auth', () => {
+    render(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={true}
+        editRepo={mockRemoteEditRepo}
+      />
+    );
+
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByText(/authentication configured/i)).toBeTruthy();
+  });
+
+  it('shows change and remove buttons when auth is configured', () => {
+    render(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={true}
+        editRepo={mockRemoteEditRepo}
+      />
+    );
+
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByRole('button', { name: /^change$/i })).toBeTruthy();
+    expect(within(dialog).getByRole('button', { name: /^remove$/i })).toBeTruthy();
+  });
+
+  it('calls onUpstreamAuthUpdate with none after remove confirmation', () => {
+    const onUpstreamAuthUpdate = vi.fn();
+    render(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={true}
+        editRepo={mockRemoteEditRepo}
+        onUpstreamAuthUpdate={onUpstreamAuthUpdate}
+      />
+    );
+
+    const dialog = screen.getByRole('dialog');
+    // First click shows the confirmation
+    fireEvent.click(within(dialog).getByRole('button', { name: /^remove$/i }));
+    expect(onUpstreamAuthUpdate).not.toHaveBeenCalled();
+    // Confirm the removal
+    fireEvent.click(within(dialog).getByRole('button', { name: /confirm remove/i }));
+    expect(onUpstreamAuthUpdate).toHaveBeenCalledWith('remote-repo', { auth_type: 'none' });
+  });
+
+  it('shows configure button when no auth is configured', () => {
+    render(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={true}
+        editRepo={{ ...mockRemoteEditRepo, upstream_auth_configured: false, upstream_auth_type: null }}
+      />
+    );
+
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByText(/no authentication configured/i)).toBeTruthy();
+    expect(within(dialog).getByRole('button', { name: /configure/i })).toBeTruthy();
+  });
+
+  it('shows auth form when change button is clicked', async () => {
+    const user = userEvent.setup();
+    render(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={true}
+        editRepo={mockRemoteEditRepo}
+      />
+    );
+
+    const dialog = screen.getByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: /^change$/i }));
+
+    // Should now show the auth type select and save button
+    expect(within(dialog).getByRole('button', { name: /save authentication/i })).toBeTruthy();
+  });
+
+  it('calls onUpstreamAuthUpdate with basic auth payload on save', async () => {
+    const onUpstreamAuthUpdate = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={true}
+        editRepo={{ ...mockRemoteEditRepo, upstream_auth_configured: false, upstream_auth_type: null }}
+        onUpstreamAuthUpdate={onUpstreamAuthUpdate}
+      />
+    );
+
+    const dialog = screen.getByRole('dialog');
+    // Click Configure to enter edit mode
+    await user.click(within(dialog).getByRole('button', { name: /configure/i }));
+
+    // Select basic auth
+    const selects = within(dialog).getAllByTestId('mock-select');
+    // In edit dialog, the auth select is the only mock-select
+    const authSelect = selects[0];
+    fireEvent.change(authSelect, { target: { value: 'basic' } });
+
+    // Fill in credentials
+    await user.type(within(dialog).getByPlaceholderText('Username'), 'newuser');
+    await user.type(within(dialog).getByPlaceholderText('Password or access token'), 'newpass');
+
+    // Save
+    await user.click(within(dialog).getByRole('button', { name: /save authentication/i }));
+
+    expect(onUpstreamAuthUpdate).toHaveBeenCalledWith('remote-repo', {
+      auth_type: 'basic',
+      username: 'newuser',
+      password: 'newpass',
+    });
+  });
+
+  it('does not show upstream auth section for local repo in edit', () => {
+    render(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={true}
+        editRepo={mockEditRepo}
+      />
+    );
+
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).queryByText('Upstream Authentication')).toBeNull();
+  });
+
+  it('calls onUpstreamAuthUpdate with bearer auth payload on save', async () => {
+    const onUpstreamAuthUpdate = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={true}
+        editRepo={{ ...mockRemoteEditRepo, upstream_auth_configured: false, upstream_auth_type: null }}
+        onUpstreamAuthUpdate={onUpstreamAuthUpdate}
+      />
+    );
+
+    const dialog = screen.getByRole('dialog');
+    // Click Configure to enter edit mode
+    await user.click(within(dialog).getByRole('button', { name: /configure/i }));
+
+    // Select bearer auth
+    const selects = within(dialog).getAllByTestId('mock-select');
+    const authSelect = selects[0];
+    fireEvent.change(authSelect, { target: { value: 'bearer' } });
+
+    // Fill in bearer token
+    await user.type(within(dialog).getByPlaceholderText('Bearer token'), 'my-secret-token');
+
+    // Save
+    await user.click(within(dialog).getByRole('button', { name: /save authentication/i }));
+
+    expect(onUpstreamAuthUpdate).toHaveBeenCalledWith('remote-repo', {
+      auth_type: 'bearer',
+      password: 'my-secret-token',
+    });
+  });
+
+  it('returns to view mode and resets fields when cancel is clicked in edit auth form', async () => {
+    const user = userEvent.setup();
+    render(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={true}
+        editRepo={mockRemoteEditRepo}
+      />
+    );
+
+    const dialog = screen.getByRole('dialog');
+    // Click Change to enter edit mode
+    await user.click(within(dialog).getByRole('button', { name: /^change$/i }));
+
+    // Verify we are in edit mode (save button visible)
+    expect(within(dialog).getByRole('button', { name: /save authentication/i })).toBeTruthy();
+
+    // Click the auth form Cancel (size=sm), not the dialog footer Cancel.
+    // There are two Cancel buttons; the auth form one has data-size="sm".
+    const cancelButtons = within(dialog).getAllByRole('button', { name: /^cancel$/i });
+    const authCancelBtn = cancelButtons.find((btn) => btn.getAttribute('data-size') === 'sm');
+    expect(authCancelBtn).toBeTruthy();
+    await user.click(authCancelBtn!);
+
+    // Should be back in view mode: Change and Remove buttons visible
+    expect(within(dialog).getByRole('button', { name: /^change$/i })).toBeTruthy();
+    expect(within(dialog).getByRole('button', { name: /^remove$/i })).toBeTruthy();
+    // Save button should be gone
+    expect(within(dialog).queryByRole('button', { name: /save authentication/i })).toBeNull();
+  });
+
+  it('resets auth state when edit dialog is closed and reopened', async () => {
+    const onEditOpenChange = vi.fn();
+    const user = userEvent.setup();
+
+    const { unmount } = render(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={true}
+        editRepo={mockRemoteEditRepo}
+        onEditOpenChange={onEditOpenChange}
+      />
+    );
+
+    const dialog = screen.getByRole('dialog');
+    // Enter edit auth mode
+    await user.click(within(dialog).getByRole('button', { name: /^change$/i }));
+    expect(within(dialog).getByRole('button', { name: /save authentication/i })).toBeTruthy();
+
+    // Unmount to simulate dialog closing (the Dialog onOpenChange resets state)
+    unmount();
+
+    // Re-mount with editOpen=true to simulate reopening
+    // The component creates fresh state on mount, so auth mode should be "view"
+    render(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={true}
+        editRepo={mockRemoteEditRepo}
+        onEditOpenChange={onEditOpenChange}
+      />
+    );
+
+    // Should be in view mode (not edit mode), meaning Change button is present
+    const reopenedDialog = screen.getByRole('dialog');
+    expect(within(reopenedDialog).getByRole('button', { name: /^change$/i })).toBeTruthy();
+    expect(within(reopenedDialog).queryByRole('button', { name: /save authentication/i })).toBeNull();
   });
 });
