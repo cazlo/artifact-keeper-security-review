@@ -1,8 +1,9 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback } from "react";
 import type { Repository, CreateRepositoryRequest, RepositoryFormat, RepositoryType, VirtualRepoMemberInput } from "@/types";
 import { FORMAT_OPTIONS, TYPE_OPTIONS } from "../_lib/constants";
+import { DEFAULT_UPSTREAM_URLS } from "../_lib/default-upstream-urls";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -110,6 +111,23 @@ export function RepoDialogs({
   const [upstreamAuthType, setUpstreamAuthType] = useState<string>("none");
   const [upstreamUsername, setUpstreamUsername] = useState("");
   const [upstreamPassword, setUpstreamPassword] = useState("");
+
+  /**
+   * Suggest a default upstream URL when the repo type is "remote".
+   * Only auto-fills if the current URL is empty or matches a known default
+   * (i.e. the user hasn't typed a custom value).
+   */
+  const maybeSetDefaultUpstreamUrl = useCallback(
+    (format: string, repoType: string, currentUrl: string) => {
+      if (repoType !== "remote") return;
+      const defaultUrl = DEFAULT_UPSTREAM_URLS[format] ?? "";
+      const isDefault = currentUrl === "" || Object.values(DEFAULT_UPSTREAM_URLS).includes(currentUrl);
+      if (isDefault && defaultUrl) {
+        setCreateForm((f) => ({ ...f, upstream_url: defaultUrl }));
+      }
+    },
+    []
+  );
 
   // Upstream auth state for edit dialog
   const [editAuthMode, setEditAuthMode] = useState<"view" | "edit">("view");
@@ -270,12 +288,13 @@ export function RepoDialogs({
                 <Label>Format</Label>
                 <Select
                   value={createForm.format}
-                  onValueChange={(v) =>
+                  onValueChange={(v) => {
                     setCreateForm((f) => ({
                       ...f,
                       format: v as RepositoryFormat,
-                    }))
-                  }
+                    }));
+                    maybeSetDefaultUpstreamUrl(v, createForm.repo_type, createForm.upstream_url ?? "");
+                  }}
                 >
                   <SelectTrigger className="w-full">
                     <SelectValue />
@@ -298,6 +317,7 @@ export function RepoDialogs({
                       ...f,
                       repo_type: v as RepositoryType,
                     }));
+                    maybeSetDefaultUpstreamUrl(createForm.format, v, createForm.upstream_url ?? "");
                     if (v !== "remote") {
                       setUpstreamAuthType("none");
                       setUpstreamUsername("");
@@ -331,7 +351,7 @@ export function RepoDialogs({
                 <Label htmlFor="create-upstream">Upstream URL</Label>
                 <Input
                   id="create-upstream"
-                  placeholder="https://registry.npmjs.org"
+                  placeholder={DEFAULT_UPSTREAM_URLS[createForm.format] ?? "https://upstream-registry.example.com"}
                   value={createForm.upstream_url || ""}
                   onChange={(e) =>
                     setCreateForm((f) => ({ ...f, upstream_url: e.target.value }))

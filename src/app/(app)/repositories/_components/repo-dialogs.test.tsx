@@ -269,8 +269,9 @@ describe('RepoDialogs - Create Dialog', () => {
     const selects = within(dialog).getAllByTestId('mock-select');
     fireEvent.change(selects[1], { target: { value: 'remote' } });
 
-    // Fill upstream URL
-    const urlInput = screen.getByPlaceholderText('https://registry.npmjs.org');
+    // Fill upstream URL (clear auto-filled default first)
+    const urlInput = within(dialog).getByLabelText(/upstream url/i);
+    await user.clear(urlInput);
     await user.type(urlInput, 'https://repo.example.com');
 
     await user.click(within(dialog).getByRole('button', { name: /^create$/i }));
@@ -531,7 +532,8 @@ describe('RepoDialogs - Upstream Auth (Create)', () => {
     fireEvent.change(selects[1], { target: { value: 'remote' } });
 
     // Fill upstream URL
-    await user.type(within(dialog).getByPlaceholderText('https://registry.npmjs.org'), 'https://example.com');
+    await user.clear(within(dialog).getByLabelText(/upstream url/i));
+    await user.type(within(dialog).getByLabelText(/upstream url/i), 'https://example.com');
 
     // Select basic auth
     const updatedSelects = within(dialog).getAllByTestId('mock-select');
@@ -567,7 +569,8 @@ describe('RepoDialogs - Upstream Auth (Create)', () => {
     fireEvent.change(selects[1], { target: { value: 'remote' } });
 
     // Fill upstream URL
-    await user.type(within(dialog).getByPlaceholderText('https://registry.npmjs.org'), 'https://example.com');
+    await user.clear(within(dialog).getByLabelText(/upstream url/i));
+    await user.type(within(dialog).getByLabelText(/upstream url/i), 'https://example.com');
 
     // Leave auth as "none" (default), submit
     await user.click(within(dialog).getByRole('button', { name: /^create$/i }));
@@ -1334,6 +1337,370 @@ describe('RepoDialogs - Upstream Auth Edge Cases', () => {
     );
 
     // Close and reopen the dialog to verify state reset
+    rerender(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={false}
+        editRepo={mockRemoteEditRepo}
+        onEditOpenChange={onEditOpenChange}
+      />
+    );
+
+    rerender(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={true}
+        editRepo={mockRemoteEditRepo}
+        onEditOpenChange={onEditOpenChange}
+      />
+    );
+
+    const dialog = screen.getByRole('dialog');
+    // Should be in view mode, not edit mode
+    expect(within(dialog).getByRole('button', { name: /^change$/i })).toBeTruthy();
+  });
+});
+describe('RepoDialogs - Default Upstream URL', () => {
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it('auto-fills upstream URL when switching to remote type with maven format', () => {
+    render(<RepoDialogs {...defaultProps} />);
+
+    const dialog = screen.getByRole('dialog');
+    const selects = within(dialog).getAllByTestId('mock-select');
+
+    // Change format to maven
+    fireEvent.change(selects[0], { target: { value: 'maven' } });
+    // Change type to remote
+    fireEvent.change(selects[1], { target: { value: 'remote' } });
+
+    const urlInput = within(dialog).getByLabelText(/upstream url/i) as HTMLInputElement;
+    expect(urlInput.value).toBe('https://repo.maven.apache.org/maven2');
+  });
+
+  it('updates upstream URL when format changes while type is remote', () => {
+    render(<RepoDialogs {...defaultProps} />);
+
+    const dialog = screen.getByRole('dialog');
+    const selects = within(dialog).getAllByTestId('mock-select');
+
+    // Set type to remote first (format is generic, no default URL)
+    fireEvent.change(selects[1], { target: { value: 'remote' } });
+
+    // Change format to npm
+    const updatedSelects = within(dialog).getAllByTestId('mock-select');
+    fireEvent.change(updatedSelects[0], { target: { value: 'npm' } });
+
+    const urlInput = within(dialog).getByLabelText(/upstream url/i) as HTMLInputElement;
+    expect(urlInput.value).toBe('https://registry.npmjs.org');
+
+    // Change format to pypi
+    const latestSelects = within(dialog).getAllByTestId('mock-select');
+    fireEvent.change(latestSelects[0], { target: { value: 'pypi' } });
+
+    expect(urlInput.value).toBe('https://pypi.org/simple');
+  });
+
+  it('does not overwrite user-modified URL when format changes', async () => {
+    const user = userEvent.setup();
+    render(<RepoDialogs {...defaultProps} />);
+
+    const dialog = screen.getByRole('dialog');
+    const selects = within(dialog).getAllByTestId('mock-select');
+
+    // Set format to npm and type to remote (auto-fills npm URL)
+    fireEvent.change(selects[0], { target: { value: 'npm' } });
+    fireEvent.change(selects[1], { target: { value: 'remote' } });
+
+    const urlInput = within(dialog).getByLabelText(/upstream url/i) as HTMLInputElement;
+    expect(urlInput.value).toBe('https://registry.npmjs.org');
+
+    // User manually types a custom URL
+    await user.clear(urlInput);
+    await user.type(urlInput, 'https://my-private-npm.example.com');
+    expect(urlInput.value).toBe('https://my-private-npm.example.com');
+
+    // Change format to pypi - should NOT overwrite the custom URL
+    const latestSelects = within(dialog).getAllByTestId('mock-select');
+    fireEvent.change(latestSelects[0], { target: { value: 'pypi' } });
+
+    expect(urlInput.value).toBe('https://my-private-npm.example.com');
+  });
+
+  it('shows format-specific placeholder on the upstream URL input', () => {
+    render(<RepoDialogs {...defaultProps} />);
+
+    const dialog = screen.getByRole('dialog');
+    const selects = within(dialog).getAllByTestId('mock-select');
+
+    // Set format to docker and type to remote
+    fireEvent.change(selects[0], { target: { value: 'docker' } });
+    fireEvent.change(selects[1], { target: { value: 'remote' } });
+
+    const urlInput = within(dialog).getByLabelText(/upstream url/i) as HTMLInputElement;
+    expect(urlInput.placeholder).toBe('https://registry-1.docker.io');
+  });
+
+  it('uses fallback placeholder for formats without a default URL', () => {
+    render(<RepoDialogs {...defaultProps} />);
+
+    const dialog = screen.getByRole('dialog');
+    const selects = within(dialog).getAllByTestId('mock-select');
+
+    // generic format has no default URL
+    fireEvent.change(selects[1], { target: { value: 'remote' } });
+
+    const urlInput = within(dialog).getByLabelText(/upstream url/i) as HTMLInputElement;
+    expect(urlInput.placeholder).toBe('https://upstream-registry.example.com');
+  });
+});
+
+describe('RepoDialogs - Virtual Member Selection', () => {
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it('selects and deselects virtual member repos via checkbox', async () => {
+    const onCreateSubmit = vi.fn();
+    const user = userEvent.setup();
+    const localRepo = {
+      ...mockEditRepo,
+      key: 'local-1',
+      name: 'Local 1',
+      format: 'generic' as const,
+      repo_type: 'local' as const,
+    };
+    const remoteRepo = {
+      ...mockEditRepo,
+      key: 'remote-1',
+      name: 'Remote 1',
+      format: 'generic' as const,
+      repo_type: 'remote' as const,
+    };
+
+    render(
+      <RepoDialogs
+        {...defaultProps}
+        onCreateSubmit={onCreateSubmit}
+        availableRepos={[localRepo, remoteRepo]}
+      />
+    );
+
+    const dialog = screen.getByRole('dialog');
+    const selects = within(dialog).getAllByTestId('mock-select');
+
+    // Set format to generic and type to virtual
+    fireEvent.change(selects[0], { target: { value: 'generic' } });
+    fireEvent.change(selects[1], { target: { value: 'virtual' } });
+
+    // Select first member
+    const checkboxes = within(dialog).getAllByRole('checkbox');
+    await user.click(checkboxes[0]);
+    expect((checkboxes[0] as HTMLInputElement).checked).toBe(true);
+
+    // Select second member
+    await user.click(checkboxes[1]);
+    expect((checkboxes[1] as HTMLInputElement).checked).toBe(true);
+
+    // Deselect first member
+    await user.click(checkboxes[0]);
+    expect((checkboxes[0] as HTMLInputElement).checked).toBe(false);
+
+    // Submit the form and verify member_repos
+    await user.type(within(dialog).getByPlaceholderText('my-repo'), 'my-virtual');
+    await user.type(within(dialog).getByPlaceholderText('My Repository'), 'My Virtual');
+    await user.click(within(dialog).getByRole('button', { name: /^create$/i }));
+
+    expect(onCreateSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repo_type: 'virtual',
+        member_repos: [{ repo_key: 'remote-1', priority: 1 }],
+      })
+    );
+  });
+});
+
+describe('RepoDialogs - Edit Dialog Additional Coverage', () => {
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it('updates description in edit dialog', async () => {
+    const onEditSubmit = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={true}
+        editRepo={mockEditRepo}
+        onEditSubmit={onEditSubmit}
+      />
+    );
+
+    const dialog = screen.getByRole('dialog');
+    const descInput = within(dialog).getByDisplayValue('A test repo');
+    await user.clear(descInput);
+    await user.type(descInput, 'Updated description');
+
+    await user.click(within(dialog).getByRole('button', { name: /save changes/i }));
+
+    expect(onEditSubmit).toHaveBeenCalledWith(
+      'test-repo',
+      expect.objectContaining({ description: 'Updated description' })
+    );
+  });
+
+  it('toggles public switch in edit dialog', async () => {
+    const onEditSubmit = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={true}
+        editRepo={mockEditRepo}
+        onEditSubmit={onEditSubmit}
+      />
+    );
+
+    const dialog = screen.getByRole('dialog');
+    const publicSwitch = within(dialog).getByRole('switch');
+    expect(publicSwitch.getAttribute('aria-checked')).toBe('true');
+
+    await user.click(publicSwitch);
+    expect(publicSwitch.getAttribute('aria-checked')).toBe('false');
+
+    await user.click(within(dialog).getByRole('button', { name: /save changes/i }));
+
+    expect(onEditSubmit).toHaveBeenCalledWith(
+      'test-repo',
+      expect.objectContaining({ is_public: false })
+    );
+  });
+
+  it('calls onEditOpenChange(false) when edit cancel button is clicked', async () => {
+    const onEditOpenChange = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={true}
+        editRepo={mockEditRepo}
+        onEditOpenChange={onEditOpenChange}
+      />
+    );
+
+    const dialog = screen.getByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: /cancel/i }));
+    expect(onEditOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it('updates create description field', async () => {
+    const onCreateSubmit = vi.fn();
+    const user = userEvent.setup();
+    render(<RepoDialogs {...defaultProps} onCreateSubmit={onCreateSubmit} />);
+
+    const dialog = screen.getByRole('dialog');
+    await user.type(within(dialog).getByPlaceholderText('my-repo'), 'desc-test');
+    await user.type(within(dialog).getByPlaceholderText('My Repository'), 'Desc Test');
+    await user.type(within(dialog).getByPlaceholderText('Optional description...'), 'My description');
+
+    await user.click(within(dialog).getByRole('button', { name: /^create$/i }));
+
+    expect(onCreateSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({ description: 'My description' })
+    );
+  });
+});
+
+describe('RepoDialogs - Upstream Auth Edge Cases', () => {
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it('dismisses remove auth confirmation when Keep is clicked', async () => {
+    const user = userEvent.setup();
+    render(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={true}
+        editRepo={mockRemoteEditRepo}
+      />
+    );
+
+    const dialog = screen.getByRole('dialog');
+    // Click Remove to show confirmation
+    await user.click(within(dialog).getByRole('button', { name: /^remove$/i }));
+    expect(within(dialog).getByText(/removing credentials will cause/i)).toBeTruthy();
+
+    // Click Keep to dismiss
+    await user.click(within(dialog).getByRole('button', { name: /^keep$/i }));
+    expect(within(dialog).queryByText(/removing credentials will cause/i)).toBeNull();
+  });
+
+  it('submits create form with bearer token auth', async () => {
+    const onCreateSubmit = vi.fn();
+    const user = userEvent.setup();
+    render(<RepoDialogs {...defaultProps} onCreateSubmit={onCreateSubmit} />);
+
+    const dialog = screen.getByRole('dialog');
+    await user.type(within(dialog).getByPlaceholderText('my-repo'), 'bearer-test');
+    await user.type(within(dialog).getByPlaceholderText('My Repository'), 'Bearer Test');
+
+    // Select remote type
+    const selects = within(dialog).getAllByTestId('mock-select');
+    fireEvent.change(selects[1], { target: { value: 'remote' } });
+
+    // Fill upstream URL
+    const urlInput = within(dialog).getByLabelText(/upstream url/i);
+    await user.type(urlInput, 'https://example.com');
+
+    // Select bearer auth
+    const updatedSelects = within(dialog).getAllByTestId('mock-select');
+    fireEvent.change(updatedSelects[2], { target: { value: 'bearer' } });
+
+    // Fill bearer token
+    await user.type(within(dialog).getByPlaceholderText('Bearer token'), 'my-token');
+
+    await user.click(within(dialog).getByRole('button', { name: /^create$/i }));
+
+    expect(onCreateSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        upstream_auth_type: 'bearer',
+        upstream_password: 'my-token',
+      })
+    );
+    // Should not include username for bearer
+    const submitData = onCreateSubmit.mock.calls[0][0];
+    expect(submitData.upstream_username).toBeUndefined();
+  });
+
+  it('resets edit form overrides when edit dialog closes via onOpenChange', () => {
+    const onEditOpenChange = vi.fn();
+    const { rerender } = render(
+      <RepoDialogs
+        {...defaultProps}
+        createOpen={false}
+        editOpen={true}
+        editRepo={mockRemoteEditRepo}
+        onEditOpenChange={onEditOpenChange}
+      />
+    );
+
+    // The Dialog's onOpenChange handler is called by Radix when the dialog closes.
+    // Since we're mocking Dialog, we need to verify the reset happens on re-open.
+    // Close and reopen the dialog
     rerender(
       <RepoDialogs
         {...defaultProps}
