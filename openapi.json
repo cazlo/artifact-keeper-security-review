@@ -15227,28 +15227,6 @@
         ]
       }
     },
-    "/api/v1/system/config": {
-      "get": {
-        "tags": [
-          "system"
-        ],
-        "summary": "Returns non-sensitive runtime configuration.",
-        "description": "The response includes upload limits, active storage backend, demo mode\nflag, and which optional services (Trivy, OpenSCAP, Dependency-Track,\nMeilisearch) are configured. No secrets or credentials are exposed.",
-        "operationId": "get_system_config",
-        "responses": {
-          "200": {
-            "description": "System configuration",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SystemConfigResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/v1/tree": {
       "get": {
         "tags": [
@@ -15390,6 +15368,304 @@
           },
           "404": {
             "description": "Artifact not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/uploads": {
+      "post": {
+        "tags": [
+          "uploads"
+        ],
+        "operationId": "create_session",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Upload session created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateSessionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Repository not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/uploads/{session_id}": {
+      "get": {
+        "tags": [
+          "uploads"
+        ],
+        "operationId": "get_session_status",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Upload session ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionStatusResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Session expired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "uploads"
+        ],
+        "operationId": "cancel",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Upload session ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Upload cancelled"
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "uploads"
+        ],
+        "operationId": "upload_chunk",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Upload session ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Chunk uploaded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChunkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid chunk or Content-Range",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Session expired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/uploads/{session_id}/complete": {
+      "put": {
+        "tags": [
+          "uploads"
+        ],
+        "operationId": "complete",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Upload session ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Upload finalized, artifact created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompleteResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Incomplete chunks or invalid state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Checksum mismatch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Session expired",
             "content": {
               "application/json": {
                 "schema": {
@@ -18420,6 +18696,33 @@
           }
         }
       },
+      "ChunkResponse": {
+        "type": "object",
+        "required": [
+          "chunk_index",
+          "bytes_received",
+          "chunks_completed",
+          "chunks_remaining"
+        ],
+        "properties": {
+          "bytes_received": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "chunk_index": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "chunks_completed": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "chunks_remaining": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
       "CleanupRequest": {
         "type": "object",
         "properties": {
@@ -18491,6 +18794,31 @@
               "null"
             ],
             "format": "uuid"
+          }
+        }
+      },
+      "CompleteResponse": {
+        "type": "object",
+        "required": [
+          "artifact_id",
+          "path",
+          "size",
+          "checksum_sha256"
+        ],
+        "properties": {
+          "artifact_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "checksum_sha256": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
@@ -19616,6 +19944,75 @@
           "name": {
             "type": "string",
             "description": "Name for the service account (will be prefixed with \"svc-\")"
+          }
+        }
+      },
+      "CreateSessionRequest": {
+        "type": "object",
+        "required": [
+          "repository_key",
+          "artifact_path",
+          "total_size",
+          "checksum_sha256"
+        ],
+        "properties": {
+          "artifact_path": {
+            "type": "string",
+            "description": "Path within the repository (e.g. \"images/vm.ova\")"
+          },
+          "checksum_sha256": {
+            "type": "string",
+            "description": "Expected SHA256 checksum of the complete file"
+          },
+          "chunk_size": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Chunk size in bytes (default 8 MB, range 1 MB - 256 MB)"
+          },
+          "content_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "MIME content type (default \"application/octet-stream\")"
+          },
+          "repository_key": {
+            "type": "string",
+            "description": "Repository key (e.g. \"my-repo\")"
+          },
+          "total_size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total file size in bytes"
+          }
+        }
+      },
+      "CreateSessionResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "chunk_count",
+          "chunk_size",
+          "expires_at"
+        ],
+        "properties": {
+          "chunk_count": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "chunk_size": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "expires_at": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       },
@@ -26253,6 +26650,58 @@
           }
         }
       },
+      "SessionStatusResponse": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "status",
+          "total_size",
+          "bytes_received",
+          "chunks_completed",
+          "chunks_total",
+          "repository_key",
+          "artifact_path",
+          "created_at",
+          "expires_at"
+        ],
+        "properties": {
+          "artifact_path": {
+            "type": "string"
+          },
+          "bytes_received": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "chunks_completed": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "chunks_total": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "string"
+          },
+          "repository_key": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string"
+          },
+          "total_size": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
       "SetArtifactLabelsRequest": {
         "type": "object",
         "required": [
@@ -26929,51 +27378,6 @@
           },
           "storage_key": {
             "type": "string"
-          }
-        }
-      },
-      "SystemConfigResponse": {
-        "type": "object",
-        "description": "Non-sensitive runtime configuration values.",
-        "required": [
-          "max_upload_size_bytes",
-          "demo_mode",
-          "storage_backend",
-          "trivy_enabled",
-          "openscap_enabled",
-          "dependency_track_enabled",
-          "meilisearch_enabled"
-        ],
-        "properties": {
-          "demo_mode": {
-            "type": "boolean",
-            "description": "Whether demo mode is active."
-          },
-          "dependency_track_enabled": {
-            "type": "boolean",
-            "description": "Whether Dependency-Track is configured."
-          },
-          "max_upload_size_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Maximum upload size in bytes (0 = unlimited).",
-            "minimum": 0
-          },
-          "meilisearch_enabled": {
-            "type": "boolean",
-            "description": "Whether Meilisearch search is configured."
-          },
-          "openscap_enabled": {
-            "type": "boolean",
-            "description": "Whether OpenSCAP scanning is configured."
-          },
-          "storage_backend": {
-            "type": "string",
-            "description": "Default storage backend name (e.g. \"filesystem\", \"s3\", \"gcs\")."
-          },
-          "trivy_enabled": {
-            "type": "boolean",
-            "description": "Whether Trivy scanning is configured."
           }
         }
       },
@@ -28862,10 +29266,6 @@
       "description": "Health and readiness checks"
     },
     {
-      "name": "system",
-      "description": "System configuration and capabilities"
-    },
-    {
       "name": "repository-labels",
       "description": "Repository label management"
     },
@@ -28876,6 +29276,10 @@
     {
       "name": "artifact-labels",
       "description": "Artifact label management"
+    },
+    {
+      "name": "uploads",
+      "description": "Chunked/resumable file uploads"
     }
   ]
 }

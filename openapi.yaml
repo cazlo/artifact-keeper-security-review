@@ -739,8 +739,7 @@ paths:
       tags:
       - admin
       summary: Trigger a full reindex of all artifacts and repositories in Meilisearch.
-      description: 'The reindex runs asynchronously in the background. The endpoint
-        returns
+      description: 'The reindex runs asynchronously in the background. The endpoint returns
 
         immediately with a confirmation that the task was started.'
       operationId: trigger_search_reindex
@@ -1440,6 +1439,28 @@ paths:
           description: Internal server error
       security:
       - bearer_auth: []
+  /api/v1/admin/storage-backends:
+    get:
+      tags:
+      - admin
+      summary: List available storage backends.
+      description: 'Returns the names of all configured and available storage backends.
+
+        Requires admin privileges.'
+      operationId: list_storage_backends
+      responses:
+        '200':
+          description: Available storage backends
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+        '403':
+          description: Admin privileges required
+      security:
+      - bearer_auth: []
   /api/v1/admin/storage-gc:
     post:
       tags:
@@ -1764,8 +1785,7 @@ paths:
       tags:
       - approval
       summary: Approve a pending promotion request. Admin-only.
-      description: 'This copies the artifact from the staging repo to the release
-        repo,
+      description: 'This copies the artifact from the staging repo to the release repo,
 
         inserts the new artifact record, records promotion history, and
 
@@ -2331,8 +2351,7 @@ paths:
     post:
       tags:
       - auth
-      summary: 'Create a short-lived, single-use download/stream ticket for the current
-        user.
+      summary: 'Create a short-lived, single-use download/stream ticket for the current user.
 
         The ticket can be passed as a `?ticket=` query parameter on endpoints that
 
@@ -2421,8 +2440,7 @@ paths:
     post:
       tags:
       - auth
-      summary: Disable TOTP for the authenticated user (requires password and current
-        TOTP code)
+      summary: Disable TOTP for the authenticated user (requires password and current TOTP code)
       operationId: disable_totp
       requestBody:
         content:
@@ -2493,8 +2511,7 @@ paths:
     post:
       tags:
       - auth
-      summary: Verify TOTP code during login (exchanges totp_token + code for full
-        auth tokens)
+      summary: Verify TOTP code during login (exchanges totp_token + code for full auth tokens)
       operationId: verify_totp
       requestBody:
         content:
@@ -7357,6 +7374,62 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
       security:
       - bearer_auth: []
+  /api/v1/repositories/{key}/test-upstream:
+    post:
+      tags:
+      - repositories
+      summary: Test connectivity to the upstream URL of a remote repository
+      operationId: test_upstream
+      parameters:
+      - name: key
+        in: path
+        description: Repository key
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Upstream reachable
+        '400':
+          description: Repository is not remote or has no upstream URL
+        '401':
+          description: Authentication required
+        '404':
+          description: Repository not found
+        '502':
+          description: Upstream unreachable
+      security:
+      - bearer_auth: []
+  /api/v1/repositories/{key}/upstream-auth:
+    put:
+      tags:
+      - repositories
+      summary: Set or remove upstream auth for a remote repository
+      operationId: set_upstream_auth
+      parameters:
+      - name: key
+        in: path
+        description: Repository key
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpstreamAuthRequest'
+        required: true
+      responses:
+        '200':
+          description: Upstream auth updated
+        '400':
+          description: Invalid auth type or missing fields
+        '401':
+          description: Authentication required
+        '404':
+          description: Repository not found
+      security:
+      - bearer_auth: []
   /api/v1/sbom:
     get:
       tags:
@@ -8548,8 +8621,7 @@ paths:
       tags:
       - service_accounts
       summary: Preview which repositories match a given repo selector.
-      description: 'Does not create or modify anything. Useful for testing selectors
-        before
+      description: 'Does not create or modify anything. Useful for testing selectors before
 
         attaching them to a token.'
       operationId: preview_repo_selector
@@ -9366,6 +9438,184 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
       security:
       - bearer_auth: []
+  /api/v1/uploads:
+    post:
+      tags:
+      - uploads
+      operationId: create_session
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSessionRequest'
+        required: true
+      responses:
+        '201':
+          description: Upload session created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateSessionResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+        '404':
+          description: Repository not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - bearer_auth: []
+  /api/v1/uploads/{session_id}:
+    get:
+      tags:
+      - uploads
+      operationId: get_session_status
+      parameters:
+      - name: session_id
+        in: path
+        description: Upload session ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Session status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionStatusResponse'
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '410':
+          description: Session expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - bearer_auth: []
+    delete:
+      tags:
+      - uploads
+      operationId: cancel
+      parameters:
+      - name: session_id
+        in: path
+        description: Upload session ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Upload cancelled
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - bearer_auth: []
+    patch:
+      tags:
+      - uploads
+      operationId: upload_chunk
+      parameters:
+      - name: session_id
+        in: path
+        description: Upload session ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Chunk uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChunkResponse'
+        '400':
+          description: Invalid chunk or Content-Range
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '410':
+          description: Session expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - bearer_auth: []
+  /api/v1/uploads/{session_id}/complete:
+    put:
+      tags:
+      - uploads
+      operationId: complete
+      parameters:
+      - name: session_id
+        in: path
+        description: Upload session ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Upload finalized, artifact created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompleteResponse'
+        '400':
+          description: Incomplete chunks or invalid state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Checksum mismatch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '410':
+          description: Session expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - bearer_auth: []
   /api/v1/users:
     get:
       tags:
@@ -10018,8 +10268,7 @@ paths:
       tags:
       - health
       summary: Health check endpoint — rich status page for dashboards.
-      description: 'Checks database, storage (real write/read probe), optional services
-        (Trivy,
+      description: 'Checks database, storage (real write/read probe), optional services (Trivy,
 
         Meilisearch), and exposes DB connection pool statistics.'
       operationId: health_check
@@ -10041,8 +10290,7 @@ paths:
       tags:
       - health
       summary: Liveness probe — confirms the process is alive and can serve HTTP.
-      description: 'Takes no State parameter. If Axum can route the request and execute
-        this
+      description: 'Takes no State parameter. If Axum can route the request and execute this
 
         function, the process is alive. External service failures cannot trigger
 
@@ -10427,8 +10675,7 @@ components:
             type: string
         match_tags:
           type: object
-          description: 'Tag selectors (AND semantics). Key = tag key, value = required
-            tag value.
+          description: 'Tag selectors (AND semantics). Key = tag key, value = required tag value.
 
             Empty value means "key must exist with any value".'
           additionalProperties:
@@ -11420,6 +11667,26 @@ components:
         session_id:
           type: string
           format: uuid
+    ChunkResponse:
+      type: object
+      required:
+      - chunk_index
+      - bytes_received
+      - chunks_completed
+      - chunks_remaining
+      properties:
+        bytes_received:
+          type: integer
+          format: int64
+        chunk_index:
+          type: integer
+          format: int32
+        chunks_completed:
+          type: integer
+          format: int32
+        chunks_remaining:
+          type: integer
+          format: int32
     CleanupRequest:
       type: object
       properties:
@@ -11471,6 +11738,24 @@ components:
           - string
           - 'null'
           format: uuid
+    CompleteResponse:
+      type: object
+      required:
+      - artifact_id
+      - path
+      - size
+      - checksum_sha256
+      properties:
+        artifact_id:
+          type: string
+          format: uuid
+        checksum_sha256:
+          type: string
+        path:
+          type: string
+        size:
+          type: integer
+          format: int64
     ComponentResponse:
       type: object
       required:
@@ -12094,8 +12379,7 @@ components:
           type:
           - string
           - 'null'
-          description: 'Separate index host for Cargo registries that split index
-            and download
+          description: 'Separate index host for Cargo registries that split index and download
 
             across two hosts (e.g. crates.io uses `https://index.crates.io` for
 
@@ -12108,6 +12392,15 @@ components:
           - 'null'
         key:
           type: string
+        member_repos:
+          type:
+          - array
+          - 'null'
+          items:
+            $ref: '#/components/schemas/CreateVirtualMemberInput'
+          description: 'Member repositories to add when creating a virtual repository.
+
+            Each entry specifies a repository key and optional priority.'
         name:
           type: string
         quota_bytes:
@@ -12117,10 +12410,34 @@ components:
           format: int64
         repo_type:
           type: string
+        storage_backend:
+          type:
+          - string
+          - 'null'
+          description: 'Override the default storage backend for this repository.
+
+            When omitted, the server''s configured default is used.
+
+            Non-admin users may only use the default backend.'
+        upstream_auth_type:
+          type:
+          - string
+          - 'null'
+          description: 'Upstream auth type: "basic" or "bearer". Only valid for remote repos.'
+        upstream_password:
+          type:
+          - string
+          - 'null'
+          description: Password (basic) or token (bearer). Write-only, never returned in responses.
         upstream_url:
           type:
           - string
           - 'null'
+        upstream_username:
+          type:
+          - string
+          - 'null'
+          description: Username for basic auth.
     CreateRuleRequest:
       type: object
       required:
@@ -12228,6 +12545,57 @@ components:
         name:
           type: string
           description: Name for the service account (will be prefixed with "svc-")
+    CreateSessionRequest:
+      type: object
+      required:
+      - repository_key
+      - artifact_path
+      - total_size
+      - checksum_sha256
+      properties:
+        artifact_path:
+          type: string
+          description: Path within the repository (e.g. "images/vm.ova")
+        checksum_sha256:
+          type: string
+          description: Expected SHA256 checksum of the complete file
+        chunk_size:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Chunk size in bytes (default 8 MB, range 1 MB - 256 MB)
+        content_type:
+          type:
+          - string
+          - 'null'
+          description: MIME content type (default "application/octet-stream")
+        repository_key:
+          type: string
+          description: Repository key (e.g. "my-repo")
+        total_size:
+          type: integer
+          format: int64
+          description: Total file size in bytes
+    CreateSessionResponse:
+      type: object
+      required:
+      - session_id
+      - chunk_count
+      - chunk_size
+      - expires_at
+      properties:
+        chunk_count:
+          type: integer
+          format: int32
+        chunk_size:
+          type: integer
+          format: int32
+        expires_at:
+          type: string
+        session_id:
+          type: string
+          format: uuid
     CreateSyncPolicyPayload:
       type: object
       required:
@@ -12285,13 +12653,11 @@ components:
           type:
           - object
           - 'null'
-          description: 'Dynamic repository selector (match by labels, formats, name
-            pattern).
+          description: 'Dynamic repository selector (match by labels, formats, name pattern).
 
             Mutually exclusive with `repository_ids`. When set, matched repos are
 
-            resolved at auth time so new repos that match the selector are picked
-            up
+            resolved at auth time so new repos that match the selector are picked up
 
             automatically.'
         repository_ids:
@@ -12301,8 +12667,7 @@ components:
           items:
             type: string
             format: uuid
-          description: Explicit repository IDs to restrict access to. Mutually exclusive
-            with `repo_selector`.
+          description: Explicit repository IDs to restrict access to. Mutually exclusive with `repo_selector`.
         scopes:
           type: array
           items:
@@ -12354,6 +12719,16 @@ components:
           - 'null'
         user:
           $ref: '#/components/schemas/AdminUserResponse'
+    CreateVirtualMemberInput:
+      type: object
+      required:
+      - repo_key
+      properties:
+        priority:
+          type: integer
+          format: int32
+        repo_key:
+          type: string
     CreateWebhookRequest:
       type: object
       required:
@@ -13751,6 +14126,10 @@ components:
       properties:
         database:
           $ref: '#/components/schemas/CheckStatus'
+        ldap:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/CheckStatus'
         meilisearch:
           oneOf:
           - type: 'null'
@@ -14165,8 +14544,7 @@ components:
           format: date-time
     LifecyclePolicy:
       type: object
-      description: A lifecycle policy attached to a repository (or global if repository_id
-        is NULL).
+      description: A lifecycle policy attached to a repository (or global if repository_id is NULL).
       required:
       - id
       - name
@@ -16159,6 +16537,7 @@ components:
       - repo_type
       - is_public
       - storage_used_bytes
+      - upstream_auth_configured
       - created_at
       - updated_at
       properties:
@@ -16193,6 +16572,16 @@ components:
         updated_at:
           type: string
           format: date-time
+        upstream_auth_configured:
+          type: boolean
+        upstream_auth_type:
+          type:
+          - string
+          - 'null'
+        upstream_url:
+          type:
+          - string
+          - 'null'
     RepositorySigningConfig:
       type: object
       description: Repository signing configuration.
@@ -16919,6 +17308,45 @@ components:
           type: string
         status:
           type: string
+    SessionStatusResponse:
+      type: object
+      required:
+      - session_id
+      - status
+      - total_size
+      - bytes_received
+      - chunks_completed
+      - chunks_total
+      - repository_key
+      - artifact_path
+      - created_at
+      - expires_at
+      properties:
+        artifact_path:
+          type: string
+        bytes_received:
+          type: integer
+          format: int64
+        chunks_completed:
+          type: integer
+          format: int32
+        chunks_total:
+          type: integer
+          format: int32
+        created_at:
+          type: string
+        expires_at:
+          type: string
+        repository_key:
+          type: string
+        session_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+        total_size:
+          type: integer
+          format: int64
     SetArtifactLabelsRequest:
       type: object
       required:
@@ -17628,8 +18056,7 @@ components:
           items:
             type: string
             format: uuid
-          description: Explicit repository IDs this token is restricted to (from join
-            table).
+          description: Explicit repository IDs this token is restricted to (from join table).
         scopes:
           type: array
           items:
@@ -18383,6 +18810,24 @@ components:
           type: boolean
         severity_threshold:
           type: string
+    UpstreamAuthRequest:
+      type: object
+      required:
+      - auth_type
+      properties:
+        auth_type:
+          type: string
+          description: 'Auth type: "basic", "bearer", or "none" to remove.'
+        password:
+          type:
+          - string
+          - 'null'
+          description: Password (basic) or token (bearer). Write-only, never returned.
+        username:
+          type:
+          - string
+          - 'null'
+          description: Username for basic auth.
     UserListResponse:
       type: object
       required:
@@ -18462,9 +18907,9 @@ components:
     VirtualMembersListResponse:
       type: object
       required:
-      - items
+      - members
       properties:
-        items:
+        members:
           type: array
           items:
             $ref: '#/components/schemas/VirtualMemberResponse'
@@ -18670,3 +19115,5 @@ tags:
   description: Peer instance label management
 - name: artifact-labels
   description: Artifact label management
+- name: uploads
+  description: Chunked/resumable file uploads
