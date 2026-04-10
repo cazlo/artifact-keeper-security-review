@@ -135,4 +135,5 @@ are generally higher severity or were reviewed earlier.
 | [003-upload-no-quota-enforcement.md](findings/003-upload-no-quota-enforcement.md) | Disk exhaustion: quota_bytes not checked in upload path |
 | [004-k8s-service-name-allowance.md](findings/004-k8s-service-name-allowance.md) | By-design K8s service name SSRF risk |
 | [005-wasm-plugin-surface.md](findings/005-wasm-plugin-surface.md) | WASM plugin system – high-risk optional surface |
+| [006-format-allowlist-contribution.md](findings/006-format-allowlist-contribution.md) | Contribution idea: per-format enable/disable config allowlist |
 
