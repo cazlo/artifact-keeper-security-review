@@ -1,0 +1,181 @@
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint & Validate OpenAPI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install tools
+        run: npm install -g @stoplight/spectral-cli @redocly/cli
+
+      - name: Spectral lint
+        run: spectral lint openapi.yaml --fail-severity error
+
+      - name: Redocly lint
+        continue-on-error: true
+        run: redocly lint openapi.yaml
+
+      - name: Verify bundleable
+        run: redocly bundle openapi.yaml -o /tmp/bundled.yaml
+
+  # ─── Breaking change detection ──────────────────────────────────────
+  breaking-changes:
+    name: Breaking Change Detection
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get previous spec from latest tag
+        id: prev-spec
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            echo "Found previous tag: $PREV_TAG"
+            git show "$PREV_TAG:openapi.yaml" > openapi-previous.yaml
+            echo "has_previous=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No previous tag found, skipping breaking change detection"
+            echo "has_previous=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check for breaking changes
+        if: steps.prev-spec.outputs.has_previous == 'true'
+        continue-on-error: true
+        uses: oasdiff/oasdiff-action/breaking@1c611ffb1253a72924624aa4fb662e302b3565d3 # v0.0.21
+        with:
+          base: openapi-previous.yaml
+          revision: openapi.yaml
+
+  # ─── SDK build checks (verify generation works) ─────────────────────
+  build-typescript:
+    name: Build TypeScript SDK
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        working-directory: sdk/typescript
+        run: npm install
+
+      - name: Generate SDK
+        working-directory: sdk/typescript
+        run: npx openapi-ts
+
+      - name: Type-check generated code
+        working-directory: sdk/typescript
+        run: npx tsc --noEmit
+
+  build-kotlin:
+    name: Build Kotlin SDK
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Generate SDK
+        uses: docker://openapitools/openapi-generator-cli:v7.12.0
+        with:
+          args: generate -c /github/workspace/sdk/kotlin/openapi-generator-config.yaml
+
+      - name: Fix permissions
+        run: sudo chown -R "$USER" sdk/kotlin/generated
+
+      - name: Build generated code
+        working-directory: sdk/kotlin/generated
+        run: chmod +x gradlew && ./gradlew build -x test
+
+  build-swift:
+    name: Build Swift SDK
+    needs: lint
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy spec into package
+        run: cp openapi.yaml sdk/swift/Sources/ArtifactKeeperClient/openapi.yaml
+
+      - name: Resolve dependencies
+        working-directory: sdk/swift
+        run: swift package resolve
+
+      - name: Build package
+        working-directory: sdk/swift
+        run: swift build
+
+  build-rust:
+    name: Build Rust SDK
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate SDK
+        uses: docker://openapitools/openapi-generator-cli:v7.12.0
+        with:
+          args: >-
+            generate
+            -i openapi.yaml
+            -g rust
+            -o generated/rust
+            --additional-properties=packageName=artifact-keeper-client,packageVersion=0.0.0,library=reqwest,supportMultipart=true
+            --type-mappings=file=Vec<u8>
+
+      - name: Fix permissions
+        run: sudo chown -R "$USER" generated/rust
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build generated code
+        working-directory: generated/rust
+        run: cargo check
+
+  build-python:
+    name: Build Python SDK
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate SDK
+        uses: docker://openapitools/openapi-generator-cli:v7.12.0
+        with:
+          args: generate -c /github/workspace/sdk/python/openapi-generator-config.yaml
+
+      - name: Fix permissions
+        run: sudo chown -R "$USER" sdk/python/generated
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install generated package
+        working-directory: sdk/python/generated
+        run: pip install .
+
+      - name: Verify import
+        run: python -c "import artifact_keeper_client; print('OK')"
