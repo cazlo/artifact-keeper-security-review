@@ -1,0 +1,94 @@
+name: Scheduled Tests
+
+on:
+  schedule:
+    # Run every day at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nightly-e2e:
+    name: 🌙 Nightly E2E Tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Run native client smoke tests
+        run: |
+          docker compose -f docker-compose.test.yml --profile smoke up \
+            --build \
+            --abort-on-container-exit
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f docker-compose.test.yml --profile smoke down -v --remove-orphans
+
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🚨 Nightly E2E Tests Failed',
+              body: `The nightly E2E test run has failed.
+
+              **Workflow:** ${context.workflow}
+              **Run:** ${context.runId}
+              **SHA:** ${context.sha}
+
+              [View the failed run](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+              `,
+              labels: ['bug', 'automated']
+            });
+        continue-on-error: true
+
+  dependency-check:
+    name: 🔍 Dependency Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check for outdated Rust dependencies
+        run: |
+          cargo install cargo-outdated || true
+          cargo outdated --workspace || true
+
+  security-scan:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked || true
+
+      - name: Run Rust security audit
+        run: cargo audit --json > rust-audit.json || true
+
+      - name: Upload audit results
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: security-audit-reports
+          path: rust-audit.json
+          retention-days: 30

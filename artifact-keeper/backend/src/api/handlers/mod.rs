@@ -1,0 +1,99 @@
+//! HTTP request handlers.
+
+/// Remove any soft-deleted artifact at the given `(repository_id, path)` so
+/// that a subsequent INSERT won't violate the UNIQUE constraint.  This is a
+/// fire-and-forget cleanup: if the DELETE fails or finds nothing we just
+/// continue with the INSERT.
+pub async fn cleanup_soft_deleted_artifact(
+    db: &sqlx::PgPool,
+    repository_id: uuid::Uuid,
+    path: &str,
+) {
+    let _ = sqlx::query(
+        "DELETE FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = true",
+    )
+    .bind(repository_id)
+    .bind(path)
+    .execute(db)
+    .await;
+}
+
+pub mod error_helpers;
+
+pub mod admin;
+pub mod alpine;
+pub mod analytics;
+pub mod ansible;
+pub mod approval;
+pub mod artifact_labels;
+pub mod artifacts;
+pub mod auth;
+pub mod builds;
+pub mod cargo;
+pub mod chef;
+pub mod cocoapods;
+pub mod composer;
+pub mod conan;
+pub mod conda;
+pub mod cran;
+pub mod curation;
+pub mod debian;
+pub mod dependency_track;
+pub mod events;
+pub mod gitlfs;
+pub mod goproxy;
+pub mod groups;
+pub mod health;
+pub mod helm;
+pub mod hex;
+pub mod huggingface;
+pub mod incus;
+pub mod jetbrains;
+pub mod lifecycle;
+pub mod maven;
+pub mod migration;
+pub mod monitoring;
+pub mod npm;
+pub mod nuget;
+pub mod oci_v2;
+pub mod packages;
+pub mod peer;
+pub mod peer_instance_labels;
+pub mod peers;
+pub mod permissions;
+pub mod plugins;
+pub mod profile;
+pub mod promotion;
+pub mod promotion_rules;
+pub mod protobuf;
+pub mod proxy_helpers;
+pub mod pub_registry;
+pub mod puppet;
+pub mod pypi;
+pub mod quality_gates;
+pub mod remote_instances;
+pub mod repositories;
+pub mod repository_labels;
+pub mod rpm;
+pub mod rubygems;
+pub mod sbom;
+pub mod sbt;
+pub mod search;
+pub mod security;
+pub mod service_accounts;
+pub mod signing;
+pub mod sso;
+pub mod sso_admin;
+pub mod storage_gc;
+pub mod swift;
+pub mod sync_policies;
+pub mod telemetry;
+pub mod terraform;
+pub mod totp;
+pub mod transfer;
+pub mod tree;
+pub mod upload;
+pub mod users;
+pub mod vscode;
+pub mod wasm_proxy;
+pub mod webhooks;

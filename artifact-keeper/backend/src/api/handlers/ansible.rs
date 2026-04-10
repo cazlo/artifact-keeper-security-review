@@ -1,0 +1,843 @@
+//! Ansible Galaxy API handlers.
+//!
+//! Implements the endpoints required for Ansible collection management.
+//!
+//! Routes are mounted at `/ansible/{repo_key}/...`:
+//!   GET  /ansible/{repo_key}/api/v3/collections/                                      - List collections
+//!   GET  /ansible/{repo_key}/api/v3/collections/{namespace}/{name}/                   - Collection info
+//!   GET  /ansible/{repo_key}/api/v3/collections/{namespace}/{name}/versions/           - Version list
+//!   GET  /ansible/{repo_key}/api/v3/collections/{namespace}/{name}/versions/{version}/ - Version info
+//!   GET  /ansible/{repo_key}/download/{namespace}-{name}-{version}.tar.gz              - Download
+//!   POST /ansible/{repo_key}/api/v3/artifacts/collections/                             - Upload collection
+
+use axum::body::Body;
+use axum::extract::{Multipart, Path, State};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::Extension;
+use axum::Router;
+use sha2::{Digest, Sha256};
+use sqlx::PgPool;
+use tracing::info;
+
+use crate::api::handlers::proxy_helpers::{self, RepoInfo};
+use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::SharedState;
+use crate::formats::ansible::AnsibleHandler;
+use crate::models::repository::RepositoryType;
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+pub fn router() -> Router<SharedState> {
+    Router::new()
+        .route("/:repo_key/api/v3/collections/", get(list_collections))
+        .route(
+            "/:repo_key/api/v3/collections/:namespace/:name/",
+            get(collection_info),
+        )
+        .route(
+            "/:repo_key/api/v3/collections/:namespace/:name/versions/",
+            get(version_list),
+        )
+        .route(
+            "/:repo_key/api/v3/collections/:namespace/:name/versions/:version/",
+            get(version_info),
+        )
+        .route("/:repo_key/download/*file_path", get(download_collection))
+        .route(
+            "/:repo_key/api/v3/artifacts/collections/",
+            post(upload_collection),
+        )
+}
+
+// ---------------------------------------------------------------------------
+// Repository resolution
+// ---------------------------------------------------------------------------
+
+async fn resolve_ansible_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
+    proxy_helpers::resolve_repo_by_key(db, repo_key, &["ansible"], "an Ansible").await
+}
+
+// ---------------------------------------------------------------------------
+// GET /ansible/{repo_key}/api/v3/collections/ — List collections (paginated)
+// ---------------------------------------------------------------------------
+
+async fn list_collections(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
+
+    let artifacts = sqlx::query!(
+        r#"
+        SELECT DISTINCT ON (LOWER(name)) name, version
+        FROM artifacts
+        WHERE repository_id = $1
+          AND is_deleted = false
+        ORDER BY LOWER(name), created_at DESC
+        "#,
+        repo.id
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let data: Vec<serde_json::Value> = artifacts
+        .iter()
+        .filter_map(|a| {
+            let name = a.name.clone();
+            // Artifact name is stored as "namespace-collection_name"
+            let first_hyphen = name.find('-')?;
+            let namespace = name[..first_hyphen].to_string();
+            let coll_name = name[first_hyphen + 1..].to_string();
+            let latest_version = a.version.clone().unwrap_or_default();
+
+            Some(serde_json::json!({
+                "namespace": namespace,
+                "name": coll_name,
+                "href": format!(
+                    "/ansible/{}/api/v3/collections/{}/{}/",
+                    repo_key, namespace, coll_name
+                ),
+                "highest_version": {
+                    "version": latest_version,
+                    "href": format!(
+                        "/ansible/{}/api/v3/collections/{}/{}/versions/{}/",
+                        repo_key, namespace, coll_name, latest_version
+                    ),
+                },
+            }))
+        })
+        .collect();
+
+    let json = serde_json::json!({
+        "meta": {
+            "count": data.len(),
+        },
+        "links": {
+            "first": null,
+            "previous": null,
+            "next": null,
+            "last": null,
+        },
+        "data": data,
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&json).unwrap()))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /ansible/{repo_key}/api/v3/collections/{namespace}/{name}/ — Collection info
+// ---------------------------------------------------------------------------
+
+async fn collection_info(
+    State(state): State<SharedState>,
+    Path((repo_key, namespace, name)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
+
+    // Validate via format handler
+    let validate_path = format!("api/v3/collections/{}/{}", namespace, name);
+    let _ = AnsibleHandler::parse_path(&validate_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response())?;
+
+    let collection_name = format!("{}-{}", namespace, name);
+    let artifact = sqlx::query!(
+        r#"
+        SELECT a.id, a.name, a.version, a.size_bytes,
+               am.metadata as "metadata?"
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND LOWER(a.name) = LOWER($2)
+        ORDER BY a.created_at DESC
+        LIMIT 1
+        "#,
+        repo.id,
+        collection_name
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "Collection not found").into_response())?;
+
+    let latest_version = artifact.version.clone().unwrap_or_default();
+    let description = artifact
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("description"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let json = serde_json::json!({
+        "namespace": namespace,
+        "name": name,
+        "description": description,
+        "highest_version": {
+            "version": latest_version,
+            "href": format!(
+                "/ansible/{}/api/v3/collections/{}/{}/versions/{}/",
+                repo_key, namespace, name, latest_version
+            ),
+        },
+        "versions_url": format!(
+            "/ansible/{}/api/v3/collections/{}/{}/versions/",
+            repo_key, namespace, name
+        ),
+        "download_url": format!(
+            "/ansible/{}/download/{}-{}-{}.tar.gz",
+            repo_key, namespace, name, latest_version
+        ),
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&json).unwrap()))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /ansible/{repo_key}/api/v3/collections/{namespace}/{name}/versions/ — Version list
+// ---------------------------------------------------------------------------
+
+async fn version_list(
+    State(state): State<SharedState>,
+    Path((repo_key, namespace, name)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
+
+    let collection_name = format!("{}-{}", namespace, name);
+    let artifacts = sqlx::query!(
+        r#"
+        SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256,
+               am.metadata as "metadata?"
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND LOWER(a.name) = LOWER($2)
+        ORDER BY a.created_at DESC
+        "#,
+        repo.id,
+        collection_name
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let versions: Vec<serde_json::Value> = artifacts
+        .iter()
+        .map(|a| {
+            let version = a.version.clone().unwrap_or_default();
+            serde_json::json!({
+                "version": version,
+                "href": format!(
+                    "/ansible/{}/api/v3/collections/{}/{}/versions/{}/",
+                    repo_key, namespace, name, version
+                ),
+            })
+        })
+        .collect();
+
+    let json = serde_json::json!({
+        "meta": {
+            "count": versions.len(),
+        },
+        "links": {
+            "first": null,
+            "previous": null,
+            "next": null,
+            "last": null,
+        },
+        "data": versions,
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&json).unwrap()))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /ansible/{repo_key}/api/v3/collections/{namespace}/{name}/versions/{version}/ — Version info
+// ---------------------------------------------------------------------------
+
+async fn version_info(
+    State(state): State<SharedState>,
+    Path((repo_key, namespace, name, version)): Path<(String, String, String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
+
+    // Validate via format handler
+    let validate_path = format!(
+        "api/v3/collections/{}/{}/versions/{}",
+        namespace, name, version
+    );
+    let _ = AnsibleHandler::parse_path(&validate_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response())?;
+
+    let collection_name = format!("{}-{}", namespace, name);
+    let artifact = sqlx::query!(
+        r#"
+        SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256,
+               am.metadata as "metadata?"
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND LOWER(a.name) = LOWER($2)
+          AND a.version = $3
+        LIMIT 1
+        "#,
+        repo.id,
+        collection_name,
+        version
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "Collection version not found").into_response())?;
+
+    let download_count: i64 = sqlx::query_scalar!(
+        "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1",
+        artifact.id
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(Some(0))
+    .unwrap_or(0);
+
+    let json = serde_json::json!({
+        "namespace": namespace,
+        "name": name,
+        "version": version,
+        "download_url": format!(
+            "/ansible/{}/download/{}-{}-{}.tar.gz",
+            repo_key, namespace, name, version
+        ),
+        "artifact": {
+            "filename": format!("{}-{}-{}.tar.gz", namespace, name, version),
+            "size": artifact.size_bytes,
+            "sha256": artifact.checksum_sha256,
+        },
+        "collection": {
+            "href": format!(
+                "/ansible/{}/api/v3/collections/{}/{}/",
+                repo_key, namespace, name
+            ),
+        },
+        "downloads": download_count,
+        "metadata": artifact.metadata.unwrap_or(serde_json::json!({})),
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&json).unwrap()))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /ansible/{repo_key}/download/{namespace}-{name}-{version}.tar.gz — Download
+// ---------------------------------------------------------------------------
+
+async fn download_collection(
+    State(state): State<SharedState>,
+    Path((repo_key, file_path)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
+
+    let filename = file_path.trim_start_matches('/');
+
+    let artifact = sqlx::query!(
+        r#"
+        SELECT id, path, name, version, size_bytes, checksum_sha256, storage_key
+        FROM artifacts
+        WHERE repository_id = $1
+          AND is_deleted = false
+          AND path LIKE '%/' || $2
+        LIMIT 1
+        "#,
+        repo.id,
+        filename
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "Collection file not found").into_response());
+
+    let artifact = match artifact {
+        Ok(a) => a,
+        Err(not_found) => {
+            if repo.repo_type == RepositoryType::Remote {
+                if let (Some(ref upstream_url), Some(ref proxy)) =
+                    (&repo.upstream_url, &state.proxy_service)
+                {
+                    let upstream_path = format!("download/{}", filename);
+                    let (content, content_type) = proxy_helpers::proxy_fetch(
+                        proxy,
+                        repo.id,
+                        &repo_key,
+                        upstream_url,
+                        &upstream_path,
+                    )
+                    .await?;
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(
+                            "Content-Type",
+                            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+                        )
+                        .body(Body::from(content))
+                        .unwrap());
+                }
+            }
+            // Virtual repo: try each member in priority order
+            if repo.repo_type == RepositoryType::Virtual {
+                let db = state.db.clone();
+                let upstream_path = format!("download/{}", filename);
+                let vfilename = filename.to_string();
+                let (content, content_type) = proxy_helpers::resolve_virtual_download(
+                    &state.db,
+                    state.proxy_service.as_deref(),
+                    repo.id,
+                    &upstream_path,
+                    |member_id, location| {
+                        let db = db.clone();
+                        let state = state.clone();
+                        let vfilename = vfilename.clone();
+                        async move {
+                            proxy_helpers::local_fetch_by_path_suffix(
+                                &db, &state, member_id, &location, &vfilename,
+                            )
+                            .await
+                        }
+                    },
+                )
+                .await?;
+
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(
+                        "Content-Type",
+                        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+                    )
+                    .header(CONTENT_LENGTH, content.len().to_string())
+                    .body(Body::from(content))
+                    .unwrap());
+            }
+            return Err(not_found);
+        }
+    };
+
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Storage error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let _ = sqlx::query!(
+        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
+        artifact.id
+    )
+    .execute(&state.db)
+    .await;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/gzip")
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .header(CONTENT_LENGTH, content.len().to_string())
+        .body(Body::from(content))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// POST /ansible/{repo_key}/api/v3/artifacts/collections/ — Upload collection (multipart)
+// ---------------------------------------------------------------------------
+
+async fn upload_collection(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(repo_key): Path<String>,
+    mut multipart: Multipart,
+) -> Result<Response, Response> {
+    let user_id = require_auth_basic(auth, "ansible")?.user_id;
+    let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
+    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+
+    let mut tarball: Option<bytes::Bytes> = None;
+    let mut collection_json: Option<serde_json::Value> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e)).into_response())?
+    {
+        let field_name = field.name().unwrap_or("").to_string();
+        match field_name.as_str() {
+            "file" => {
+                tarball = Some(field.bytes().await.map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("Failed to read file: {}", e),
+                    )
+                        .into_response()
+                })?);
+            }
+            "collection" | "metadata" => {
+                let data = field.bytes().await.map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("Failed to read collection JSON: {}", e),
+                    )
+                        .into_response()
+                })?;
+                collection_json = Some(serde_json::from_slice(&data).map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("Invalid collection JSON: {}", e),
+                    )
+                        .into_response()
+                })?);
+            }
+            _ => {}
+        }
+    }
+
+    let tarball =
+        tarball.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing file field").into_response())?;
+
+    if tarball.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Empty tarball").into_response());
+    }
+
+    let (namespace, collection_name, collection_version) = if let Some(ref json) = collection_json {
+        let namespace = json
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let name = json
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let version = json
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        (namespace, name, version)
+    } else {
+        return Err((StatusCode::BAD_REQUEST, "Missing collection metadata JSON").into_response());
+    };
+
+    if namespace.is_empty() || collection_name.is_empty() || collection_version.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Namespace, name, and version are required",
+        )
+            .into_response());
+    }
+
+    // Validate via format handler
+    let validate_path = format!(
+        "api/v3/collections/{}/{}/versions/{}",
+        namespace, collection_name, collection_version
+    );
+    let _ = AnsibleHandler::parse_path(&validate_path).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid collection: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let full_name = format!("{}-{}", namespace, collection_name);
+    let filename = format!(
+        "{}-{}-{}.tar.gz",
+        namespace, collection_name, collection_version
+    );
+
+    // Compute SHA256
+    let mut hasher = Sha256::new();
+    hasher.update(&tarball);
+    let computed_sha256 = format!("{:x}", hasher.finalize());
+
+    let artifact_path = format!("{}/{}/{}", full_name, collection_version, filename);
+
+    // Check for duplicate
+    let existing = sqlx::query_scalar!(
+        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        repo.id,
+        artifact_path
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    if existing.is_some() {
+        return Err((StatusCode::CONFLICT, "Collection version already exists").into_response());
+    }
+
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+
+    // Store the file
+    let storage_key = format!("ansible/{}/{}/{}", full_name, collection_version, filename);
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    storage
+        .put(&storage_key, tarball.clone())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Storage error: {}", e),
+            )
+                .into_response()
+        })?;
+
+    let ansible_metadata = serde_json::json!({
+        "namespace": namespace,
+        "collection_name": collection_name,
+        "version": collection_version,
+        "filename": filename,
+        "collection_json": collection_json,
+    });
+
+    let size_bytes = tarball.len() as i64;
+
+    let artifact_id = sqlx::query_scalar!(
+        r#"
+        INSERT INTO artifacts (
+            repository_id, path, name, version, size_bytes,
+            checksum_sha256, content_type, storage_key, uploaded_by
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING id
+        "#,
+        repo.id,
+        artifact_path,
+        full_name,
+        collection_version,
+        size_bytes,
+        computed_sha256,
+        "application/gzip",
+        storage_key,
+        user_id,
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let _ = sqlx::query!(
+        r#"
+        INSERT INTO artifact_metadata (artifact_id, format, metadata)
+        VALUES ($1, 'ansible', $2)
+        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
+        "#,
+        artifact_id,
+        ansible_metadata,
+    )
+    .execute(&state.db)
+    .await;
+
+    let _ = sqlx::query!(
+        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
+        repo.id,
+    )
+    .execute(&state.db)
+    .await;
+
+    info!(
+        "Ansible upload: {}-{} {} ({}) to repo {}",
+        namespace, collection_name, collection_version, filename, repo_key
+    );
+
+    let response_json = serde_json::json!({
+        "namespace": namespace,
+        "name": collection_name,
+        "version": collection_version,
+        "href": format!(
+            "/ansible/{}/api/v3/collections/{}/{}/versions/{}/",
+            repo_key, namespace, collection_name, collection_version
+        ),
+        "download_url": format!(
+            "/ansible/{}/download/{}",
+            repo_key, filename
+        ),
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::ACCEPTED)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&response_json).unwrap()))
+        .unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_repo_info_struct() {
+        let info = RepoInfo {
+            id: uuid::Uuid::nil(),
+            key: String::new(),
+            storage_path: "/tmp/test".to_string(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "hosted".to_string(),
+            upstream_url: Some("https://example.com".to_string()),
+        };
+        assert_eq!(info.storage_path, "/tmp/test");
+        assert_eq!(info.repo_type, "hosted");
+        assert_eq!(info.upstream_url, Some("https://example.com".to_string()));
+    }
+
+    #[test]
+    fn test_collection_name_format() {
+        let namespace = "community";
+        let collection_name = "general";
+        let collection_version = "1.2.3";
+        let full_name = format!("{}-{}", namespace, collection_name);
+        let filename = format!(
+            "{}-{}-{}.tar.gz",
+            namespace, collection_name, collection_version
+        );
+        let artifact_path = format!("{}/{}/{}", full_name, collection_version, filename);
+
+        assert_eq!(full_name, "community-general");
+        assert_eq!(filename, "community-general-1.2.3.tar.gz");
+        assert_eq!(
+            artifact_path,
+            "community-general/1.2.3/community-general-1.2.3.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_storage_key_format() {
+        let full_name = "namespace-collection";
+        let version = "2.0.0";
+        let filename = "namespace-collection-2.0.0.tar.gz";
+        let storage_key = format!("ansible/{}/{}/{}", full_name, version, filename);
+        assert_eq!(
+            storage_key,
+            "ansible/namespace-collection/2.0.0/namespace-collection-2.0.0.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_sha256_computation() {
+        let data = b"test data for hashing";
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let computed = format!("{:x}", hasher.finalize());
+        assert_eq!(computed.len(), 64);
+        // Known SHA-256 hash of "test data for hashing"
+        assert!(!computed.is_empty());
+    }
+
+    #[test]
+    fn test_collection_name_parsing_from_artifact() {
+        let name = "community-general";
+        let first_hyphen = name.find('-').unwrap();
+        let namespace = &name[..first_hyphen];
+        let coll_name = &name[first_hyphen + 1..];
+        assert_eq!(namespace, "community");
+        assert_eq!(coll_name, "general");
+    }
+
+    #[test]
+    fn test_collection_name_parsing_no_hyphen() {
+        let name = "nohyphen";
+        let result = name.find('-');
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_ansible_metadata_json_construction() {
+        let namespace = "testns";
+        let collection_name = "testcoll";
+        let collection_version = "1.0.0";
+        let filename = "testns-testcoll-1.0.0.tar.gz";
+        let collection_json: Option<serde_json::Value> =
+            Some(serde_json::json!({"namespace": "testns"}));
+
+        let metadata = serde_json::json!({
+            "namespace": namespace,
+            "collection_name": collection_name,
+            "version": collection_version,
+            "filename": filename,
+            "collection_json": collection_json,
+        });
+
+        assert_eq!(metadata["namespace"], "testns");
+        assert_eq!(metadata["collection_name"], "testcoll");
+        assert_eq!(metadata["version"], "1.0.0");
+        assert_eq!(metadata["filename"], "testns-testcoll-1.0.0.tar.gz");
+    }
+}

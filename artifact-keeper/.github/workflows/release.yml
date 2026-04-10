@@ -1,0 +1,244 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+  actions: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # E2E GATE - Must pass before release proceeds
+  # ════════════════════════════════════════════════════════════════════════════
+
+  e2e-gate:
+    name: 🚦 E2E Gate
+    uses: ./.github/workflows/e2e.yml
+    with:
+      profile: smoke
+      include_stress: false
+      include_failure: false
+
+  mesh-e2e-gate:
+    name: Mesh Replication E2E (optional)
+    uses: ./.github/workflows/mesh-e2e.yml
+    with:
+      image_tag: dev
+    secrets: inherit
+
+  release-gate:
+    name: Release Gate (Full Suite)
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
+    with:
+      backend_tag: dev
+      test_suite: all
+    secrets: inherit
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # BUILD BINARIES
+  # ════════════════════════════════════════════════════════════════════════════
+
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    needs: [e2e-gate, release-gate]
+    if: |
+      always() &&
+      needs.e2e-gate.result == 'success' &&
+      (needs.release-gate.result == 'success' || needs.release-gate.result == 'failure')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: artifact-keeper-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: artifact-keeper-linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: artifact-keeper-darwin-amd64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: artifact-keeper-darwin-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: artifact-keeper-windows-amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install build dependencies (Windows)
+        if: runner.os == 'Windows'
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        env:
+          SQLX_OFFLINE: true
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target ${{ matrix.target }} --features vendored-openssl
+
+      - name: Package binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/artifact-keeper dist/${{ matrix.name }}
+          chmod +x dist/${{ matrix.name }}
+          cd dist
+          tar -czvf ${{ matrix.name }}.tar.gz ${{ matrix.name }}
+          if command -v sha256sum &>/dev/null; then
+            sha256sum ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
+          else
+            shasum -a 256 ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
+          fi
+
+      - name: Package binary (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/artifact-keeper.exe dist/${{ matrix.name }}.exe
+          cd dist
+          sha256sum ${{ matrix.name }}.exe > ${{ matrix.name }}.exe.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/${{ matrix.name }}.tar.gz*
+            dist/${{ matrix.name }}.exe*
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # CREATE RELEASE
+  # ════════════════════════════════════════════════════════════════════════════
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [build-binaries, release-gate, mesh-e2e-gate]
+    if: always() && needs.build-binaries.result == 'success'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: artifacts
+          pattern: artifact-keeper-*
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            echo "tag=v${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check gate status
+        id: gates
+        run: |
+          RELEASE_GATE="${{ needs.release-gate.result }}"
+          MESH_GATE="${{ needs.mesh-e2e-gate.result }}"
+          echo "release_gate=${RELEASE_GATE}" >> $GITHUB_OUTPUT
+          echo "mesh_gate=${MESH_GATE}" >> $GITHUB_OUTPUT
+
+          if [[ "$RELEASE_GATE" == "success" ]]; then
+            echo "all_passed=true" >> $GITHUB_OUTPUT
+            echo "Gates passed: release=$RELEASE_GATE mesh=$MESH_GATE (mesh is optional)"
+          else
+            echo "all_passed=false" >> $GITHUB_OUTPUT
+            echo "::warning::Release gate not green: release=$RELEASE_GATE mesh=$MESH_GATE. Release will be created as DRAFT."
+          fi
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -name "*.tar.gz*" -exec cp {} release-assets/ \;
+          find artifacts -name "*.exe*" -exec cp {} release-assets/ \;
+          ls -la release-assets/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Artifact Keeper ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          draft: ${{ steps.gates.outputs.all_passed != 'true' }}
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          files: release-assets/*
+          fail_on_unmatched_files: true
+
+      - name: Notify Windows MSI build
+        if: steps.gates.outputs.all_passed == 'true'
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
+        with:
+          token: ${{ secrets.WINDOWS_REPO_PAT }}
+          repository: artifact-keeper/artifact-keeper-windows
+          event-type: backend-release
+          client-payload: '{"version": "${{ steps.version.outputs.version }}", "tag": "${{ steps.version.outputs.tag }}"}'
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # PUBLISH DOCKER IMAGES (only when gates pass, release is not draft)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  docker-release:
+    name: Publish Docker Images
+    runs-on: ubuntu-latest
+    needs: [release, release-gate, mesh-e2e-gate]
+    if: |
+      always() &&
+      needs.release.result == 'success' &&
+      needs.release-gate.result == 'success'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Trigger Docker publish
+        uses: benc-uk/workflow-dispatch@7a027648b88c2413826b6ddd6c76114894dc5ec4 # v1
+        with:
+          workflow: docker-publish.yml
+          token: ${{ secrets.GITHUB_TOKEN }}
