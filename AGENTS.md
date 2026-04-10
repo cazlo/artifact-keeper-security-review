@@ -5,17 +5,28 @@
 This workspace is for a focused security review of the `artifact-keeper` project, with the intent to determine whether it is defensible for internal use and whether we can productively contribute security improvements upstream.
 
 The preferred workflow is:
-1. The repository is already cloned as a **git subtree** at `artifact-keeper/`  
-   To update: `git subtree pull --prefix=artifact-keeper https://github.com/artifact-keeper/artifact-keeper.git main`
+1. All repositories from the [artifact-keeper org](https://github.com/artifact-keeper) are cloned as **git subtrees** (full history, no squash):  
+   | Prefix | Repo | Pinned SHA |
+   |---|---|---|
+   | `artifact-keeper/` | artifact-keeper/artifact-keeper | `fb2fcd799c9a87b49f2170f1f46bc26bb902500f` |
+   | `artifact-keeper-web/` | artifact-keeper/artifact-keeper-web | `10fd8569b6e91ad174867b45a971a55880029964` |
+   | `artifact-keeper-iac/` | artifact-keeper/artifact-keeper-iac | `583adb7d3f885ccb0b5e77a894ef89af374f1f96` |
+   | `artifact-keeper-api/` | artifact-keeper/artifact-keeper-api | `4d7d207f839b81ca4e11b6fb70fc7efd35d85a7d` |
+   | `artifact-keeper-example-plugin/` | artifact-keeper/artifact-keeper-example-plugin | `23d495209d8761dd14b71c2468c570a8b5156d28` |
+
 2. Inspect the code locally. Do not browse GitHub per-file when the subtree is available.
 3. Write findings under the `findings/` directory — one markdown file per topic, numbered (e.g. `001-ssrf-redirects.md`).
 4. Every finding must include **receipts**: links to specific source files at the pinned commit SHA.  
-   Link format: `https://github.com/artifact-keeper/artifact-keeper/blob/<SHA>/backend/src/...`  
-   Current pinned SHA: **`fb2fcd799c9a87b49f2170f1f46bc26bb902500f`**
+   Link format: `https://github.com/artifact-keeper/<repo>/blob/<SHA>/path/to/file`  
+   Use the pinned SHA from the table above for the relevant repo.
 5. Favor concrete proof over speculation.
 
-**Language note:** artifact-keeper is a **Rust** project (Cargo.toml, Cargo.lock). Not Go.  
-See `README.md` for Rust tooling setup on Linux.
+**Tech stack notes:**
+- **artifact-keeper** (backend): Rust (Cargo.toml, Cargo.lock). Not Go. See `README.md` for Rust tooling setup.
+- **artifact-keeper-web** (frontend): TypeScript / Next.js 15 / React 19 / Tailwind CSS 4
+- **artifact-keeper-iac** (infra): Terraform (AWS) / Helm 3 / ArgoCD / kube-prometheus
+- **artifact-keeper-api** (spec): OpenAPI 3.1 (auto-generated from backend annotations via utoipa) + SDK generators
+- **artifact-keeper-example-plugin** (plugins): Rust → WASM Component Model (wasm32-wasip2)
 
 This repository review is **not** a generic audit of every feature. The review should stay tightly aligned to the actual intended use cases below.
 
@@ -87,8 +98,8 @@ Important nuance:
 
 ## Scope of review
 
-### In scope
-Focus heavily on:
+### In scope — backend (`artifact-keeper/`)
+Primary review target. Focus heavily on:
 - PyPI proxy/repository behavior
 - npm proxy/repository behavior
 - Maven proxy/repository behavior
@@ -99,6 +110,34 @@ Focus heavily on:
 - upload and download handlers
 - cache/proxy semantics and continuity concerns
 - deployment hardening for private/internal-only use
+
+### In scope — frontend (`artifact-keeper-web/`)
+Secondary review. Focus on:
+- client-side auth token handling and storage
+- API URL configuration and CORS implications
+- any client-side secrets or credentials in code/config
+- XSS vectors in artifact metadata display
+- dependency supply chain (npm packages)
+
+### In scope — infrastructure (`artifact-keeper-iac/`)
+Review for deployment security posture:
+- Helm chart defaults (RBAC, NetworkPolicy, PodSecurityStandards)
+- Terraform module defaults (security groups, IAM, RDS config)
+- Secrets management approach (Secrets Manager, IRSA)
+- Default exposure (ingress, service types, public endpoints)
+- Monitoring/alerting gaps
+
+### In scope — API spec (`artifact-keeper-api/`)
+Light review:
+- API surface area assessment (277 operations across 24 groups)
+- Auth requirements per endpoint (missing auth on sensitive operations?)
+- SDK generation safety (no credential leaks in generated code)
+
+### In scope — example plugins (`artifact-keeper-example-plugin/`)
+Review in context of WASM plugin surface (finding 005):
+- WIT interface contract (what host capabilities are exposed)
+- Plugin install/load mechanism security
+- Reference implementation patterns that downstream plugin authors will copy
 
 ### Deprioritized
 Do not spend much time here unless findings force us to:
