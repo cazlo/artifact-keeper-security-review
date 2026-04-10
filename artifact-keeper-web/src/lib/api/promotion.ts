@@ -1,0 +1,151 @@
+import '@/lib/sdk-client';
+import {
+  listRepositories as sdkListRepositories,
+  listArtifacts as sdkListArtifacts,
+  promoteArtifact as sdkPromoteArtifact,
+  promoteArtifactsBulk as sdkPromoteArtifactsBulk,
+  promotionHistory as sdkPromotionHistory,
+} from '@artifact-keeper/sdk';
+import { getActiveInstanceBaseUrl } from '@/lib/sdk-client';
+import type {
+  PromoteArtifactRequest,
+  BulkPromoteRequest,
+  PromotionResponse,
+  BulkPromotionResponse,
+  PromotionHistoryResponse,
+  RejectArtifactRequest,
+  RejectArtifactResponse,
+} from '@/types/promotion';
+import type { Repository, PaginatedResponse, Artifact } from '@/types';
+
+export const promotionApi = {
+  /**
+   * List all staging repositories
+   */
+  listStagingRepos: async (params?: {
+    page?: number;
+    per_page?: number;
+    format?: string;
+  }): Promise<PaginatedResponse<Repository>> => {
+    const { data, error } = await sdkListRepositories({
+      query: {
+        ...params,
+        type: 'staging',
+      },
+    });
+    if (error) throw error;
+    return data as never;
+  },
+
+  /**
+   * List artifacts in a staging repository
+   */
+  listStagingArtifacts: async (
+    repoKey: string,
+    params?: {
+      page?: number;
+      per_page?: number;
+      path_prefix?: string;
+    }
+  ): Promise<PaginatedResponse<Artifact>> => {
+    const { data, error } = await sdkListArtifacts({
+      path: { key: repoKey },
+      query: params as never,
+    });
+    if (error) throw error;
+    return data as never;
+  },
+
+  /**
+   * List local (release) repositories that can be promotion targets
+   */
+  listReleaseRepos: async (params?: {
+    format?: string;
+  }): Promise<PaginatedResponse<Repository>> => {
+    const { data, error } = await sdkListRepositories({
+      query: {
+        ...params,
+        type: 'local',
+        per_page: 100,
+      },
+    });
+    if (error) throw error;
+    return data as never;
+  },
+
+  /**
+   * Promote a single artifact from staging to release
+   */
+  promoteArtifact: async (
+    repoKey: string,
+    artifactId: string,
+    request: PromoteArtifactRequest
+  ): Promise<PromotionResponse> => {
+    const { data, error } = await sdkPromoteArtifact({
+      path: { key: repoKey, artifact_id: artifactId },
+      body: request as never,
+    });
+    if (error) throw error;
+    return data as never;
+  },
+
+  /**
+   * Promote multiple artifacts from staging to release
+   */
+  promoteBulk: async (
+    repoKey: string,
+    request: BulkPromoteRequest
+  ): Promise<BulkPromotionResponse> => {
+    const { data, error } = await sdkPromoteArtifactsBulk({
+      path: { key: repoKey },
+      body: request as never,
+    });
+    if (error) throw error;
+    return data as never;
+  },
+
+  /**
+   * Get promotion history for a repository
+   */
+  getPromotionHistory: async (
+    repoKey: string,
+    params?: {
+      page?: number;
+      per_page?: number;
+      artifact_id?: string;
+      status?: string;
+    }
+  ): Promise<PromotionHistoryResponse> => {
+    const { data, error } = await sdkPromotionHistory({
+      path: { key: repoKey },
+      query: params as never,
+    });
+    if (error) throw error;
+    return data as never;
+  },
+
+  /**
+   * Reject a staging artifact
+   */
+  rejectArtifact: async (
+    repoKey: string,
+    artifactId: string,
+    request: RejectArtifactRequest
+  ): Promise<RejectArtifactResponse> => {
+    const baseUrl = getActiveInstanceBaseUrl();
+    const response = await fetch(
+      `${baseUrl}/api/v1/promotion/repositories/${encodeURIComponent(repoKey)}/artifacts/${encodeURIComponent(artifactId)}/reject`,
+      {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+      }
+    );
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.message || body.error || `Rejection failed: ${response.status}`);
+    }
+    return response.json();
+  },
+};
