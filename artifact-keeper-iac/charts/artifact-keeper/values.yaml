@@ -1,0 +1,399 @@
+# =============================================================================
+# EXAMPLE CONFIGURATION - Getting Started Template
+# =============================================================================
+# This file is provided as a starting point for deployments. It should be
+# reviewed and modified to match your specific infrastructure requirements,
+# security policies, and operational needs before use in production.
+# =============================================================================
+#
+# HOST REQUIREMENTS
+# -----------------
+# - vm.max_map_count >= 262144 (required by Meilisearch/LMDB)
+#     sysctl -w vm.max_map_count=262144
+#     echo "vm.max_map_count = 262144" >> /etc/sysctl.d/99-meilisearch.conf
+#
+# DEPLOYMENT STRATEGIES
+# ---------------------
+# Services that use PersistentVolumeClaims (Meilisearch, Trivy,
+# DependencyTrack) use the Recreate strategy in their templates.
+# This prevents two pods from competing for the same volume lock
+# during rolling updates. Do not change these to RollingUpdate.
+#
+# IMAGE TAGS
+# ----------
+# The "dev" tag on backend/web is a floating tag that always points to
+# the latest build from main. ArgoCD Image Updater pins these to specific
+# digests so rollouts are deterministic. If you deploy outside ArgoCD,
+# set imagePullPolicy: Always so restarts pull the latest dev build.
+#
+# RESOURCE SIZING
+# ---------------
+# These defaults target a single-node dev cluster. For production sizing,
+# see values-production.yaml. Key considerations:
+# - Meilisearch spawns one HTTP worker per CPU core (actix). On a 28-core
+#   node, that means 28 workers. The memory limit must be >= 8Gi for this.
+# - DependencyTrack needs 4Gi+ to load its vulnerability database.
+# - Backend memory scales with concurrent uploads and scan activity.
+#
+# =============================================================================
+
+# Default values for artifact-keeper (development profile)
+
+global:
+  # Container registry prefix. Default is ghcr.io.
+  # For Docker Hub, change to: docker.io/artifactkeeper
+  imageRegistry: ghcr.io/artifact-keeper
+  imagePullPolicy: Always
+  storageClass: standard
+
+  # -- Scheduling constraints applied to ALL workloads by default.
+  # Per-component values (e.g. backend.nodeSelector) override these.
+  #
+  # NOTE: Per-component values fully replace global, they do not merge.
+  # Setting backend.tolerations means the backend gets only those tolerations,
+  # not global + backend combined. There is currently no way to opt a single
+  # component out of global scheduling without setting its own values.
+  tolerations: []
+  affinity: {}
+  nodeSelector: {}
+  topologySpreadConstraints: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# -- Cosign image signature verification
+# When enabled, an init container verifies the backend image signature
+# before the pod starts. Uses sigstore keyless verification (GitHub OIDC).
+cosign:
+  enabled: false
+  image:
+    repository: gcr.io/projectsigstore/cosign
+    tag: v2.4.1
+  # OIDC issuer and identity for keyless verification
+  certificateOidcIssuer: "https://token.actions.githubusercontent.com"
+  certificateIdentityRegexp: "https://github.com/artifact-keeper/.*"
+
+# -- Backend API server
+# The backend handles all API requests, format-specific wire protocols,
+# and artifact storage. It runs as a single Rust binary (Axum).
+backend:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: ghcr.io/artifact-keeper/artifact-keeper-backend  # Docker Hub: artifactkeeper/backend
+    # -- "dev" is a floating tag built from main. ArgoCD Image Updater
+    # pins this to a digest automatically. For manual deploys, consider
+    # using a specific version tag (e.g. 1.1.0).
+    tag: dev
+    pullPolicy: Always
+  service:
+    type: ClusterIP
+    httpPort: 8080
+    grpcPort: 9090
+  env:
+    RUST_LOG: "info,artifact_keeper=debug"
+    HOST: "0.0.0.0"
+    PORT: "8080"
+    STORAGE_PATH: "/data/storage"
+    BACKUP_PATH: "/data/backups"
+    PLUGINS_DIR: "/data/plugins"
+    ENVIRONMENT: "development"
+    ADMIN_PASSWORD: "admin"
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+      ephemeral-storage: 256Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+      ephemeral-storage: 1Gi
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: ""
+  scanWorkspace:
+    enabled: true
+    size: 2Gi
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilization: 70
+    targetMemoryUtilization: 80
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+  # -- Per-component scheduling (overrides global)
+  tolerations: []
+  affinity: {}
+  nodeSelector: {}
+  topologySpreadConstraints: []
+  serviceAccount:
+    create: true
+    annotations: {}
+    name: ""
+
+# -- Next.js web frontend
+web:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: ghcr.io/artifact-keeper/artifact-keeper-web  # Docker Hub: artifactkeeper/web
+    tag: dev
+    pullPolicy: Always
+  service:
+    type: ClusterIP
+    port: 3000
+  env:
+    NEXT_PUBLIC_API_URL: ""
+    NODE_ENV: "production"
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+      ephemeral-storage: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+      ephemeral-storage: 2Gi
+
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+  # -- Per-component scheduling (overrides global)
+  tolerations: []
+  affinity: {}
+  nodeSelector: {}
+  topologySpreadConstraints: []
+
+# -- Edge replication service
+edge:
+  enabled: false
+  replicaCount: 1
+  image:
+    repository: ghcr.io/artifact-keeper/artifact-keeper-edge
+    tag: dev
+    pullPolicy: Always
+  service:
+    type: ClusterIP
+    port: 8081
+  env:
+    RUST_LOG: "info,artifact_keeper_edge=debug"
+    EDGE_HOST: "0.0.0.0"
+    EDGE_PORT: "8081"
+    CACHE_SIZE_MB: "10240"
+    HEARTBEAT_INTERVAL_SECS: "30"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+  # -- Per-component scheduling (overrides global)
+  tolerations: []
+  affinity: {}
+  nodeSelector: {}
+  topologySpreadConstraints: []
+
+# -- PostgreSQL (in-cluster, disable for external/RDS)
+# For production, set postgres.enabled=false and configure externalDatabase
+# to point at a managed database (RDS, Cloud SQL, etc.). The in-cluster
+# instance is suitable for dev/testing only.
+postgres:
+  enabled: true
+  image:
+    repository: postgres
+    tag: "16-alpine"
+  auth:
+    username: registry
+    password: registry
+    database: artifact_registry
+  persistence:
+    size: 20Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+      ephemeral-storage: 128Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+      ephemeral-storage: 512Mi
+  initDb:
+    enabled: true
+  # -- Per-component scheduling (overrides global)
+  tolerations: []
+  affinity: {}
+  nodeSelector: {}
+  topologySpreadConstraints: []
+
+# -- External database (used when postgres.enabled=false)
+externalDatabase:
+  host: ""
+  port: 5432
+  username: ""
+  password: ""
+  database: "artifact_registry"
+  existingSecret: ""
+  existingSecretKey: "DATABASE_URL"
+
+# -- Meilisearch (full-text search engine)
+# Powers full-text artifact search. Uses LMDB for storage (requires
+# vm.max_map_count >= 262144 on the host). The template hardcodes
+# MEILI_MAX_INDEXING_THREADS=4 to limit indexing parallelism.
+#
+# Memory sizing: Meilisearch spawns one actix HTTP worker per CPU core.
+# On a 28-core host, 28 workers start up simultaneously. With the default
+# 1Gi limit this causes immediate OOMKill. Set the limit to at least 4Gi,
+# or higher if the search index is large.
+#
+# The deployment uses Recreate strategy because the PVC-backed LMDB
+# database cannot be opened by two pods at once. Do not change this to
+# RollingUpdate or new pods will crash with "Resource temporarily
+# unavailable (os error 11)".
+meilisearch:
+  enabled: true
+  image:
+    repository: getmeili/meilisearch
+    # -- Use a major.minor tag (e.g. v1.12) for automatic patch updates,
+    # or pin to a specific patch (e.g. v1.12.8) for stability.
+    tag: v1.12
+  masterKey: "artifact-keeper-dev-key"
+  env: "development"
+  persistence:
+    size: 5Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+      ephemeral-storage: 128Mi
+    limits:
+      cpu: "2"
+      # -- Must be >= 4Gi on multi-core nodes. 8Gi recommended for nodes
+      # with 16+ cores. See Memory sizing note above.
+      memory: 8Gi
+      ephemeral-storage: 512Mi
+  # -- Per-component scheduling (overrides global)
+  tolerations: []
+  affinity: {}
+  nodeSelector: {}
+  topologySpreadConstraints: []
+
+# -- Trivy vulnerability scanner
+# Runs as a persistent server that the backend calls for image/SBOM scans.
+# Uses a PVC for its vulnerability database cache. Like Meilisearch, the
+# deployment uses Recreate strategy because the cache directory uses a file
+# lock that prevents concurrent access from two pods.
+trivy:
+  enabled: true
+  image:
+    repository: aquasec/trivy
+    tag: "0.62.1"
+  persistence:
+    size: 5Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+      ephemeral-storage: 128Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+      ephemeral-storage: 1Gi
+  # -- Per-component scheduling (overrides global)
+  tolerations: []
+  affinity: {}
+  nodeSelector: {}
+  topologySpreadConstraints: []
+
+# -- DependencyTrack SBOM analysis
+# Provides SBOM ingestion, license analysis, and vulnerability correlation.
+# Requires significant memory (4Gi+) to load its internal vulnerability
+# database on startup. The bootstrap init container creates the initial
+# admin user and API key for backend integration.
+dependencyTrack:
+  enabled: true
+  image:
+    repository: dependencytrack/apiserver
+    tag: "4.11.4"
+  adminPassword: "ArtifactKeeper2026!"
+  persistence:
+    size: 5Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 500m
+      memory: 4Gi
+      ephemeral-storage: 256Mi
+    limits:
+      cpu: "2"
+      memory: 6Gi
+      ephemeral-storage: 1Gi
+  bootstrap:
+    enabled: true
+  # -- Per-component scheduling (overrides global)
+  tolerations: []
+  affinity: {}
+  nodeSelector: {}
+  topologySpreadConstraints: []
+
+# -- Ingress configuration
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "1024m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+  host: artifacts.example.com
+  tls:
+    enabled: false
+    secretName: artifact-keeper-tls
+
+# -- Secrets
+# These are development defaults. For production, override via --set or
+# use existingSecret references. Never commit real credentials here.
+secrets:
+  jwtSecret: "dev-secret-change-in-production"
+  s3AccessKey: "minioadmin"
+  s3SecretKey: "minioadmin-secret"
+
+# -- External Secrets Operator
+# When enabled, ExternalSecret CRDs replace the static Secret template.
+# Requires External Secrets Operator installed on the cluster and a
+# SecretStore or ClusterSecretStore configured for your provider.
+externalSecrets:
+  enabled: false
+  # Name of the SecretStore or ClusterSecretStore to reference.
+  # If storeKind is ClusterSecretStore, the store must already exist.
+  storeName: aws-secrets-manager
+  storeKind: ClusterSecretStore
+  # Refresh interval for syncing secrets from the provider
+  refreshInterval: 1h
+  # AWS Secrets Manager paths for each secret. These must match the
+  # secret names in your AWS Secrets Manager configuration.
+  secrets:
+    jwtSecret: artifact-keeper/${ENVIRONMENT}/jwt-secret
+    dbCredentials: artifact-keeper/${ENVIRONMENT}/db-credentials
+    s3Keys: artifact-keeper/${ENVIRONMENT}/s3-keys
+    meilisearchKey: artifact-keeper/${ENVIRONMENT}/meilisearch-key
+    dtAdminPassword: artifact-keeper/${ENVIRONMENT}/dt-admin-password
+
+# -- Network policies
+networkPolicy:
+  enabled: false
+
+# -- Prometheus ServiceMonitor
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
