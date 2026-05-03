@@ -2356,6 +2356,15 @@ paths:
         The ticket can be passed as a `?ticket=` query parameter on endpoints that
 
         cannot use `Authorization` headers (e.g. `<a>` downloads, `EventSource` SSE).'
+      description: 'Security note: the resulting ticket value will appear in webserver access
+
+        logs, browser history, and `Referer` headers if it is embedded in a URL.
+
+        The mitigation is single-use consumption plus a 30-second TTL plus 256-bit
+
+        entropy. Clients should consume the ticket immediately and never share or
+
+        log the URL that contains it.'
       operationId: create_download_ticket
       requestBody:
         content:
@@ -2370,6 +2379,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TicketResponse'
+        '400':
+          description: Invalid resource_path
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '401':
           description: Not authenticated
           content:
@@ -3426,13 +3441,33 @@ paths:
         schema:
           type: string
           format: uuid
+      - name: member_limit
+        in: query
+        description: 'Maximum number of members to return (default: 50, max: 200)'
+        required: false
+        schema:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          minimum: 0
+      - name: member_offset
+        in: query
+        description: 'Number of members to skip for pagination (default: 0)'
+        required: false
+        schema:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          minimum: 0
       responses:
         '200':
-          description: Group details
+          description: Group details with paginated members
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/GroupResponse'
+                $ref: '#/components/schemas/GroupDetailResponse'
         '404':
           description: Group not found
         '500':
@@ -14007,6 +14042,25 @@ components:
           - string
           - 'null'
           format: uuid
+    GroupDetailResponse:
+      allOf:
+      - $ref: '#/components/schemas/GroupResponse'
+      - type: object
+        required:
+        - members
+        - members_total
+        properties:
+          members:
+            type: array
+            items:
+              $ref: '#/components/schemas/GroupMemberResponse'
+            description: Paginated list of group members.
+          members_total:
+            type: integer
+            format: int64
+            description: 'Total number of members in the group. Clients can compare this against
+
+              the length of `members` to determine whether additional pages exist.'
     GroupListResponse:
       type: object
       required:
@@ -14019,6 +14073,25 @@ components:
             $ref: '#/components/schemas/GroupResponse'
         pagination:
           $ref: '#/components/schemas/Pagination'
+    GroupMemberResponse:
+      type: object
+      required:
+      - user_id
+      - username
+      - joined_at
+      properties:
+        display_name:
+          type:
+          - string
+          - 'null'
+        joined_at:
+          type: string
+          format: date-time
+        user_id:
+          type: string
+          format: uuid
+        username:
+          type: string
     GroupResponse:
       type: object
       required:
