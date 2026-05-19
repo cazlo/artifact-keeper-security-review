@@ -718,7 +718,7 @@ paths:
     post:
       tags:
       - admin
-      summary: Trigger a full Meilisearch reindex of all artifacts and repositories.
+      summary: Trigger a full OpenSearch reindex of all artifacts and repositories.
       description: Requires admin privileges and Meilisearch to be configured.
       operationId: trigger_reindex
       responses:
@@ -734,11 +734,36 @@ paths:
           description: Internal server error
       security:
       - bearer_auth: []
+  /api/v1/admin/rescan-for-inventory:
+    post:
+      tags:
+      - admin
+      operationId: rescan_for_inventory
+      requestBody:
+        description: Optional; empty body uses defaults
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RescanForInventoryRequest'
+        required: true
+      responses:
+        '200':
+          description: Rescans enqueued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RescanForInventoryResponse'
+        '403':
+          description: Admin privileges required
+        '503':
+          description: Scanner service not configured
+      security:
+      - bearer_auth: []
   /api/v1/admin/search/reindex:
     post:
       tags:
       - admin
-      summary: Trigger a full reindex of all artifacts and repositories in Meilisearch.
+      summary: Trigger a full reindex of all artifacts and repositories in OpenSearch.
       description: 'The reindex runs asynchronously in the background. The endpoint returns
 
         immediately with a confirmation that the task was started.'
@@ -751,7 +776,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ReindexResponse'
         '500':
-          description: Meilisearch is not configured
+          description: Search engine is not configured
   /api/v1/admin/settings:
     get:
       tags:
@@ -789,6 +814,36 @@ paths:
                 $ref: '#/components/schemas/SystemSettings'
         '500':
           description: Internal server error
+      security:
+      - bearer_auth: []
+  /api/v1/admin/smtp/test:
+    post:
+      tags:
+      - admin
+      summary: Send a test email to verify SMTP configuration.
+      description: 'Requires admin privileges. Sends a short test message to the provided
+
+        recipient address and reports whether delivery succeeded.'
+      operationId: send_test_email
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SmtpTestRequest'
+        required: true
+      responses:
+        '200':
+          description: Test email sent successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SmtpTestResponse'
+        '400':
+          description: Invalid request (e.g. bad email address)
+        '403':
+          description: Admin privileges required
+        '503':
+          description: SMTP not configured
       security:
       - bearer_auth: []
   /api/v1/admin/sso/ldap:
@@ -3421,6 +3476,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/GroupResponse'
+        '401':
+          description: Authentication required
+        '403':
+          description: Insufficient permissions
         '409':
           description: Group name already exists
         '500':
@@ -3500,6 +3559,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/GroupResponse'
+        '401':
+          description: Authentication required
+        '403':
+          description: Insufficient permissions
         '404':
           description: Group not found
         '500':
@@ -3522,6 +3585,10 @@ paths:
       responses:
         '200':
           description: Group deleted successfully
+        '401':
+          description: Authentication required
+        '403':
+          description: Insufficient permissions
         '404':
           description: Group not found
         '500':
@@ -3551,6 +3618,10 @@ paths:
       responses:
         '200':
           description: Members added successfully
+        '401':
+          description: Authentication required
+        '403':
+          description: Insufficient permissions
         '404':
           description: Group not found
         '500':
@@ -3579,6 +3650,10 @@ paths:
       responses:
         '200':
           description: Members removed successfully
+        '401':
+          description: Authentication required
+        '403':
+          description: Insufficient permissions
         '404':
           description: Group not found
         '500':
@@ -6254,6 +6329,84 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
       security:
       - bearer_auth: []
+  /api/v1/promotion/repositories/{key}/release-target:
+    get:
+      tags:
+      - promotion
+      summary: Get the linked release target for a staging repository.
+      operationId: get_release_target
+      parameters:
+      - name: key
+        in: path
+        description: Staging repository key
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Release target information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReleaseTargetResponse'
+        '404':
+          description: Repository not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Repository is not a staging repository
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - bearer_auth: []
+    put:
+      tags:
+      - promotion
+      summary: Set or remove the linked release target for a staging repository.
+      description: 'The release repository must exist, be type Local, and share the same package
+
+        format as the staging repository. Pass `null` for `release_repository_key` to
+
+        remove the link.'
+      operationId: set_release_target
+      parameters:
+      - name: key
+        in: path
+        description: Staging repository key
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetReleaseTargetRequest'
+        required: true
+      responses:
+        '200':
+          description: Release target updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReleaseTargetResponse'
+        '404':
+          description: Repository not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security:
+      - bearer_auth: []
   /api/v1/quality/checks:
     get:
       tags:
@@ -6666,6 +6819,101 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
       security:
       - bearer_auth: []
+  /api/v1/quarantine/{artifact_id}:
+    get:
+      tags:
+      - quarantine
+      summary: Get quarantine status for an artifact
+      operationId: get_quarantine_status
+      parameters:
+      - name: artifact_id
+        in: path
+        description: Artifact ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Quarantine status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuarantineStatusResponse'
+        '401':
+          description: Authentication required
+        '404':
+          description: Artifact not found
+      security:
+      - bearer_auth: []
+  /api/v1/quarantine/{artifact_id}/reject:
+    post:
+      tags:
+      - quarantine
+      summary: Reject a quarantined artifact (admin only)
+      operationId: reject_artifact
+      parameters:
+      - name: artifact_id
+        in: path
+        description: Artifact ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RejectRequest'
+        required: true
+      responses:
+        '200':
+          description: Artifact rejected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuarantineActionResponse'
+        '401':
+          description: Authentication required
+        '403':
+          description: Admin access required
+        '404':
+          description: Artifact not found
+        '409':
+          description: Artifact is not in quarantined state
+      security:
+      - bearer_auth: []
+  /api/v1/quarantine/{artifact_id}/release:
+    post:
+      tags:
+      - quarantine
+      summary: Release an artifact from quarantine (admin only)
+      operationId: release_artifact
+      parameters:
+      - name: artifact_id
+        in: path
+        description: Artifact ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Artifact released
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuarantineActionResponse'
+        '401':
+          description: Authentication required
+        '403':
+          description: Admin access required
+        '404':
+          description: Artifact not found
+        '409':
+          description: Artifact is not in quarantined state
+      security:
+      - bearer_auth: []
   /api/v1/repositories:
     get:
       tags:
@@ -6739,6 +6987,8 @@ paths:
                 $ref: '#/components/schemas/RepositoryResponse'
         '401':
           description: Authentication required
+        '403':
+          description: Insufficient permissions
         '409':
           description: Repository key already exists
       security:
@@ -6782,6 +7032,8 @@ paths:
           description: Repository deleted
         '401':
           description: Authentication required
+        '403':
+          description: Insufficient permissions
         '404':
           description: Repository not found
       security:
@@ -6813,6 +7065,8 @@ paths:
                 $ref: '#/components/schemas/RepositoryResponse'
         '401':
           description: Authentication required
+        '403':
+          description: Insufficient permissions
         '404':
           description: Repository not found
         '409':
@@ -6859,6 +7113,18 @@ paths:
           - 'null'
       - name: path_prefix
         in: query
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
+      - name: group_by
+        in: query
+        description: 'When set to `maven_component`, Maven/Gradle artifacts are grouped by
+
+          groupId, artifactId, and version.  Individual files (jar, pom, checksums)
+
+          appear in the `artifact_files` array of each component.'
         required: false
         schema:
           type:
@@ -7052,6 +7318,100 @@ paths:
           description: Redirect to S3 presigned URL
         '404':
           description: Artifact not found
+  /api/v1/repositories/{key}/email-subscriptions:
+    get:
+      tags:
+      - email_subscriptions
+      summary: List the email subscriptions configured on a repository.
+      operationId: list_subscriptions
+      parameters:
+      - name: key
+        in: path
+        description: Repository key
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: List of email subscriptions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmailSubscriptionListResponse'
+        '401':
+          description: Not authenticated
+        '403':
+          description: Insufficient permissions
+        '404':
+          description: Repository not found
+      security:
+      - bearer_auth: []
+    post:
+      tags:
+      - email_subscriptions
+      summary: Create an email subscription scoped to a repository.
+      operationId: create_subscription
+      parameters:
+      - name: key
+        in: path
+        description: Repository key
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateEmailSubscriptionRequest'
+        required: true
+      responses:
+        '201':
+          description: Subscription created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmailSubscriptionResponse'
+        '400':
+          description: Validation error
+        '401':
+          description: Not authenticated
+        '403':
+          description: Insufficient permissions
+        '404':
+          description: Repository not found
+      security:
+      - bearer_auth: []
+  /api/v1/repositories/{key}/email-subscriptions/{subscription_id}:
+    delete:
+      tags:
+      - email_subscriptions
+      summary: Delete an email subscription by id.
+      operationId: delete_subscription
+      parameters:
+      - name: key
+        in: path
+        description: Repository key
+        required: true
+        schema:
+          type: string
+      - name: subscription_id
+        in: path
+        description: Subscription ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Subscription deleted
+        '401':
+          description: Not authenticated
+        '403':
+          description: Insufficient permissions
+        '404':
+          description: Subscription or repository not found
+      security:
+      - bearer_auth: []
   /api/v1/repositories/{key}/labels:
     get:
       tags:
@@ -7181,15 +7541,19 @@ paths:
           type: string
       responses:
         '200':
-          description: List of virtual repository members
+          description: List of virtual repository members (filtered to caller-visible members)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/VirtualMembersListResponse'
         '400':
           description: Repository is not virtual
+        '401':
+          description: Authentication required
         '404':
           description: Repository not found
+      security:
+      - bearer_auth: []
     put:
       tags:
       - repositories
@@ -7252,6 +7616,8 @@ paths:
           description: Authentication required
         '404':
           description: Repository or member not found
+        '409':
+          description: Member already exists in virtual repository
       security:
       - bearer_auth: []
   /api/v1/repositories/{key}/members/{member_key}:
@@ -7282,6 +7648,89 @@ paths:
           description: Authentication required
         '404':
           description: Repository or member not found
+      security:
+      - bearer_auth: []
+  /api/v1/repositories/{key}/routing-rules:
+    get:
+      tags:
+      - repositories
+      summary: Get routing rules for a repository
+      operationId: get_routing_rules
+      parameters:
+      - name: key
+        in: path
+        description: Repository key
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Current routing rules
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoutingRulesResponse'
+        '404':
+          description: Repository not found
+    post:
+      tags:
+      - repositories
+      summary: Set routing rules for a repository
+      description: 'Routing rules rewrite the request path before it is forwarded to the
+
+        upstream server. This is useful for proxying resources like GitHub Releases
+
+        where the client-facing path structure differs from the upstream URL
+
+        layout. Rules are evaluated in order and the first match wins.'
+      operationId: set_routing_rules
+      parameters:
+      - name: key
+        in: path
+        description: Repository key
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetRoutingRulesRequest'
+        required: true
+      responses:
+        '200':
+          description: Routing rules saved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoutingRulesResponse'
+        '400':
+          description: Invalid rule (bad regex or capture reference)
+        '401':
+          description: Authentication required
+        '404':
+          description: Repository not found
+      security:
+      - bearer_auth: []
+    delete:
+      tags:
+      - repositories
+      summary: Delete all routing rules for a repository
+      operationId: delete_routing_rules
+      parameters:
+      - name: key
+        in: path
+        description: Repository key
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Routing rules deleted
+        '401':
+          description: Authentication required
+        '404':
+          description: Repository not found
       security:
       - bearer_auth: []
   /api/v1/repositories/{key}/security:
@@ -7433,6 +7882,140 @@ paths:
           description: Repository not found
         '502':
           description: Upstream unreachable
+      security:
+      - bearer_auth: []
+  /api/v1/repositories/{key}/tokens:
+    get:
+      tags:
+      - repository_tokens
+      summary: List all access tokens configured on a repository.
+      operationId: list_repo_tokens
+      parameters:
+      - name: key
+        in: path
+        description: Repository key
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: List of tokens on this repository
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepoTokenListResponse'
+        '401':
+          description: Not authenticated
+        '403':
+          description: Insufficient permissions
+        '404':
+          description: Repository not found
+      security:
+      - bearer_auth: []
+    post:
+      tags:
+      - repository_tokens
+      summary: Create a new access token scoped to a repository.
+      description: 'The token is automatically restricted to this repository. The plaintext
+
+        token value is returned only in this response and cannot be retrieved later.'
+      operationId: create_repo_token
+      parameters:
+      - name: key
+        in: path
+        description: Repository key
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRepoTokenRequest'
+        required: true
+      responses:
+        '200':
+          description: Token created (value shown once)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateRepoTokenResponse'
+        '400':
+          description: Validation error
+        '401':
+          description: Not authenticated
+        '403':
+          description: Insufficient permissions
+        '404':
+          description: Repository not found
+      security:
+      - bearer_auth: []
+  /api/v1/repositories/{key}/tokens/{token_id}:
+    get:
+      tags:
+      - repository_tokens
+      summary: Get details of a specific token on a repository.
+      operationId: get_repo_token
+      parameters:
+      - name: key
+        in: path
+        description: Repository key
+        required: true
+        schema:
+          type: string
+      - name: token_id
+        in: path
+        description: Token ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Token details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepoTokenResponse'
+        '401':
+          description: Not authenticated
+        '403':
+          description: Insufficient permissions
+        '404':
+          description: Repository or token not found
+      security:
+      - bearer_auth: []
+    delete:
+      tags:
+      - repository_tokens
+      summary: Revoke an access token from a repository.
+      description: 'This soft-revokes the token by setting `revoked_at`. The token will
+
+        immediately stop working for authentication.'
+      operationId: revoke_repo_token
+      parameters:
+      - name: key
+        in: path
+        description: Repository key
+        required: true
+        schema:
+          type: string
+      - name: token_id
+        in: path
+        description: Token ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Token revoked
+        '401':
+          description: Not authenticated
+        '403':
+          description: Insufficient permissions
+        '404':
+          description: Repository or token not found
       security:
       - bearer_auth: []
   /api/v1/repositories/{key}/upstream-auth:
@@ -8244,6 +8827,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DashboardResponse'
+        '403':
+          description: Admin privileges required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
       security:
       - bearer_auth: []
   /api/v1/security/findings/{id}/acknowledge:
@@ -8272,6 +8861,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/FindingResponse'
+        '403':
+          description: Admin privileges required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Finding not found
           content:
@@ -8299,6 +8894,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/FindingResponse'
+        '403':
+          description: Admin privileges required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Finding not found
           content:
@@ -8460,7 +9061,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-        '500':
+        '503':
           description: Scanner service not configured
           content:
             application/json:
@@ -8608,6 +9209,12 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/ScoreResponse'
+        '403':
+          description: Admin privileges required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
       security:
       - bearer_auth: []
   /api/v1/service-accounts:
@@ -9376,6 +9983,26 @@ paths:
           description: Internal server error
       security:
       - bearer_auth: []
+  /api/v1/system/config:
+    get:
+      tags:
+      - system
+      summary: Return public runtime configuration.
+      description: 'No authentication required. This endpoint exposes only non-sensitive
+
+        configuration values that help frontends adapt their behavior (e.g.
+
+        showing upload limits, conditionally rendering scanner UI, initiating
+
+        OIDC flows).'
+      operationId: get_system_config
+      responses:
+        '200':
+          description: Public runtime configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemConfigResponse'
   /api/v1/tree:
     get:
       tags:
@@ -9730,66 +10357,6 @@ paths:
           description: Validation error
       security:
       - bearer_auth: []
-  /api/v1/users/me:
-    get:
-      tags:
-      - users
-      summary: Get the currently-authenticated user.
-      description: 'Resolves the user UUID from the JWT/API-token auth context and returns the
-
-        same payload as `GET /users/{id}`. Added for issue #1008 so that
-
-        `GET /api/v1/users/me` no longer fails with a UUID parse error. Mounted
-
-        under [`self_service_router`] so it is reachable by any authenticated user
-
-        (issue #1008 R1 Security: must NOT be gated by `admin_middleware`).'
-      operationId: get_current_user
-      responses:
-        '200':
-          description: Current user details
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/AdminUserResponse'
-        '401':
-          description: Not authenticated
-        '404':
-          description: User not found
-      security:
-      - bearer_auth: []
-  /api/v1/users/me/password:
-    post:
-      tags:
-      - users
-      summary: Change the currently-authenticated user's password.
-      description: 'Convenience alias for `POST /users/{id}/password` that resolves the user
-
-        UUID from the auth context. Used by the first-time setup flow documented
-
-        in `admin.password` (issue #1008). Mounted under [`self_service_router`]
-
-        so a non-admin in the forced must_change_password flow can complete it
-
-        without tripping `admin_middleware` (issue #1008 R1 Security).'
-      operationId: change_my_password
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ChangePasswordRequest'
-        required: true
-      responses:
-        '200':
-          description: Password changed successfully
-        '401':
-          description: Current password is incorrect
-        '404':
-          description: User not found
-        '422':
-          description: Validation error
-      security:
-      - bearer_auth: []
   /api/v1/users/{id}:
     get:
       tags:
@@ -9865,6 +10432,39 @@ paths:
                 $ref: '#/components/schemas/AdminUserResponse'
         '404':
           description: User not found
+      security:
+      - bearer_auth: []
+  /api/v1/users/{id}/force-password-change:
+    post:
+      tags:
+      - users
+      summary: 'Force a user to change their password on next login (admin only).
+
+        Sets must_change_password=true and invalidates existing sessions so the
+
+        user is prompted immediately on their next login.'
+      operationId: force_password_change
+      parameters:
+      - name: id
+        in: path
+        description: User ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Flag set successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForcePasswordChangeResponse'
+        '403':
+          description: Only administrators can force password changes
+        '404':
+          description: User not found
+        '422':
+          description: Cannot force password change for SSO users
       security:
       - bearer_auth: []
   /api/v1/users/{id}/password:
@@ -10143,7 +10743,14 @@ paths:
     post:
       tags:
       - webhooks
-      summary: Create webhook
+      summary: Create webhook.
+      description: 'Generates a fresh signing secret (or accepts a caller-supplied one),
+
+        encrypts it at rest, and returns the raw secret in the response body
+
+        **once**. After this call, GET on the webhook returns only
+
+        `secret_digest`, never the raw secret.'
       operationId: create_webhook
       requestBody:
         content:
@@ -10153,11 +10760,11 @@ paths:
         required: true
       responses:
         '200':
-          description: Webhook created successfully
+          description: Webhook created. Body includes the raw secret exactly once.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/WebhookResponse'
+                $ref: '#/components/schemas/WebhookSecretCreatedResponse'
         '422':
           description: Validation error
         '500':
@@ -10333,6 +10940,59 @@ paths:
           description: Webhook not found
       security:
       - bearer_auth: []
+  /api/v1/webhooks/{id}/rotate-secret:
+    post:
+      tags:
+      - webhooks
+      summary: Rotate the signing secret for a webhook.
+      description: 'Generates a new raw secret, encrypts it, moves the existing
+
+        `secret_encrypted` into `secret_previous_encrypted`, and stamps an
+
+        expiry 24 hours in the future. The new raw secret is returned in the
+
+        response body **once**. The HMAC signing path (added in a later ticket)
+
+        signs deliveries with both secrets while the previous one is within
+
+        its expiry window so consumers can rotate without dropped events.
+
+
+        If a previous-secret window is still active when the rotate request
+
+        arrives, the request is REJECTED with HTTP 409 Conflict. This prevents
+
+        two near-simultaneous rotations from clobbering the original
+
+        `secret_previous_encrypted` material before the operator has finished
+
+        distributing the previous new key. The 409 body is structured:
+
+        `{"error": "rotation_already_in_progress", "expires_at": "<RFC3339>"}`.'
+      operationId: rotate_webhook_secret
+      parameters:
+      - name: id
+        in: path
+        description: Webhook ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Secret rotated. Body includes the new raw secret exactly once.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RotateWebhookSecretResponse'
+        '404':
+          description: Webhook not found
+        '409':
+          description: A previous rotation overlap window is still active
+        '500':
+          description: Encryption key not configured
+      security:
+      - bearer_auth: []
   /api/v1/webhooks/{id}/test:
     post:
       tags:
@@ -10362,10 +11022,10 @@ paths:
     get:
       tags:
       - health
-      summary: Health check endpoint — rich status page for dashboards.
+      summary: Health check endpoint -- rich status page for dashboards.
       description: 'Checks database, storage (real write/read probe), optional services (Trivy,
 
-        Meilisearch), and exposes DB connection pool statistics.'
+        OpenSearch), and exposes DB connection pool statistics.'
       operationId: health_check
       responses:
         '200':
@@ -10384,7 +11044,7 @@ paths:
     get:
       tags:
       - health
-      summary: Liveness probe — confirms the process is alive and can serve HTTP.
+      summary: Liveness probe - confirms the process is alive and can serve HTTP.
       description: 'Takes no State parameter. If Axum can route the request and execute this
 
         function, the process is alive. External service failures cannot trigger
@@ -10402,10 +11062,25 @@ paths:
     get:
       tags:
       - health
-      summary: Readiness probe — is the service ready to accept traffic?
-      description: 'Checks database connectivity, that migrations have run successfully,
+      summary: Readiness probe - is the service ready to accept traffic?
+      description: 'Returns 200 once the database is reachable and migrations have applied
 
-        and that initial setup (admin password) is complete.'
+        successfully. Initial-setup state (whether the default admin password has
+
+        been changed) is reported as an informational field on the response but
+
+        does NOT influence the status code: a 503 here would make Kubernetes
+
+        restart the pod, terminating any `kubectl exec` session an operator is
+
+        using to complete setup. See issue #889.
+
+
+        API mutations are separately gated by the setup middleware
+
+        (`api::middleware::setup`) until setup is complete, so a 200 from this
+
+        endpoint does not imply that write traffic will be accepted.'
       operationId: readiness_check
       responses:
         '200':
@@ -10898,6 +11573,13 @@ components:
       - items
       - pagination
       properties:
+        components:
+          type:
+          - array
+          - 'null'
+          items:
+            $ref: '#/components/schemas/MavenComponentResponse'
+          description: Maven component grouping.  Only present when `group_by=maven_component`.
         items:
           type: array
           items:
@@ -11062,6 +11744,25 @@ components:
         role_id:
           type: string
           format: uuid
+    AuthConfig:
+      type: object
+      description: Authentication provider availability.
+      required:
+      - oidc_enabled
+      - ldap_enabled
+      - sso_enabled
+      properties:
+        ldap_enabled:
+          type: boolean
+          description: Whether an LDAP directory is configured.
+        oidc_enabled:
+          type: boolean
+          description: Whether an OIDC provider is configured.
+        sso_enabled:
+          type: boolean
+          description: 'Whether SAML SSO is configured (derived from the SSO admin settings in the DB,
+
+            but for this endpoint we report whether the OIDC issuer is set as a proxy).'
     BackupListResponse:
       type: object
       required:
@@ -11441,7 +12142,6 @@ components:
     BulkPromoteRequest:
       type: object
       required:
-      - target_repository
       - artifact_ids
       properties:
         artifact_ids:
@@ -11456,7 +12156,12 @@ components:
         skip_policy_check:
           type: boolean
         target_repository:
-          type: string
+          type:
+          - string
+          - 'null'
+          description: 'Target release repository key. When omitted, the staging repository''s
+
+            linked release target (from `repository_config`) is used instead.'
     BulkPromotionResponse:
       type: object
       required:
@@ -12167,6 +12872,26 @@ components:
           description: 'Source registry type: "artifactory" (default) or "nexus"'
         url:
           type: string
+    CreateEmailSubscriptionRequest:
+      type: object
+      required:
+      - recipients
+      - event_types
+      properties:
+        enabled:
+          type: boolean
+        event_types:
+          type: array
+          items:
+            type: string
+          description: Event-type tokens to listen for. Must be drawn from `VALID_EVENT_TYPES`.
+        recipients:
+          type: array
+          items:
+            type: string
+          description: 'Email addresses to deliver matching events to. Bounded length;
+
+            see `MAX_RECIPIENTS_PER_SUBSCRIPTION` for the operator-facing limit.'
     CreateGateRequest:
       type: object
       required:
@@ -12387,8 +13112,22 @@ components:
           - 'null'
         issuer_url:
           type: string
+        map_groups_to_groups:
+          type:
+          - boolean
+          - 'null'
+          description: 'When `true`, OIDC group claim values are reflected as Artifact Keeper
+
+            group memberships (auto-creating groups on first sight). Defaults to
+
+            `false` to preserve legacy role-mapping behavior.'
         name:
           type: string
+        pkce_enabled:
+          type:
+          - boolean
+          - 'null'
+          description: Enable PKCE (S256) on the authorization request. Defaults to `true`.
         scopes:
           type:
           - array
@@ -12451,6 +13190,53 @@ components:
           format: uuid
         require_signature:
           type: boolean
+    CreateRepoTokenRequest:
+      type: object
+      description: Request to create an access token scoped to a repository.
+      required:
+      - name
+      - scopes
+      properties:
+        description:
+          type:
+          - string
+          - 'null'
+          description: Optional human-readable description.
+        expires_in_days:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Number of days until the token expires (1-365). Omit for no expiration.
+        name:
+          type: string
+          description: Display name for the token.
+        scopes:
+          type: array
+          items:
+            type: string
+          description: Permission scopes for the token.
+    CreateRepoTokenResponse:
+      type: object
+      description: 'Response returned when a repository token is created. The `token` field
+
+        contains the plaintext value and is only shown once.'
+      required:
+      - id
+      - token
+      - name
+      - repository_key
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        repository_key:
+          type: string
+        token:
+          type: string
+          description: The full token value (only returned at creation time).
     CreateRepositoryRequest:
       type: object
       required:
@@ -12459,6 +13245,19 @@ components:
       - format
       - repo_type
       properties:
+        allow_anonymous_access:
+          type:
+          - boolean
+          - 'null'
+          description: 'Alias for `is_public`. When set to true, anonymous users can download
+
+            artifacts from this repository without authentication. Useful for remote
+
+            (pull-through cache) repositories that proxy public upstream registries.
+
+            If both `is_public` and `allow_anonymous_access` are provided,
+
+            `allow_anonymous_access` takes precedence.'
         description:
           type:
           - string
@@ -12831,6 +13630,15 @@ components:
       - url
       - events
       properties:
+        event_schema_version:
+          type:
+          - string
+          - 'null'
+          description: 'Pinned event payload version. Defaults to "2026-04-01" when omitted.
+
+            Must match a value in `SUPPORTED_EVENT_VERSIONS` or the request is
+
+            rejected with HTTP 422.'
         events:
           type: array
           items:
@@ -12841,6 +13649,9 @@ components:
           - 'null'
         name:
           type: string
+        payload_template:
+          $ref: '#/components/schemas/PayloadTemplate'
+          description: 'Payload layout for the target platform (default: generic).'
         repository_id:
           type:
           - string
@@ -12850,6 +13661,11 @@ components:
           type:
           - string
           - 'null'
+          description: 'Optional caller-supplied secret. When omitted the server generates a
+
+            fresh `whsec_*` secret. Either way the raw value is returned in the
+
+            201 response body exactly once and is unrecoverable thereafter.'
         url:
           type: string
     CreatedGroupRow:
@@ -13654,12 +14470,34 @@ components:
           format: int64
     DtStatusResponse:
       type: object
+      description: "Dependency-Track integration status surfaced to the frontend.\n\n`healthy` is the boolean the existing\
+        \ UI already binds to. The new\n`error_status` and `error_message` fields let the UI distinguish a\ngenuine \"DT replied\
+        \ OK with no findings\" state from \"DT is down or\nmisconfigured\" (issue #963). When `healthy = true` both error\
+        \ fields\nare None; when `healthy = false`:\n  - `error_status = Some(401)`: auth failure (check API key)\n  - `error_status\
+        \ = Some(5xx)`: upstream is broken\n  - `error_status = None`:     transport failure (DT pod unreachable)\n  - `error_message`:\
+        \           operator-facing failure description"
       required:
       - enabled
       - healthy
       properties:
         enabled:
           type: boolean
+        error_message:
+          type:
+          - string
+          - 'null'
+          description: 'Human-readable explanation when `healthy = false`. Safe to surface
+
+            in the UI; does not leak credentials.'
+        error_status:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: 'Upstream HTTP status if the health probe got a response, else None.
+
+            Only populated when `healthy = false`.'
+          minimum: 0
         healthy:
           type: boolean
         url:
@@ -13700,6 +14538,49 @@ components:
           type: string
         vulnId:
           type: string
+    EmailSubscriptionListResponse:
+      type: object
+      required:
+      - subscriptions
+      properties:
+        subscriptions:
+          type: array
+          items:
+            $ref: '#/components/schemas/EmailSubscriptionResponse'
+    EmailSubscriptionResponse:
+      type: object
+      required:
+      - id
+      - recipients
+      - event_types
+      - enabled
+      - created_at
+      - updated_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        enabled:
+          type: boolean
+        event_types:
+          type: array
+          items:
+            type: string
+        id:
+          type: string
+          format: uuid
+        recipients:
+          type: array
+          items:
+            type: string
+        repository_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        updated_at:
+          type: string
+          format: date-time
     ErrorResponse:
       type: object
       description: Standard error response body returned by all endpoints on failure.
@@ -13885,6 +14766,14 @@ components:
           - string
           - 'null'
         title:
+          type: string
+    ForcePasswordChangeResponse:
+      type: object
+      description: Response for force password change
+      required:
+      - message
+      properties:
+        message:
           type: string
     FormatHandlerResponse:
       type: object
@@ -14263,7 +15152,7 @@ components:
           oneOf:
           - type: 'null'
           - $ref: '#/components/schemas/CheckStatus'
-        meilisearch:
+        opensearch:
           oneOf:
           - type: 'null'
           - $ref: '#/components/schemas/CheckStatus'
@@ -14734,6 +15623,15 @@ components:
     ListArtifactsQuery:
       type: object
       properties:
+        group_by:
+          type:
+          - string
+          - 'null'
+          description: 'When set to `maven_component`, Maven/Gradle artifacts are grouped by
+
+            groupId, artifactId, and version.  Individual files (jar, pom, checksums)
+
+            appear in the `artifact_files` array of each component.'
         page:
           type:
           - integer
@@ -15000,6 +15898,62 @@ components:
           format: uuid
         key:
           type: string
+    MavenComponentResponse:
+      type: object
+      description: 'A Maven component grouped by GAV (groupId, artifactId, version).
+
+
+        Each component collects the individual files (jar, pom, checksums, etc.)
+
+        that share the same Maven coordinates.'
+      required:
+      - id
+      - group_id
+      - artifact_id
+      - version
+      - repository_key
+      - format
+      - size_bytes
+      - download_count
+      - created_at
+      - artifact_files
+      properties:
+        artifact_files:
+          type: array
+          items:
+            type: string
+          description: Individual filenames belonging to this component.
+        artifact_id:
+          type: string
+          description: Maven artifactId (e.g. `junit-jupiter-api`).
+        created_at:
+          type: string
+          format: date-time
+          description: Earliest creation timestamp among the component files.
+        download_count:
+          type: integer
+          format: int64
+          description: Total download count across all files in this component.
+        format:
+          type: string
+          description: Repository format (always `maven` or `gradle`).
+        group_id:
+          type: string
+          description: Maven groupId with dots (e.g. `org.junit.jupiter`).
+        id:
+          type: string
+          format: uuid
+          description: Representative artifact ID (the first file in the group).
+        repository_key:
+          type: string
+          description: Repository key this component belongs to.
+        size_bytes:
+          type: integer
+          format: int64
+          description: Total size in bytes across all files in this component.
+        version:
+          type: string
+          description: Maven version string (e.g. `5.11.0`).
     MembersRequest:
       type: object
       required:
@@ -15356,6 +16310,8 @@ components:
       - attribute_mapping
       - is_enabled
       - auto_create_users
+      - pkce_enabled
+      - map_groups_to_groups
       - created_at
       - updated_at
       properties:
@@ -15377,8 +16333,12 @@ components:
           type: boolean
         issuer_url:
           type: string
+        map_groups_to_groups:
+          type: boolean
         name:
           type: string
+        pkce_enabled:
+          type: boolean
         scopes:
           type: array
           items:
@@ -15611,6 +16571,22 @@ components:
           type: integer
           format: int32
           minimum: 0
+    PayloadTemplate:
+      type: string
+      description: 'Supported webhook payload templates.
+
+
+        Controls how the outgoing JSON body is structured when delivering a
+
+        webhook. The `Generic` variant preserves backward compatibility with the
+
+        original flat JSON format.'
+      enum:
+      - generic
+      - slack
+      - microsoft_teams
+      - discord
+      - mattermost
     PeerInstanceListResponse:
       type: object
       required:
@@ -15910,6 +16886,25 @@ components:
         updated_at:
           type: string
           format: date-time
+    PermissionsConfig:
+      type: object
+      description: Fine-grained permissions enforcement status.
+      required:
+      - rules_exist
+      - enforcement_enabled
+      properties:
+        enforcement_enabled:
+          type: boolean
+          description: 'Whether those rules are actively enforced on API requests.
+
+            The permission-check middleware and handler guards are wired in,
+
+            so this is `true` when the server is running.'
+        rules_exist:
+          type: boolean
+          description: 'Whether the permissions table (from migration 018) has any rows.
+
+            When true, an administrator has configured permission rules.'
     PluginConfigResponse:
       type: object
       required:
@@ -16197,8 +17192,6 @@ components:
           format: uuid
     PromoteArtifactRequest:
       type: object
-      required:
-      - target_repository
       properties:
         notes:
           type:
@@ -16207,7 +17200,12 @@ components:
         skip_policy_check:
           type: boolean
         target_repository:
-          type: string
+          type:
+          - string
+          - 'null'
+          description: 'Target release repository key. When omitted, the staging repository''s
+
+            linked release target (from `repository_config`) is used instead.'
     PromotionHistoryEntry:
       type: object
       required:
@@ -16394,6 +17392,40 @@ components:
         updated_at:
           type: string
           format: date-time
+    QuarantineActionResponse:
+      type: object
+      required:
+      - artifact_id
+      - new_status
+      - message
+      properties:
+        artifact_id:
+          type: string
+          format: uuid
+        message:
+          type: string
+        new_status:
+          type: string
+    QuarantineStatusResponse:
+      type: object
+      required:
+      - artifact_id
+      - is_blocked
+      properties:
+        artifact_id:
+          type: string
+          format: uuid
+        is_blocked:
+          type: boolean
+        quarantine_status:
+          type:
+          - string
+          - 'null'
+        quarantine_until:
+          type:
+          - string
+          - 'null'
+          format: date-time
     QuickSearchResponse:
       type: object
       required:
@@ -16492,6 +17524,14 @@ components:
           - 'null'
         reason:
           type: string
+    RejectRequest:
+      type: object
+      properties:
+        reason:
+          type:
+          - string
+          - 'null'
+          description: Optional reason for rejection.
     RejectionResponse:
       type: object
       required:
@@ -16513,6 +17553,25 @@ components:
           format: uuid
         source:
           type: string
+    ReleaseTargetResponse:
+      type: object
+      required:
+      - linked
+      properties:
+        linked:
+          type: boolean
+          description: Whether this staging repository has a linked release target.
+        release_repository_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: The release repository ID, if linked.
+        release_repository_key:
+          type:
+          - string
+          - 'null'
+          description: The release repository key, if linked.
     RemoteInstanceResponse:
       type: object
       required:
@@ -16619,6 +17678,64 @@ components:
           items:
             type: string
             format: uuid
+    RepoTokenListResponse:
+      type: object
+      description: List of tokens configured on a repository.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RepoTokenResponse'
+    RepoTokenResponse:
+      type: object
+      description: Summary of a repository-scoped token.
+      required:
+      - id
+      - name
+      - token_prefix
+      - scopes
+      - created_at
+      - is_expired
+      - is_revoked
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        created_by:
+          type:
+          - string
+          - 'null'
+        description:
+          type:
+          - string
+          - 'null'
+        expires_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        id:
+          type: string
+          format: uuid
+        is_expired:
+          type: boolean
+        is_revoked:
+          type: boolean
+        last_used_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        name:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        token_prefix:
+          type: string
     RepositoryAssessment:
       type: object
       required:
@@ -16669,11 +17786,19 @@ components:
       - format
       - repo_type
       - is_public
+      - allow_anonymous_access
       - storage_used_bytes
       - upstream_auth_configured
       - created_at
       - updated_at
       properties:
+        allow_anonymous_access:
+          type: boolean
+          description: 'Whether anonymous (unauthenticated) downloads are allowed. This is
+
+            always equal to `is_public` and provided as a convenience alias so
+
+            the semantics are clear for remote (pull-through cache) repositories.'
         created_at:
           type: string
           format: date-time
@@ -16818,6 +17943,41 @@ components:
         storage_bytes:
           type: integer
           format: int64
+    RescanForInventoryRequest:
+      type: object
+      properties:
+        limit:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: 'Maximum number of artifacts to enqueue in this call. Operators
+
+            run the endpoint repeatedly to drain large backfills without
+
+            stalling a single HTTP worker; the handler returns the actual
+
+            number enqueued so the caller can detect when work is done.
+
+            Defaults to 100. Hard-capped at 1000 to avoid pathological inputs.'
+    RescanForInventoryResponse:
+      type: object
+      required:
+      - artifacts_enqueued
+      - limit
+      properties:
+        artifacts_enqueued:
+          type: integer
+          format: int64
+          description: 'Number of artifacts whose latest scan had no inventory rows and
+
+            for which a rescan was enqueued in this call.'
+        limit:
+          type: integer
+          format: int64
+          description: 'Echo of the requested (or defaulted) limit, useful for clients
+
+            driving the loop programmatically.'
     ResetPasswordResponse:
       type: object
       description: Response for password reset
@@ -16897,6 +18057,56 @@ components:
           type: array
           items:
             type: string
+    RotateWebhookSecretResponse:
+      type: object
+      description: Response returned by the rotate-secret endpoint.
+      required:
+      - id
+      - secret
+      - secret_digest
+      - previous_secret_expires_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        previous_secret_expires_at:
+          type: string
+          format: date-time
+          description: When the previously active secret stops being accepted.
+        secret:
+          type: string
+          description: Raw signing secret produced by this rotation. Shown exactly once.
+        secret_digest:
+          type: string
+    RoutingRule:
+      type: object
+      description: A single routing rule that maps an incoming path to a rewritten path.
+      required:
+      - path_pattern
+      - rewrite_to
+      properties:
+        path_pattern:
+          type: string
+          description: 'Regex pattern matched against the full request path.
+
+            Use capture groups to extract portions for the rewrite template.'
+        rewrite_to:
+          type: string
+          description: 'Rewrite template. Use `$1`, `$2`, etc. to reference captured groups
+
+            from `path_pattern`.'
+    RoutingRulesResponse:
+      type: object
+      required:
+      - repository_key
+      - rules
+      properties:
+        repository_key:
+          type: string
+        rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/RoutingRule'
     RuleEvaluationResponse:
       type: object
       required:
@@ -17161,6 +18371,7 @@ components:
       - low_count
       - info_count
       - created_at
+      - is_reused
       properties:
         artifact_id:
           type: string
@@ -17200,6 +18411,15 @@ components:
         info_count:
           type: integer
           format: int32
+        is_reused:
+          type: boolean
+          description: 'True when the row was synthesized by the dedup path (`copy_scan_results`)
+
+            because a prior scan with the same `(checksum_sha256, scan_type)` pair
+
+            already existed within the dedup TTL. No scanner was actually invoked
+
+            for this row; counts and findings were copied from `source_scan_id`.'
         low_count:
           type: integer
           format: int32
@@ -17215,6 +18435,18 @@ components:
           type:
           - string
           - 'null'
+        source_scan_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: 'When `is_reused` is true, the `id` of the source scan whose results
+
+            were copied. Useful for distinguishing "fresh scan" from "deduped
+
+            satisfaction" in release-gate provenance checks. None for original
+
+            (non-reused) scans.'
         started_at:
           type:
           - string
@@ -17222,6 +18454,23 @@ components:
           format: date-time
         status:
           type: string
+    ScannersConfig:
+      type: object
+      description: Scanner availability flags.
+      required:
+      - trivy_enabled
+      - openscap_enabled
+      - dependency_track_enabled
+      properties:
+        dependency_track_enabled:
+          type: boolean
+          description: Whether the Dependency-Track integration is configured.
+        openscap_enabled:
+          type: boolean
+          description: Whether the OpenSCAP compliance scanner is configured.
+        trivy_enabled:
+          type: boolean
+          description: Whether the Trivy vulnerability scanner is configured.
     ScoreResponse:
       type: object
       required:
@@ -17515,6 +18764,28 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/PeerLabelEntrySchema'
+    SetReleaseTargetRequest:
+      type: object
+      properties:
+        release_repository_key:
+          type:
+          - string
+          - 'null'
+          description: 'Repository key of the release (local) repository to link.
+
+            Pass `null` or omit to remove the link.'
+    SetRoutingRulesRequest:
+      type: object
+      required:
+      - rules
+      properties:
+        rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/RoutingRule'
+          description: 'Ordered list of routing rules. Each rule specifies a regex pattern and
+
+            a rewrite template. Rules are evaluated in order during proxy requests.'
     SetupStatusResponse:
       type: object
       description: Response body for the setup status endpoint.
@@ -17609,6 +18880,28 @@ components:
           type:
           - string
           - 'null'
+    SmtpTestRequest:
+      type: object
+      description: Request body for the SMTP test endpoint.
+      required:
+      - to
+      properties:
+        to:
+          type: string
+          description: Recipient email address for the test message.
+    SmtpTestResponse:
+      type: object
+      description: Response from the SMTP test endpoint.
+      required:
+      - success
+      - message
+      properties:
+        message:
+          type: string
+          description: Human-readable status message.
+        success:
+          type: boolean
+          description: Whether the test email was sent successfully.
     SourceConnectionRow:
       type: object
       required:
@@ -17959,6 +19252,67 @@ components:
           format: int32
         storage_key:
           type: string
+    SystemConfigResponse:
+      type: object
+      description: 'Public runtime configuration values.
+
+
+        This response intentionally omits all secrets, credentials, and internal
+
+        connection strings. Only values useful for UI/client behavior are included.'
+      required:
+      - max_upload_size_bytes
+      - demo_mode
+      - guest_access_enabled
+      - scanners
+      - search_engine
+      - storage_backend
+      - auth
+      - permissions
+      properties:
+        auth:
+          $ref: '#/components/schemas/AuthConfig'
+          description: Authentication provider availability.
+        demo_mode:
+          type: boolean
+          description: Whether the instance is running in demo mode (writes blocked).
+        guest_access_enabled:
+          type: boolean
+          description: 'Whether anonymous (unauthenticated) access is permitted at all (issue #850).
+
+            When `false`, the server rejects all unauthenticated requests except for
+
+            the login, setup, health, and OCI challenge endpoints. Frontends should
+
+            hide UI affordances that imply public access (e.g. the "public repo"
+
+            toggle) and redirect unauthenticated users to the login page.'
+        max_upload_size_bytes:
+          type: integer
+          format: int64
+          description: Maximum upload size in bytes (0 means no limit).
+          minimum: 0
+        oidc_issuer:
+          type:
+          - string
+          - 'null'
+          description: 'OIDC issuer URL, if configured. This is public information needed by
+
+            clients to initiate the OIDC flow.'
+        permissions:
+          $ref: '#/components/schemas/PermissionsConfig'
+          description: 'Fine-grained permissions enforcement status. Permission rules can be
+
+            managed via /api/v1/permissions and are actively enforced.'
+        scanners:
+          $ref: '#/components/schemas/ScannersConfig'
+          description: Scanner availability.
+        search_engine:
+          type: string
+          description: 'Search engine type: "opensearch" when configured, "database" otherwise.'
+        storage_backend:
+          type: string
+          description: Storage backend type (e.g. "filesystem", "s3", "gcs", "azure").
     SystemSettings:
       type: object
       required:
@@ -18388,6 +19742,25 @@ components:
           minimum: 0
         message:
           type: string
+        scan_result_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: 'Scan result IDs created (one per active scanner) when triggering an
+
+            artifact-level scan. Empty for repository-level scans (where the
+
+            per-artifact rows are created inside the spawned worker) and for
+
+            artifact-level triggers when no scanners are configured.
+
+
+            Clients (and the release-gate test in artifact-keeper-test#58) should
+
+            poll `GET /api/v1/security/scans/{id}` against these IDs rather than
+
+            guessing the most-recent scan from `GET /artifacts/{id}/scans`.'
     UninstallQuery:
       type: object
       description: Request for uninstalling a plugin
@@ -18603,6 +19976,22 @@ components:
           type:
           - object
           - 'null'
+          description: 'Partial update for `attribute_mapping`. Keys present in this object
+
+            overwrite the matching keys in the stored mapping. Keys not present
+
+            are preserved. To remove a key, set it to `null`. To replace the
+
+            whole mapping atomically, set `attribute_mapping_replace = true`.
+
+            (See issue #1191.)'
+        attribute_mapping_replace:
+          type:
+          - boolean
+          - 'null'
+          description: 'When `true`, treat `attribute_mapping` as a wholesale replacement
+
+            (legacy behavior). Defaults to `false` — partial merge.'
         auto_create_users:
           type:
           - boolean
@@ -18623,9 +20012,17 @@ components:
           type:
           - string
           - 'null'
+        map_groups_to_groups:
+          type:
+          - boolean
+          - 'null'
         name:
           type:
           - string
+          - 'null'
+        pkce_enabled:
+          type:
+          - boolean
           - 'null'
         scopes:
           type:
@@ -18674,6 +20071,21 @@ components:
     UpdateRepositoryRequest:
       type: object
       properties:
+        allow_anonymous_access:
+          type:
+          - boolean
+          - 'null'
+          description: 'Alias for `is_public`. When set to true, anonymous users can download
+
+            artifacts without authentication. Useful for remote (pull-through cache)
+
+            repositories that proxy public upstream registries. Write operations
+
+            (upload, delete) still require authentication regardless of this setting.
+
+            If both `is_public` and `allow_anonymous_access` are provided,
+
+            `allow_anonymous_access` takes precedence.'
         description:
           type:
           - string
@@ -18697,11 +20109,41 @@ components:
           type:
           - string
           - 'null'
+        quarantine_duration_minutes:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: 'Quarantine hold duration in minutes for this repository.
+
+            Stored in `repository_config` under `quarantine_duration_minutes`.'
+        quarantine_enabled:
+          type:
+          - boolean
+          - 'null'
+          description: 'Enable or disable quarantine period for this repository.
+
+            When enabled, newly uploaded artifacts are held until scanned.
+
+            Stored in `repository_config` under `quarantine_enabled`.'
         quota_bytes:
           type:
           - integer
           - 'null'
           format: int64
+        release_repository_key:
+          type:
+          - string
+          - 'null'
+          description: 'Link this staging repository to a release (local) repository.
+
+            Promotions from this staging repo will default to the linked release repo,
+
+            and promotions to any other repo will be rejected.
+
+            Pass an empty string to remove the link.
+
+            Stored in `repository_config` under `release_repository_id`.'
     UpdateRuleRequest:
       type: object
       properties:
@@ -19150,11 +20592,20 @@ components:
       - url
       - events
       - is_enabled
+      - payload_template
+      - event_schema_version
       - created_at
       properties:
         created_at:
           type: string
           format: date-time
+        event_schema_version:
+          type: string
+          description: 'Pinned event payload version (e.g. "2026-04-01"). Determines the
+
+            shape of the rendered payload and the value sent in the
+
+            `X-ArtifactKeeper-Event-Version` header.'
         events:
           type: array
           items:
@@ -19175,13 +20626,46 @@ components:
           format: date-time
         name:
           type: string
+        payload_template:
+          $ref: '#/components/schemas/PayloadTemplate'
         repository_id:
           type:
           - string
           - 'null'
           format: uuid
+        secret_digest:
+          type:
+          - string
+          - 'null'
+          description: 'Short non-reversible identifier for the current signing secret
+
+            (`whsec_...abcd`), suitable for display in operator UIs. The raw
+
+            secret is never returned by GET or LIST.'
+        secret_rotation_active:
+          type: boolean
+          description: 'True while a previous secret is still accepted by the retry path
+
+            during a rotation overlap window.'
         url:
           type: string
+    WebhookSecretCreatedResponse:
+      allOf:
+      - $ref: '#/components/schemas/WebhookResponse'
+      - type: object
+        required:
+        - secret
+        properties:
+          secret:
+            type: string
+            description: 'Raw signing secret. Display this to the operator immediately and
+
+              instruct them to record it; the server retains only the encrypted
+
+              form and a short digest.'
+      description: 'Response returned exactly once when a webhook is created or its secret
+
+        is rotated. The raw `secret` value is not retrievable afterwards.'
   securitySchemes:
     bearer_auth:
       type: http
@@ -19236,12 +20720,18 @@ tags:
   description: Single sign-on configuration
 - name: migration
   description: Data migration and import
+- name: quarantine
+  description: Artifact quarantine period management
 - name: quality
   description: Artifact health scoring and quality gates
 - name: service_accounts
   description: Service account management
 - name: health
   description: Health and readiness checks
+- name: system
+  description: Public system configuration
+- name: email_subscriptions
+  description: Per-repository email subscription management
 - name: repository-labels
   description: Repository label management
 - name: peer-instance-labels
@@ -19250,3 +20740,5 @@ tags:
   description: Artifact label management
 - name: uploads
   description: Chunked/resumable file uploads
+- name: repository_tokens
+  description: Repository-scoped access token management
