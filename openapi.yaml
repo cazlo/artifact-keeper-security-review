@@ -7120,11 +7120,11 @@ paths:
           - 'null'
       - name: group_by
         in: query
-        description: 'When set to `maven_component`, Maven/Gradle artifacts are grouped by
-
-          groupId, artifactId, and version.  Individual files (jar, pom, checksums)
-
-          appear in the `artifact_files` array of each component.'
+        description: "Server-side artifact grouping.\n\nSupported values:\n- `maven_component`: Maven/Gradle artifacts are\
+          \ grouped by\n  groupId, artifactId, and version.  Individual files (jar, pom,\n  checksums) appear in the `artifact_files`\
+          \ array of each component.\n- `docker_tag`: Docker/OCI artifacts are grouped by (image, tag),\n  with `total_size_bytes`\
+          \ summed across the manifest config and\n  referenced layer blobs.  The grouped rows are returned in the\n  `docker_tags`\
+          \ array."
         required: false
         schema:
           type:
@@ -11580,6 +11580,13 @@ components:
           items:
             $ref: '#/components/schemas/MavenComponentResponse'
           description: Maven component grouping.  Only present when `group_by=maven_component`.
+        docker_tags:
+          type:
+          - array
+          - 'null'
+          items:
+            $ref: '#/components/schemas/DockerTagResponse'
+          description: Docker tag grouping.  Only present when `group_by=docker_tag`.
         items:
           type: array
           items:
@@ -14050,6 +14057,88 @@ components:
           - 'null'
         status:
           type: string
+    DockerTagResponse:
+      type: object
+      description: 'A Docker/OCI tag grouped by (image, tag).
+
+
+        `total_size_bytes` is the server-side aggregation of the manifest body
+
+        plus every referenced layer blob.  This is what the UI should display
+
+        as the on-disk image size; the previous client-side aggregation that
+
+        only summed the manifest body itself reported a few kilobytes for
+
+        images that are hundreds of megabytes on disk (artifact-keeper#1193).
+
+
+        For multi-arch image indexes the size is the sum across all per-arch
+
+        child manifests recorded in `oci_manifest_refs`, so an `amd64+arm64`
+
+        index reports the combined storage cost.'
+      required:
+      - id
+      - repository_key
+      - image
+      - tag
+      - manifest_digest
+      - total_size_bytes
+      - layer_count
+      - is_index
+      - last_pushed_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Representative manifest artifact ID.
+        image:
+          type: string
+          description: 'Image name (no registry host, no tag).  Maps to the OCI v2 `<name>`
+
+            path segment, which may include slashes (e.g. `library/postgres`).'
+        is_index:
+          type: boolean
+          description: Whether this manifest is a multi-arch image index.
+        last_pushed_at:
+          type: string
+          format: date-time
+          description: Last push (or update) timestamp from the underlying `oci_tags` row.
+        layer_count:
+          type: integer
+          format: int32
+          description: 'Number of layer blobs referenced by the manifest.  For image indexes
+
+            this is the sum of layer counts across child manifests.  `0` when
+
+            the manifest could not be parsed.'
+        manifest_digest:
+          type: string
+          description: Manifest content digest (e.g. `sha256:abcdef...`).
+        repository_key:
+          type: string
+          description: Repository key this tag belongs to.
+        scan_status:
+          type:
+          - string
+          - 'null'
+          description: 'Latest scan status (`pending`, `running`, `completed`, `failed`) from
+
+            `scan_results`, if the manifest has ever been scanned.  `None` when
+
+            the artifact has never been scanned.'
+        tag:
+          type: string
+          description: 'Tag string (e.g. `16-alpine`).  Never a `sha256:...` digest;
+
+            digest-only references are filtered out of the grouping.'
+        total_size_bytes:
+          type: integer
+          format: int64
+          description: 'Total size in bytes of the manifest plus all referenced layer blobs.
+
+            For image indexes, this sums across child manifests.'
     DownloadTrend:
       type: object
       description: Download trend data point.
@@ -15627,11 +15716,11 @@ components:
           type:
           - string
           - 'null'
-          description: 'When set to `maven_component`, Maven/Gradle artifacts are grouped by
-
-            groupId, artifactId, and version.  Individual files (jar, pom, checksums)
-
-            appear in the `artifact_files` array of each component.'
+          description: "Server-side artifact grouping.\n\nSupported values:\n- `maven_component`: Maven/Gradle artifacts are\
+            \ grouped by\n  groupId, artifactId, and version.  Individual files (jar, pom,\n  checksums) appear in the `artifact_files`\
+            \ array of each component.\n- `docker_tag`: Docker/OCI artifacts are grouped by (image, tag),\n  with `total_size_bytes`\
+            \ summed across the manifest config and\n  referenced layer blobs.  The grouped rows are returned in the\n  `docker_tags`\
+            \ array."
         page:
           type:
           - integer
@@ -18888,7 +18977,12 @@ components:
       properties:
         to:
           type: string
-          description: Recipient email address for the test message.
+          description: 'Recipient email address for the test message.
+
+
+            Accepts `recipient` as an alias for backward compatibility with Web UI
+
+            versions <= 1.1.3, which send `{"recipient": "..."}`.'
     SmtpTestResponse:
       type: object
       description: Response from the SMTP test endpoint.
