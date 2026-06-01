@@ -352,6 +352,8 @@ paths:
           description: Backup cancelled
         '404':
           description: Backup not found
+        '409':
+          description: Backup is not in a cancellable state
         '500':
           description: Internal server error
       security:
@@ -2308,6 +2310,12 @@ paths:
           description: Redirect to frontend with exchange code
         '400':
           description: Invalid callback parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Invalid or expired SSO state (CSRF)
           content:
             application/json:
               schema:
@@ -5116,6 +5124,46 @@ paths:
       security:
       - bearer_auth: []
   /api/v1/peers/{id}/repositories/{repo_id}:
+    get:
+      tags:
+      - peers
+      summary: Get full subscription details for a (peer, repo) pair.
+      description: 'Returns the per-subscription `replication_mode`, `replication_schedule`,
+
+        and `replication_filter` exactly as persisted by `POST /:id/repositories`.
+
+        Round-trips the filter so callers can verify that a scheduled-sync
+
+        filter (e.g. `{"include_patterns": ["\\.tar\\.gz$"]}`) was persisted.'
+      operationId: get_subscription
+      parameters:
+      - name: id
+        in: path
+        description: Peer instance ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: repo_id
+        in: path
+        description: Repository ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Subscription details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubscriptionResponse'
+        '404':
+          description: Subscription not found
+        '500':
+          description: Internal server error
+      security:
+      - bearer_auth: []
     delete:
       tags:
       - peers
@@ -5141,6 +5189,47 @@ paths:
           description: Repository unassigned successfully
         '404':
           description: Peer instance or repository not found
+        '500':
+          description: Internal server error
+      security:
+      - bearer_auth: []
+  /api/v1/peers/{id}/repositories/{repo_id}/sync:
+    post:
+      tags:
+      - peers
+      summary: Trigger an immediate sync for a single (peer, repo) subscription.
+      description: 'Queues one `sync_task` per artifact in the repository at priority 100
+
+        without waiting for the next cron tick. Idempotent: if tasks are already
+
+        pending for the same artifacts, the unique constraint
+
+        `(peer_instance_id, artifact_id, task_type)` skips duplicates.'
+      operationId: run_subscription_now
+      parameters:
+      - name: id
+        in: path
+        description: Peer instance ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: repo_id
+        in: path
+        description: Repository ID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '202':
+          description: Sync tasks queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunNowResponse'
+        '404':
+          description: Subscription not found
         '500':
           description: Internal server error
       security:
@@ -8177,16 +8266,23 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
       security:
       - bearer_auth: []
-  /api/v1/sbom/cve/history/{artifact_id}:
+  /api/v1/sbom/cve/history/by-artifact/{artifact_id}:
     get:
       tags:
       - sbom
-      summary: Get CVE history for an artifact
-      operationId: get_cve_history
+      summary: Get CVE history for one artifact (typed UUID variant).
+      description: 'Canonical replacement for the UUID branch of the overloaded
+
+        `/cve/history/{id}` route. Returns every CVE ever detected against the
+
+        given artifact, deduped across curated `cve_history` rows and live
+
+        `scan_findings` projections.'
+      operationId: get_cve_history_by_artifact
       parameters:
       - name: artifact_id
         in: path
-        description: Artifact ID
+        description: Artifact UUID
         required: true
         schema:
           type: string
@@ -8200,6 +8296,151 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/CveHistoryEntry'
+        '403':
+          description: Caller does not have access to this artifact's repository
+        '404':
+          description: Artifact not found
+      security:
+      - bearer_auth: []
+  /api/v1/sbom/cve/history/by-cve/{cve_id}:
+    get:
+      tags:
+      - sbom
+      summary: 'Get CVE history for one CVE identifier across artifacts (typed CVE-id
+
+        variant).'
+      description: 'Canonical replacement for the CVE-id branch of the overloaded
+
+        `/cve/history/{id}` route. Returns every artifact the caller can access
+
+        where the given CVE has been detected.'
+      operationId: get_cve_history_by_cve
+      parameters:
+      - name: cve_id
+        in: path
+        description: CVE identifier (e.g. CVE-2019-10744)
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: CVE history entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CveHistoryEntry'
+        '400':
+          description: Path id is not a valid CVE identifier
+      security:
+      - bearer_auth: []
+  /api/v1/sbom/cve/history/{id}:
+    get:
+      tags:
+      - sbom
+      summary: Get CVE history by artifact UUID or CVE identifier (legacy overload).
+      description: "The path param accepts either:\n  - A UUID `artifact_id` (legacy shape, returns all CVEs for one artifact)\n\
+        \  - A CVE id like `CVE-2019-10744` (returns this CVE across every artifact\n    the caller can access)\n\n# URL design\
+        \ decision (#1385 round-2)\n\nOverloading a single `{id}` path parameter to mean two different lookups\nis a REST\
+        \ anti-pattern: the route's behavior changes based on a runtime\ncontent sniff. We considered splitting into two routes\
+        \ vs documenting the\noverload and chose **both**: the split routes\n`GET /cve/history/by-artifact/{uuid}` and `GET\
+        \ /cve/history/by-cve/{cve_id}`\nare the canonical shape for new clients (typed path params, no sniff),\nwhile this\
+        \ overload remains so the v1.2.0 SDKs that already shipped\nagainst the single-route shape keep working. New code\
+        \ should prefer the\nsplit routes; the overload may be deprecated in v1.3.\n\nIssue #1375: prior to this fix the route\
+        \ was typed `Path<Uuid>`, so any\nCVE-id call (e.g. the release-gate `GET /sbom/cve/history/CVE-2019-10744`)\nfailed\
+        \ Axum's path extractor with a bare HTTP 400, leaving consumers\nunable to look up history by CVE."
+      operationId: get_cve_history
+      parameters:
+      - name: id
+        in: path
+        description: Artifact UUID or CVE identifier (e.g. CVE-2019-10744). Prefer the typed routes /cve/history/by-artifact/{uuid}
+          or /cve/history/by-cve/{cve_id}.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: CVE history entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CveHistoryEntry'
+        '400':
+          description: Path id is neither a valid UUID nor a valid CVE identifier
+      security:
+      - bearer_auth: []
+  /api/v1/sbom/cve/status/by-artifact/{artifact_id}/by-cve/{cve_id}:
+    post:
+      tags:
+      - sbom
+      summary: Update CVE status for a synth (scan_findings-derived) Security tab row.
+      description: 'Background (#1426): the Security tab read path projects `scan_findings`
+
+        into `CveHistoryEntry` rows whose `id` is a deterministic SHA-256 hash
+
+        (see `synth_cve_id`). Those ids have no corresponding row in the
+
+        `cve_history` table, so calls to `POST /cve/status/{id}` always 404 -- a
+
+        dead acknowledge path. This route operates on the only stable identity a
+
+        synth row carries, the (artifact_id, cve_id) pair, and writes the
+
+        underlying `scan_findings` rows instead.
+
+
+        The wider design choice between (A) populating `cve_history` from the
+
+        scanner loop and (B) treating `scan_findings` as the source of truth for
+
+        the Security tab is settled here in favour of B: less code, less risk of
+
+        data drift between two parallel tables, and `cve_history` remains in
+
+        place for the rare curated/admin write path via the legacy
+
+        `POST /cve/status/{id}` route.'
+      operationId: update_cve_status_by_artifact_cve
+      parameters:
+      - name: artifact_id
+        in: path
+        description: Artifact UUID
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: cve_id
+        in: path
+        description: CVE identifier (e.g. CVE-2019-10744)
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCveStatusRequest'
+        required: true
+      responses:
+        '200':
+          description: Updated synth CVE entry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CveHistoryEntry'
+        '400':
+          description: Validation error (e.g. invalid CVE id or unsupported status)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Caller does not have access to this artifact's repository
+        '404':
+          description: No scan_findings rows match (artifact_id, cve_id)
       security:
       - bearer_auth: []
   /api/v1/sbom/cve/status/{id}:
@@ -8462,6 +8703,25 @@ paths:
       tags:
       - sbom
       summary: Convert an SBOM to a different format
+      description: 'Returns the converted SBOM as a [`SbomContentResponse`]: the metadata
+
+        row plus the full converted document under `content`. The `content` is
+
+        load-bearing here. A consumer that asked for `target_format=spdx` needs
+
+        the SPDX document (`content.spdxVersion`, `content.SPDXID`, ...) to feed
+
+        downstream attestation tooling, and a `target_format=cyclonedx` request
+
+        needs `content.bomFormat == "CycloneDX"`. Returning metadata-only
+
+        (`SbomResponse`) dropped the converted document entirely, so callers
+
+        could not tell an SPDX result from a CycloneDX one and round-trip
+
+        conversion appeared to lose the document shape. (release-gate
+
+        `test-sbom-convert.sh` 2.5.a / 2.5.b.)'
       operationId: convert_sbom
       parameters:
       - name: id
@@ -8479,11 +8739,11 @@ paths:
         required: true
       responses:
         '200':
-          description: Converted SBOM
+          description: Converted SBOM with content
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SbomResponse'
+                $ref: '#/components/schemas/SbomContentResponse'
         '404':
           description: SBOM not found
           content:
@@ -9057,6 +9317,12 @@ paths:
                 $ref: '#/components/schemas/TriggerScanResponse'
         '400':
           description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: bypass_dedup requested by non-admin caller
           content:
             application/json:
               schema:
@@ -10760,7 +11026,7 @@ paths:
         required: true
       responses:
         '200':
-          description: Webhook created. Body includes the raw secret exactly once.
+          description: Webhook created. Body includes the raw secret exactly once (omitted when created unsigned).
           content:
             application/json:
               schema:
@@ -10769,6 +11035,9 @@ paths:
           description: Validation error
         '500':
           description: Internal server error
+        '503':
+          description: A secret was supplied but AK_WEBHOOK_SECRET_KEY is not configured, so the secret cannot be encrypted
+            at rest
       security:
       - bearer_auth: []
   /api/v1/webhooks/{id}:
@@ -11727,7 +11996,15 @@ components:
       type: object
       required:
       - repository_id
+      - replication_filter
       properties:
+        replication_filter:
+          type: object
+          description: 'Optional JSONB filter constraining which artifacts in the repository
+
+            get replicated. Shape: `{"include_patterns": ["^v\\d+\\."], "exclude_patterns": [".*-SNAPSHOT$"]}`.
+
+            Null/absent means replicate everything.'
         replication_mode:
           type:
           - string
@@ -13508,6 +13785,17 @@ components:
           type: string
         enabled:
           type: boolean
+        filter:
+          type:
+          - string
+          - 'null'
+          description: 'Convenience glob filter (e.g. `"*.tar.gz"`). When set, it is folded
+
+            into `artifact_filter.include_paths` so only matching artifact paths
+
+            are eligible for sync. Ignored if `artifact_filter.include_paths` is
+
+            already provided.'
         name:
           type: string
         peer_selector:
@@ -13863,7 +14151,26 @@ components:
           $ref: '#/components/schemas/CveStatus'
     CveTrends:
       type: object
-      description: CVE trends summary.
+      description: 'CVE trends summary.
+
+
+        #1446: the security-tests `cve-history` suite probes the trends body for
+
+        any of `total`, `count`, `critical`, or `high` to confirm the response
+
+        carries aggregate counts (PR #1385 fixed `cve-history` but the trends
+
+        shape was not aligned). The original field set (`total_cves`,
+
+        `critical_count`, ...) is retained for openapi consumers; the bare
+
+        `total`/`critical`/`high`/`medium`/`low` aliases are added alongside so
+
+        both shape contracts are satisfied without breaking existing clients.
+
+        `#[serde(default)]` keeps deserialization working when the alias fields
+
+        are absent (older payloads, tests that build the struct via field init).'
       required:
       - total_cves
       - open_cves
@@ -13883,18 +14190,34 @@ components:
           - number
           - 'null'
           format: double
+        critical:
+          type: integer
+          format: int64
+          description: Alias of `critical_count` (#1446).
         critical_count:
           type: integer
           format: int64
         fixed_cves:
           type: integer
           format: int64
+        high:
+          type: integer
+          format: int64
+          description: Alias of `high_count` (#1446).
         high_count:
           type: integer
           format: int64
+        low:
+          type: integer
+          format: int64
+          description: Alias of `low_count` (#1446).
         low_count:
           type: integer
           format: int64
+        medium:
+          type: integer
+          format: int64
+          description: Alias of `medium_count` (#1446).
         medium_count:
           type: integer
           format: int64
@@ -13905,6 +14228,10 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/CveTimelineEntry'
+        total:
+          type: integer
+          format: int64
+          description: Alias of `total_cves` (#1446).
         total_cves:
           type: integer
           format: int64
@@ -14123,11 +14450,12 @@ components:
           type:
           - string
           - 'null'
-          description: 'Latest scan status (`pending`, `running`, `completed`, `failed`) from
-
-            `scan_results`, if the manifest has ever been scanned.  `None` when
-
-            the artifact has never been scanned.'
+          description: "Rolled-up scan status across all scanners configured for this\nartifact. `None` when the artifact\
+            \ has never been scanned.\n\nValues surface the aggregate state, not a single scanner's row\n(see #1497). One\
+            \ of:\n\n* `pending` / `running` -- at least one scanner is still in flight\n* `completed` -- every per-scan-type\
+            \ latest row is `completed`\n* `failed` -- every per-scan-type latest row is `failed`\n* `partial` -- mixed: at\
+            \ least one `completed` AND at least one\n  `failed`. A green generic scanner (e.g. grype) no longer hides\n \
+            \ a failed format-native scanner (e.g. incus) behind a\n  `completed` label."
         tag:
           type: string
           description: 'Tag string (e.g. `16-alpine`).  Never a `sha256:...` digest;
@@ -18261,6 +18589,18 @@ components:
           type: string
         version_constraint:
           type: string
+    RunNowResponse:
+      type: object
+      description: Result of `POST /:id/repositories/:repo_id/sync` (run-now trigger).
+      required:
+      - status
+      - tasks_queued
+      properties:
+        status:
+          type: string
+        tasks_queued:
+          type: integer
+          format: int64
     SamlAcsForm:
       type: object
       required:
@@ -19238,6 +19578,46 @@ components:
           type: integer
           format: int64
           minimum: 0
+    SubscriptionResponse:
+      type: object
+      description: Detailed subscription view (mode, schedule, filter) for a single (peer, repo) pair.
+      required:
+      - id
+      - peer_instance_id
+      - repository_id
+      - sync_enabled
+      - replication_filter
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        id:
+          type: string
+          format: uuid
+        last_replicated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        peer_instance_id:
+          type: string
+          format: uuid
+        replication_filter:
+          type: object
+        replication_mode:
+          type:
+          - string
+          - 'null'
+        replication_schedule:
+          type:
+          - string
+          - 'null'
+        repository_id:
+          type: string
+          format: uuid
+        sync_enabled:
+          type: boolean
     SuggestResponse:
       type: object
       required:
@@ -19290,6 +19670,7 @@ components:
       - replication_mode
       - priority
       - artifact_filter
+      - filter
       - precedence
       - created_at
       - updated_at
@@ -19303,6 +19684,13 @@ components:
           type: string
         enabled:
           type: boolean
+        filter:
+          type: string
+          description: 'Convenience glob filter, mirrored from `artifact_filter.include_paths`.
+
+            Round-trips the single-pattern shorthand accepted on create
+
+            (e.g. `"*.tar.gz"`). Empty when no include pattern is set.'
         id:
           type: string
           format: uuid
@@ -19331,6 +19719,8 @@ components:
       - storage_key
       - artifact_size
       - priority
+      - status
+      - created_at
       properties:
         artifact_id:
           type: string
@@ -19338,12 +19728,33 @@ components:
         artifact_size:
           type: integer
           format: int64
+        created_at:
+          type: string
+          format: date-time
+          description: 'When the task was enqueued. Lets clients tell a freshly-scheduled task
+
+            apart from a stale queue entry (used by the replication-schedule check).
+
+            Serialized as whole-second RFC3339 with a `Z` suffix
+
+            (e.g. `2026-05-29T12:34:56Z`) so simple ISO8601 parsers can consume it.'
         id:
           type: string
           format: uuid
         priority:
           type: integer
           format: int32
+        started_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: 'When the worker began transferring, if it has started. Same format as
+
+            `created_at`.'
+        status:
+          type: string
+          description: Task status (e.g. "pending"). Listing currently returns pending tasks.
         storage_key:
           type: string
     SystemConfigResponse:
@@ -19819,6 +20230,45 @@ components:
           - string
           - 'null'
           format: uuid
+        bypass_dedup:
+          type:
+          - boolean
+          - 'null'
+          description: 'Skip the hash-based scan dedup short-circuit when running this scan.
+
+
+            Defaults to `false`. Normal trigger calls dedup against prior
+
+            completed scans for the same checksum + scan_type so a freshly
+
+            uploaded byte-identical artifact reuses the existing result instead
+
+            of re-running the scanner. When `true`, that dedup is skipped: the
+
+            scanner runs against the bytes again and writes a fresh
+
+            `scan_results` row. Use this to recover from a silently-broken
+
+            prior scan (e.g. an extraction bug producing a completed,
+
+            zero-finding row that masks the real findings until the dedup TTL
+
+            expires; see #1469). Costs an extra scan run, so leave it unset
+
+            for routine trigger calls.
+
+
+            **Admin only.** Setting this to `true` bypasses the dedup short-
+
+            circuit and fans out unbounded scanner work per artifact. The
+
+            `trigger_scan` handler rejects this field with 403 for non-admin
+
+            callers, since a non-admin force-rescan path would be a DoS
+
+            amplifier (the pre-existing `force=true` was naturally rate-limited
+
+            by dedup; `bypass_dedup` removes that safety).'
         repository_id:
           type:
           - string
@@ -20133,35 +20583,70 @@ components:
           type: object
     UpdatePolicyRequest:
       type: object
-      required:
-      - name
-      - max_severity
-      - block_unscanned
-      - block_on_fail
-      - is_enabled
+      description: 'Partial-update payload for `PUT /security/policies/{id}`.
+
+
+        Every field is `Option<T>` so clients can send any subset of mutable
+
+        columns; omitted fields leave the existing row value untouched. The
+
+        previous shape required all of `name`, `max_severity`, `block_unscanned`,
+
+        `block_on_fail`, `is_enabled` on every call. That was incompatible with
+
+        the release-gate `scan-policy-crud` test (and external callers) which
+
+        PATCH a subset like `{max_severity, is_enabled}`; under the strict shape
+
+        the request was rejected as a 422 and the boolean toggle silently never
+
+        took effect on a follow-up GET. See #1374.
+
+
+        For `min_staging_hours` / `max_artifact_age_days` the field is the inner
+
+        nullable `i32`; "not provided" leaves the column untouched. Explicit
+
+        `null` to clear those columns is not currently supported; the release
+
+        gate only mutates the bool/enum fields, so the narrower semantics are
+
+        sufficient and we avoid an ambiguous JSON contract.'
       properties:
         block_on_fail:
-          type: boolean
+          type:
+          - boolean
+          - 'null'
         block_unscanned:
-          type: boolean
+          type:
+          - boolean
+          - 'null'
         is_enabled:
-          type: boolean
+          type:
+          - boolean
+          - 'null'
         max_artifact_age_days:
           type:
           - integer
           - 'null'
           format: int32
         max_severity:
-          type: string
+          type:
+          - string
+          - 'null'
         min_staging_hours:
           type:
           - integer
           - 'null'
           format: int32
         name:
-          type: string
+          type:
+          - string
+          - 'null'
         require_signature:
-          type: boolean
+          type:
+          - boolean
+          - 'null'
     UpdateRepositoryRequest:
       type: object
       properties:
@@ -20461,24 +20946,51 @@ components:
           format: uuid
     UpsertScanConfigRequest:
       type: object
-      description: Request to create or update a scan configuration.
-      required:
-      - scan_enabled
-      - scan_on_upload
-      - scan_on_proxy
-      - block_on_policy_violation
-      - severity_threshold
+      description: 'Request to create or update a scan configuration.
+
+
+        Every field is optional so a `PUT /repositories/{key}/security` can carry
+
+        any subset of mutable columns; fields the client omits keep their existing
+
+        value (or fall back to the documented default when the row does not exist
+
+        yet). The previous shape required all of `scan_enabled`, `scan_on_upload`,
+
+        `scan_on_proxy`, `block_on_policy_violation`, `severity_threshold` on every
+
+        call. That was the #1374 bug class on a second entity: a partial PUT (for
+
+        example just `{scan_enabled: true}`) either bounced as a 422 or, worse,
+
+        silently reset every other column to its default so a follow-up GET showed
+
+        the untouched fields stale. The upsert is now a read-modify-write that
+
+        merges the patch over the existing row, so multiple fields persist together
+
+        and an omitted field is never clobbered. See #1374 / B11.'
       properties:
         block_on_policy_violation:
-          type: boolean
+          type:
+          - boolean
+          - 'null'
         scan_enabled:
-          type: boolean
+          type:
+          - boolean
+          - 'null'
         scan_on_proxy:
-          type: boolean
+          type:
+          - boolean
+          - 'null'
         scan_on_upload:
-          type: boolean
+          type:
+          - boolean
+          - 'null'
         severity_threshold:
-          type: string
+          type:
+          - string
+          - 'null'
     UpstreamAuthRequest:
       type: object
       required:
@@ -20747,16 +21259,29 @@ components:
       allOf:
       - $ref: '#/components/schemas/WebhookResponse'
       - type: object
-        required:
-        - secret
         properties:
           secret:
-            type: string
+            type:
+            - string
+            - 'null'
             description: 'Raw signing secret. Display this to the operator immediately and
 
               instruct them to record it; the server retains only the encrypted
 
-              form and a short digest.'
+              form and a short digest.
+
+
+              Absent when the webhook was created without a signing secret. This
+
+              happens when no secret was supplied and the deployment has no
+
+              `AK_WEBHOOK_SECRET_KEY` configured: rather than fail the create with
+
+              a 500, the webhook is stored unsigned and deliveries omit the
+
+              signature header. Configure the key and rotate the secret later to
+
+              enable signing.'
       description: 'Response returned exactly once when a webhook is created or its secret
 
         is rotated. The raw `secret` value is not retrievable afterwards.'
