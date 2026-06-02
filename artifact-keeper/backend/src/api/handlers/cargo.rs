@@ -29,19 +29,33 @@ use tracing::info;
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::{require_auth_with_bearer_fallback, AuthExtension};
+use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::api::{CachedRepo, IndexCache, RepoCache, REPO_CACHE_TTL_SECS};
 use crate::error::AppError;
 use crate::models::repository::RepositoryType;
 
 // ---------------------------------------------------------------------------
-// In-process index entry cache
+// In-process caches
 // ---------------------------------------------------------------------------
 
 const INDEX_CACHE_TTL_SECS: u64 = 300;
 
-fn index_cache_get(cache: &IndexCache, key: &str) -> Option<Bytes> {
-    let c = cache.read().ok()?;
+/// TTL for cached upstream `config.json` data (the `dl` download URL).
+/// Upstream registries change their config.json very rarely, so 1 hour
+/// is a reasonable balance between freshness and upstream request volume.
+const CONFIG_CACHE_TTL_SECS: u64 = 3600;
+
+/// Thread-safe cache for upstream registry `config.json` download URL (`dl` field).
+/// Key: upstream base URL. Value: resolved `dl` URL + insertion time.
+type ConfigCache = std::sync::Arc<tokio::sync::RwLock<HashMap<String, (String, Instant)>>>;
+
+/// Module-level cache for upstream `config.json` download URLs.
+static UPSTREAM_CONFIG_CACHE: once_cell::sync::Lazy<ConfigCache> =
+    once_cell::sync::Lazy::new(|| std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())));
+
+async fn index_cache_get(cache: &IndexCache, key: &str) -> Option<Bytes> {
+    let c = cache.read().await;
     let (bytes, at) = c.get(key)?;
     if at.elapsed().as_secs() < INDEX_CACHE_TTL_SECS {
         Some(bytes.clone())
@@ -50,17 +64,112 @@ fn index_cache_get(cache: &IndexCache, key: &str) -> Option<Bytes> {
     }
 }
 
-fn index_cache_set(cache: &IndexCache, key: String, bytes: Bytes) {
-    if let Ok(mut c) = cache.write() {
-        c.retain(|_, (_, at)| at.elapsed().as_secs() < INDEX_CACHE_TTL_SECS);
-        c.insert(key, (bytes, Instant::now()));
+async fn index_cache_set(cache: &IndexCache, key: String, bytes: Bytes) {
+    let mut c = cache.write().await;
+    c.retain(|_, (_, at)| at.elapsed().as_secs() < INDEX_CACHE_TTL_SECS);
+    c.insert(key, (bytes, Instant::now()));
+}
+
+async fn index_cache_invalidate(cache: &IndexCache, key: &str) {
+    cache.write().await.remove(key);
+}
+
+// ---------------------------------------------------------------------------
+// Upstream config.json resolution
+// ---------------------------------------------------------------------------
+
+/// Look up the cached `dl` URL for an upstream registry base URL.
+async fn config_cache_get(base_url: &str) -> Option<String> {
+    let c = UPSTREAM_CONFIG_CACHE.read().await;
+    let (dl_url, at) = c.get(base_url)?;
+    if at.elapsed().as_secs() < CONFIG_CACHE_TTL_SECS {
+        Some(dl_url.clone())
+    } else {
+        None
     }
 }
 
-fn index_cache_invalidate(cache: &IndexCache, key: &str) {
-    if let Ok(mut c) = cache.write() {
-        c.remove(key);
+/// Store a resolved `dl` URL for an upstream base URL.
+async fn config_cache_set(base_url: String, dl_url: String) {
+    let mut c = UPSTREAM_CONFIG_CACHE.write().await;
+    c.retain(|_, (_, at)| at.elapsed().as_secs() < CONFIG_CACHE_TTL_SECS);
+    c.insert(base_url, (dl_url, Instant::now()));
+}
+
+/// Fetch the upstream registry's `config.json` and extract the `dl` field.
+///
+/// Cargo registries serve a `config.json` at their root that contains a `dl`
+/// field indicating the download URL template. For registries like crates.io,
+/// the index (`https://index.crates.io`) and the download host
+/// (`https://crates.io`) are on different domains, so the `dl` field is the
+/// authoritative source for where to fetch .crate files.
+///
+/// Returns `Some(dl_url)` on success, `None` if the config could not be fetched
+/// or parsed. Results are cached for `CONFIG_CACHE_TTL_SECS`.
+async fn resolve_upstream_dl_url(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+) -> Option<String> {
+    // Determine which base URL to fetch config.json from. Prefer the index URL
+    // because that is where Cargo registries serve their config.json.
+    let base_url = repo
+        .index_upstream_url
+        .as_deref()
+        .or(repo.upstream_url.as_deref())?;
+
+    // Check the cache first.
+    if let Some(cached) = config_cache_get(base_url).await {
+        return Some(cached);
     }
+
+    // Fetch config.json from upstream.
+    let proxy = state.proxy_service.as_ref()?;
+    let config_bytes =
+        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, base_url, "config.json")
+            .await
+            .ok()?;
+
+    let config: serde_json::Value = serde_json::from_slice(&config_bytes.0).ok()?;
+    let dl_url = config.get("dl")?.as_str()?.to_string();
+
+    // Cache the resolved dl URL.
+    config_cache_set(base_url.to_string(), dl_url.clone()).await;
+
+    Some(dl_url)
+}
+
+/// Build the full download URL for a crate, using the upstream `dl` template
+/// when available. Falls back to `{upstream_url}/api/v1/crates/{name}/{version}/download`.
+///
+/// The `dl` field from `config.json` can be either a plain base URL
+/// (e.g. `https://crates.io/api/v1/crates`) to which `/{name}/{version}/download`
+/// is appended, or a template with `{crate}` / `{version}` markers. This
+/// function handles both forms.
+fn build_download_url(dl_url: &str, name: &str, version: &str) -> String {
+    if dl_url.contains("{crate}") || dl_url.contains("{version}") {
+        dl_url
+            .replace("{crate}", name)
+            .replace("{version}", version)
+    } else {
+        let base = dl_url.trim_end_matches('/');
+        format!("{}/{}/{}/download", base, name, version)
+    }
+}
+
+/// Split a fully-qualified URL into `(origin, path)`.
+///
+/// Given `https://crates.io/api/v1/crates/serde/1.0.0/download`, returns
+/// `("https://crates.io", "api/v1/crates/serde/1.0.0/download")`.
+///
+/// Returns `None` when the URL has no scheme or no path component after the host.
+fn split_url(url: &str) -> Option<(String, String)> {
+    let scheme_end = url.find("://")?;
+    let after_scheme = &url[scheme_end + 3..];
+    let slash = after_scheme.find('/')?;
+    let origin = &url[..scheme_end + 3 + slash];
+    let path = &url[scheme_end + 3 + slash + 1..];
+    Some((origin.to_string(), path.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +243,8 @@ async fn resolve_cargo_repo(
     // Check the shared repo cache first.  The repo_visibility_middleware
     // populates this cache before handlers run, so on most requests this
     // returns immediately with 0 DB queries.
-    if let Ok(cache) = repo_cache.read() {
+    {
+        let cache = repo_cache.read().await;
         if let Some((entry, at)) = cache.get(repo_key) {
             if at.elapsed().as_secs() < REPO_CACHE_TTL_SECS {
                 let fmt = entry.format.to_lowercase();
@@ -194,7 +304,8 @@ async fn resolve_cargo_repo(
     let index_upstream_url: Option<String> = repo.get("index_upstream_url");
 
     // Populate cache so subsequent requests from this handler path are fast.
-    if let Ok(mut cache) = repo_cache.write() {
+    {
+        let mut cache = repo_cache.write().await;
         cache.retain(|_, (_, at)| at.elapsed().as_secs() < REPO_CACHE_TTL_SECS);
         cache.insert(
             repo_key.to_string(),
@@ -236,12 +347,13 @@ async fn config_json(
     let _repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
 
     // Check repo visibility from the cache (populated by resolve_cargo_repo).
-    let is_private = !state
-        .repo_cache
-        .read()
-        .ok()
-        .and_then(|c| c.get(&repo_key).map(|(r, _)| r.is_public))
-        .unwrap_or(true);
+    let is_private = {
+        let cache = state.repo_cache.read().await;
+        !cache
+            .get(&repo_key)
+            .map(|(r, _)| r.is_public)
+            .unwrap_or(true)
+    };
 
     // Determine the base URL from reverse-proxy / Host headers.
     let base_url = proxy_helpers::request_base_url(&headers);
@@ -558,6 +670,10 @@ async fn publish(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
+    // GHSA-vvc3-h39c-mrq5: a read-scoped service-account token must not be
+    // accepted for `cargo publish`. Enforce the write scope on the token
+    // before falling back to the Bearer-as-base64 credential path.
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
     let user_id =
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "cargo")
             .await?;
@@ -596,7 +712,7 @@ async fn publish(
     .await?;
 
     // Invalidate the index cache for this crate so the next fetch sees the new version.
-    index_cache_invalidate(&state.index_cache, &format!("{}:{}", repo_key, name_lower));
+    index_cache_invalidate(&state.index_cache, &format!("{}:{}", repo_key, name_lower)).await;
 
     // Also invalidate any virtual repos that include this hosted repo.
     let virtual_keys: Vec<String> = sqlx::query_scalar(
@@ -610,7 +726,7 @@ async fn publish(
     .unwrap_or_default();
 
     for vkey in &virtual_keys {
-        index_cache_invalidate(&state.index_cache, &format!("{}:{}", vkey, name_lower));
+        index_cache_invalidate(&state.index_cache, &format!("{}:{}", vkey, name_lower)).await;
     }
 
     info!(
@@ -671,14 +787,39 @@ async fn download(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    let upstream_path =
+                    // Resolve the download base URL from the upstream config.json.
+                    // This handles split-host registries like crates.io where
+                    // the index lives at index.crates.io but downloads come
+                    // from crates.io/api/v1/crates.
+                    let fallback_path =
                         format!("api/v1/crates/{}/{}/download", name_lower, version);
-                    let (content, _content_type) = proxy_helpers::proxy_fetch(
+                    let (dl_base, dl_path) = match resolve_upstream_dl_url(&state, &repo, &repo_key)
+                        .await
+                    {
+                        Some(dl_url) => {
+                            let full = build_download_url(&dl_url, &name_lower, &version);
+                            // Validate the resolved download URL against SSRF.
+                            // A malicious upstream config.json could set `dl` to
+                            // a cloud metadata endpoint or internal service URL.
+                            validate_outbound_url(&full, "Cargo upstream download URL")
+                                .map_err(|e| e.into_response())?;
+                            split_url(&full)
+                                .unwrap_or_else(|| (upstream_url.clone(), fallback_path.clone()))
+                        }
+                        None => (upstream_url.clone(), fallback_path.clone()),
+                    };
+
+                    // Use the canonical local cache path regardless of which
+                    // upstream URL was resolved so that subsequent requests hit
+                    // the proxy cache even after a config.json TTL change.
+                    let cache_path = format!("api/v1/crates/{}/{}/download", name_lower, version);
+                    let (content, _content_type) = proxy_helpers::proxy_fetch_with_cache_key(
                         proxy,
                         repo.id,
                         &repo_key,
-                        upstream_url,
-                        &upstream_path,
+                        &dl_base,
+                        &dl_path,
+                        &cache_path,
                     )
                     .await?;
 
@@ -703,9 +844,41 @@ async fn download(
                 let vname = name_lower.clone();
                 let vversion = version.clone();
                 let upstream_path = format!("api/v1/crates/{}/{}/download", name_lower, version);
+
+                // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
+                // If a non-Remote member of this Virtual repo owns the
+                // crate name, block Remote members from satisfying the
+                // download. The guard runs on the case-folded crate name
+                // (`name_lower` is already lowercase). When the guard
+                // fires we pass `None` to `resolve_virtual_download` so
+                // Remote members fall to `VirtualMemberFetchStrategy::Skip`.
+                // The `None` argument is load-bearing: see the comment
+                // on `serve_virtual_tarball_local_only` in hex.rs for
+                // why any future refactor that threads a real proxy
+                // service through this branch would re-open the
+                // shadowing attack.
+                //
+                // Fail-closed: if the requested name does not parse as a
+                // valid crate name, do not run the guard. Bad names
+                // cannot reach `artifacts.name` (the publish path also
+                // rejects them) so the guard would always return false
+                // anyway, and skipping it spares the DB an existence
+                // check on every malformed request.
+                let local_owns = if crate::formats::cargo::is_valid_cargo_name(&name_lower) {
+                    proxy_helpers::virtual_non_remote_owns_name(&state.db, repo.id, &name_lower)
+                        .await?
+                } else {
+                    false
+                };
+                let proxy_for_virtual = if local_owns {
+                    None
+                } else {
+                    state.proxy_service.as_deref()
+                };
+
                 let (content, content_type) = proxy_helpers::resolve_virtual_download(
                     &state.db,
-                    state.proxy_service.as_deref(),
+                    proxy_for_virtual,
                     repo.id,
                     &upstream_path,
                     |member_id, location| {
@@ -743,6 +916,11 @@ async fn download(
             return Err(AppError::NotFound("Crate not found".to_string()).into_response());
         }
     };
+
+    // Check quarantine status before serving
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
+        .await
+        .map_err(|e| e.into_response())?;
 
     let storage = state
         .storage_for_repo(&repo.storage_location())
@@ -928,22 +1106,47 @@ async fn try_remote_index(
     let index_path = cargo_sparse_index_path_upstream(name_lower);
     let result = proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, base_url, &index_path).await;
 
-    Some(result.map(|(content, content_type)| {
-        index_cache_set(index_cache, cache_key.to_string(), content.clone());
-        index_response(content, content_type)
-    }))
+    Some(match result {
+        Ok((content, content_type)) => {
+            index_cache_set(index_cache, cache_key.to_string(), content.clone()).await;
+            Ok(index_response(content, content_type))
+        }
+        Err(e) => Err(e),
+    })
 }
 
 /// Try to resolve a crate index from a virtual repo's member repositories.
 ///
-/// Iterates members in priority order: local index entries first, then upstream
-/// proxy for remote members. Honours each member's `index_upstream_url` from
-/// `repository_config` (falls back to `upstream_url` when absent).
+/// Iterates members in priority order. Dispatch by member type:
+///
+/// * **Remote** — always go through [`ProxyService`] (via `proxy_fetch`) so
+///   that `__cache_meta__.json` governs freshness (default 24 h, per-repo
+///   configurable). This returns the raw upstream sparse-index JSON and
+///   therefore stays in sync with yanks, new releases, and dep changes
+///   whenever the cache expires. Uses each member's `index_upstream_url`
+///   config override when present, falling back to `upstream_url`.
+///
+/// * **Local / Staging** — the `artifacts` table is authoritative for
+///   repos that host crates directly; rebuild the sparse-index lines from
+///   DB rows.
+///
+/// * **Virtual** (nested) — skipped defensively to avoid recursion; not
+///   a supported configuration.
 ///
 /// NOTE: This does not use `resolve_virtual_metadata` because cargo index
-/// resolution interleaves local DB queries with remote proxy fallback per
-/// member, and uses `index_upstream_url` config overrides for the proxy URL.
-/// The shared helper only handles remote members in isolation.
+/// resolution honours `index_upstream_url` config overrides for the proxy
+/// URL, which the shared helper does not know about.
+///
+/// Aggregation semantics (matches helm/conda/cran/rubygems and #1143):
+///
+/// * Visit every member in priority order rather than stopping at the first
+///   member that has data. A virtual cargo repo with both a Local fork and a
+///   Remote upstream must surface versions from both, not just the first.
+/// * Within a single response, dedupe NDJSON entries by `(name, vers)`. When
+///   the same `(name, vers)` appears in more than one member, the entry from
+///   the higher-priority member (earlier in the iteration order) wins, which
+///   matches the artifact-listing precedence used elsewhere.
+#[allow(clippy::result_large_err)]
 async fn try_virtual_index(
     state: &SharedState,
     repo: &RepoInfo,
@@ -988,58 +1191,51 @@ async fn try_virtual_index(
 
     let index_path = cargo_sparse_index_path_upstream(name_lower);
 
-    for member in &members {
-        // Try building the index from local artifacts first.
-        let rows = sqlx::query(
-            r#"
-            SELECT a.name, a.version, a.checksum_sha256,
-                   am.metadata
-            FROM artifacts a
-            LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-            WHERE a.repository_id = $1
-              AND a.name = $2
-              AND a.is_deleted = false
-            ORDER BY a.created_at ASC
-            "#,
-        )
-        .bind(member.id)
-        .bind(name_lower)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("Failed to query artifacts for member {}: {}", member.id, e);
-            Vec::new()
-        });
+    // Accumulate NDJSON entries across all members. Use a LinkedHashMap-style
+    // ordered set keyed by version so that:
+    //   * iteration order = first-seen order = priority order;
+    //   * a `(name, vers)` already inserted by a higher-priority member is
+    //     not overwritten by a lower-priority member's entry.
+    //
+    // Visit every member in priority order. For each member, pick the lookup
+    // strategy that matches its type:
+    //
+    // * Remote members go straight through the proxy (ProxyService consults
+    //   __cache_meta__.json and re-fetches from upstream when the cache has
+    //   expired). We deliberately skip the DB-rebuild path for Remote members,
+    //   because proxy-cached .crate downloads leave rows in the artifacts
+    //   table; rebuilding the sparse index from those rows would serve a
+    //   stale snapshot that ignores upstream yanks / new releases and never
+    //   re-validates with crates.io. See the PR introducing this change for
+    //   details on the prior bypass.
+    //
+    // * Local and Staging members have no proxy cache; the artifacts table is
+    //   the authoritative source for the crates they host. We build the index
+    //   from their rows exactly as we do for the top-level hosted case.
+    let mut aggregated: Vec<String> = Vec::new();
+    let mut seen_versions: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        if !rows.is_empty() {
-            let lines: Vec<String> = rows
-                .iter()
-                .map(|row| {
-                    let vers: Option<String> = row.get("version");
-                    let vers = vers.as_deref().unwrap_or("0.0.0");
-                    let cksum: String = row.get("checksum_sha256");
-                    let meta: Option<serde_json::Value> = row.get("metadata");
-                    build_index_entry(name_lower, vers, &cksum, meta.as_ref())
-                })
-                .collect();
-            let body = bytes::Bytes::from(lines.join("\n"));
-            index_cache_set(index_cache, cache_key.to_string(), body.clone());
-            return Some(Ok(index_response(
-                body,
-                Some("application/json".to_string()),
-            )));
-        }
+    // Visit non-Remote (Local/Staging) members before Remote members so a
+    // locally-published crate version cannot be shadowed by an upstream
+    // entry of the same `(name, vers)`. This mirrors the supply-chain
+    // protection applied to Hex package_info in this same PR (#973) and
+    // closes the gap where a Remote member configured at higher priority
+    // could pre-empt a Local member's authoritative entry.
+    let ordered_members = order_members_local_first(&members);
 
-        // For remote members, try the upstream proxy.
-        if member.repo_type == RepositoryType::Remote {
-            if let (Some(proxy), Some(upstream_url)) = (&state.proxy_service, &member.upstream_url)
-            {
-                let base_url = index_url_overrides
-                    .get(&member.id)
-                    .cloned()
-                    .unwrap_or_else(|| upstream_url.clone());
+    for member in ordered_members {
+        match member.repo_type {
+            RepositoryType::Remote => {
+                let (Some(proxy), Some(upstream_url)) =
+                    (&state.proxy_service, &member.upstream_url)
+                else {
+                    continue;
+                };
 
-                if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
+                let base_url =
+                    resolve_remote_index_base_url(&index_url_overrides, member.id, upstream_url);
+
+                if let Ok((content, _content_type)) = proxy_helpers::proxy_fetch(
                     proxy,
                     member.id,
                     &member.key,
@@ -1048,17 +1244,163 @@ async fn try_virtual_index(
                 )
                 .await
                 {
-                    index_cache_set(index_cache, cache_key.to_string(), content.clone());
-                    return Some(Ok(index_response(content, content_type)));
+                    merge_index_lines(&content, &mut aggregated, &mut seen_versions);
                 }
+            }
+            RepositoryType::Local | RepositoryType::Staging => {
+                let rows = sqlx::query(
+                    r#"
+                    SELECT a.name, a.version, a.checksum_sha256,
+                           am.metadata
+                    FROM artifacts a
+                    LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+                    WHERE a.repository_id = $1
+                      AND a.name = $2
+                      AND a.version IS NOT NULL
+                      AND a.is_deleted = false
+                    ORDER BY a.created_at ASC
+                    "#,
+                )
+                .bind(member.id)
+                .bind(name_lower)
+                .fetch_all(&state.db)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to query artifacts for member {}: {}", member.id, e);
+                    Vec::new()
+                });
+
+                for row in &rows {
+                    let vers: Option<String> = row.get("version");
+                    let Some(vers) = vers else { continue };
+                    if !seen_versions.insert(vers.clone()) {
+                        continue;
+                    }
+                    let cksum: String = row.get("checksum_sha256");
+                    let meta: Option<serde_json::Value> = row.get("metadata");
+                    aggregated.push(build_index_entry(name_lower, &vers, &cksum, meta.as_ref()));
+                }
+            }
+            RepositoryType::Virtual => {
+                // Nested virtuals are not supported and would cause recursion.
+                // Skip defensively rather than attempting a lookup.
+                continue;
             }
         }
     }
 
-    Some(Err(AppError::NotFound(
-        "Artifact not found in any member repository".to_string(),
-    )
-    .into_response()))
+    match finalize_virtual_index_aggregation(aggregated) {
+        Some(Ok(body)) => {
+            index_cache_set(index_cache, cache_key.to_string(), body.clone()).await;
+            Some(Ok(index_response(
+                body,
+                Some("application/json".to_string()),
+            )))
+        }
+        Some(Err(resp)) => Some(Err(resp)),
+        None => None,
+    }
+}
+
+/// Order virtual repo members so non-Remote members come before Remote
+/// members, preserving the original priority ordering within each group.
+///
+/// Pure function so the supply-chain-shadowing rule can be unit-tested
+/// without standing up a real virtual-repo configuration. Non-Remote-first
+/// ordering prevents an upstream from shadowing a locally-published crate
+/// version even when the admin configures the Remote member at a higher
+/// raw priority than the Local member (#1143).
+///
+/// Matches the equivalent helper in `hex.rs` so the two formats apply the
+/// same supply-chain protection. Keeping a local copy (rather than sharing
+/// via `proxy_helpers`) avoids cross-module churn for a 6-line function;
+/// the followup to consolidate is tracked in the review notes.
+fn order_members_local_first(
+    members: &[crate::models::repository::Repository],
+) -> Vec<&crate::models::repository::Repository> {
+    let mut ordered: Vec<&crate::models::repository::Repository> =
+        Vec::with_capacity(members.len());
+    ordered.extend(
+        members
+            .iter()
+            .filter(|m| m.repo_type != RepositoryType::Remote),
+    );
+    ordered.extend(
+        members
+            .iter()
+            .filter(|m| m.repo_type == RepositoryType::Remote),
+    );
+    ordered
+}
+
+/// Pick the upstream base URL to use when fetching a virtual member's
+/// sparse-index NDJSON. An entry in `repository_config.index_upstream_url`
+/// overrides the member's primary `upstream_url`, so an admin can point
+/// e.g. a github.com Cargo registry at a separate index host without
+/// editing the artifact upstream. Pure to keep tested without DB.
+fn resolve_remote_index_base_url(
+    overrides: &HashMap<uuid::Uuid, String>,
+    member_id: uuid::Uuid,
+    fallback_upstream_url: &str,
+) -> String {
+    overrides
+        .get(&member_id)
+        .cloned()
+        .unwrap_or_else(|| fallback_upstream_url.to_string())
+}
+
+/// Decide what `try_virtual_index` should return given the aggregated
+/// NDJSON lines collected from every member. Returns `Some(Ok(body))`
+/// when there are entries to serve, `Some(Err(404 response))` when no
+/// member contributed anything. Returning `None` is reserved for the
+/// "skip the virtual path entirely" pre-check before aggregation; this
+/// helper does not produce it.
+#[allow(clippy::result_large_err)]
+fn finalize_virtual_index_aggregation(aggregated: Vec<String>) -> Option<Result<Bytes, Response>> {
+    if aggregated.is_empty() {
+        return Some(Err(AppError::NotFound(
+            "Artifact not found in any member repository".to_string(),
+        )
+        .into_response()));
+    }
+    Some(Ok(Bytes::from(aggregated.join("\n"))))
+}
+
+/// Merge sparse-index NDJSON lines from one member into the running
+/// aggregate, skipping any line whose `vers` field has already been
+/// contributed by a higher-priority member. Lines that fail to parse as
+/// JSON or are missing `vers` are preserved at the cost of dedup so the
+/// client still sees them, matching the helm/conda merge behaviour for
+/// malformed upstream data.
+fn merge_index_lines(
+    content: &[u8],
+    aggregated: &mut Vec<String>,
+    seen_versions: &mut std::collections::HashSet<String>,
+) {
+    let text = match std::str::from_utf8(content) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v.get("vers").and_then(|x| x.as_str()).map(String::from))
+        {
+            Some(vers) => {
+                if seen_versions.insert(vers) {
+                    aggregated.push(line.to_string());
+                }
+            }
+            None => {
+                // Unparseable line: keep it so we don't silently drop data,
+                // but don't track it in the dedup set.
+                aggregated.push(line.to_string());
+            }
+        }
+    }
 }
 
 /// Serve the sparse index file for a crate (one JSON object per version, per line).
@@ -1073,7 +1415,7 @@ async fn serve_index(
     let cache_key = format!("{}:{}", repo_key, name_lower);
 
     // Fast path: serve from in-process index cache (no storage I/O, no SHA-256).
-    if let Some(cached) = index_cache_get(&state.index_cache, &cache_key) {
+    if let Some(cached) = index_cache_get(&state.index_cache, &cache_key).await {
         return Ok(index_response(cached, Some("application/json".to_string())));
     }
 
@@ -1154,7 +1496,7 @@ async fn serve_index(
         .collect();
 
     let body = bytes::Bytes::from(lines.join("\n"));
-    index_cache_set(&state.index_cache, cache_key, body.clone());
+    index_cache_set(&state.index_cache, cache_key, body.clone()).await;
     Ok(index_response(body, Some("application/json".to_string())))
 }
 
@@ -1213,6 +1555,207 @@ mod tests {
             "links": null,
             "rust_version": "1.70.0"
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_index_lines (virtual repo NDJSON aggregation, #1143)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_index_lines_first_member_wins_on_collision() {
+        // Local member already contributed serde 1.0.0; the upstream's
+        // serde 1.0.0 line must not overwrite it. Higher-priority
+        // member's `cksum` is preserved.
+        let mut aggregated: Vec<String> =
+            vec![r#"{"name":"serde","vers":"1.0.0","cksum":"LOCAL"}"#.to_string()];
+        let mut seen: std::collections::HashSet<String> =
+            ["1.0.0".to_string()].into_iter().collect();
+        let upstream = b"{\"name\":\"serde\",\"vers\":\"1.0.0\",\"cksum\":\"UPSTREAM\"}\n{\"name\":\"serde\",\"vers\":\"1.0.1\",\"cksum\":\"UPSTREAM\"}";
+        merge_index_lines(upstream, &mut aggregated, &mut seen);
+        // 1.0.0 stays as LOCAL, 1.0.1 added from upstream.
+        assert_eq!(aggregated.len(), 2);
+        assert!(aggregated[0].contains("LOCAL"));
+        assert!(aggregated[1].contains("1.0.1"));
+        assert!(seen.contains("1.0.0"));
+        assert!(seen.contains("1.0.1"));
+    }
+
+    #[test]
+    fn test_merge_index_lines_skips_blank_lines() {
+        let mut aggregated: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let upstream = b"\n\n{\"name\":\"foo\",\"vers\":\"0.1.0\"}\n\n";
+        merge_index_lines(upstream, &mut aggregated, &mut seen);
+        assert_eq!(aggregated.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_index_lines_keeps_unparseable_lines() {
+        // A malformed NDJSON line (not JSON, no `vers`) is preserved
+        // verbatim so we don't silently drop upstream data.
+        let mut aggregated: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let upstream = b"not-json\n{\"name\":\"foo\",\"vers\":\"0.1.0\"}";
+        merge_index_lines(upstream, &mut aggregated, &mut seen);
+        assert_eq!(aggregated.len(), 2);
+        assert_eq!(aggregated[0], "not-json");
+    }
+
+    #[test]
+    fn test_merge_index_lines_handles_invalid_utf8() {
+        // A non-UTF-8 body is a no-op rather than a panic.
+        let mut aggregated: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let bytes: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x80];
+        merge_index_lines(&bytes, &mut aggregated, &mut seen);
+        assert!(aggregated.is_empty());
+        assert!(seen.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_remote_index_base_url (#1143)
+    //
+    // Pure helper for the virtual-index Remote-member path: picks the
+    // `repository_config.index_upstream_url` override when present, else
+    // falls back to the member's primary `upstream_url`. Exercising it
+    // directly avoids spinning up a DB just to verify the precedence
+    // table.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_remote_index_base_url_uses_override_when_present() {
+        let id = uuid::Uuid::new_v4();
+        let mut overrides: HashMap<uuid::Uuid, String> = HashMap::new();
+        overrides.insert(id, "https://override.example/index".to_string());
+        let base = resolve_remote_index_base_url(&overrides, id, "https://upstream.example");
+        assert_eq!(base, "https://override.example/index");
+    }
+
+    #[test]
+    fn test_resolve_remote_index_base_url_falls_back_to_upstream_when_no_override() {
+        let id = uuid::Uuid::new_v4();
+        let overrides: HashMap<uuid::Uuid, String> = HashMap::new();
+        let base = resolve_remote_index_base_url(&overrides, id, "https://upstream.example");
+        assert_eq!(base, "https://upstream.example");
+    }
+
+    #[test]
+    fn test_resolve_remote_index_base_url_override_only_applies_to_matching_member() {
+        // Override is registered for *another* member's id; the current
+        // member should still get its primary upstream URL.
+        let target_id = uuid::Uuid::new_v4();
+        let other_id = uuid::Uuid::new_v4();
+        let mut overrides: HashMap<uuid::Uuid, String> = HashMap::new();
+        overrides.insert(other_id, "https://override.example/index".to_string());
+        let base = resolve_remote_index_base_url(&overrides, target_id, "https://upstream.example");
+        assert_eq!(base, "https://upstream.example");
+    }
+
+    // -----------------------------------------------------------------------
+    // finalize_virtual_index_aggregation (#1143)
+    //
+    // Decides between an aggregated NDJSON body and a 404 when no member
+    // contributed any line. The pre-cache step happens in the caller so
+    // this helper is purely a body-or-not-found decision.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_finalize_virtual_index_aggregation_returns_body_when_lines_present() {
+        let lines = vec![
+            r#"{"name":"foo","vers":"1.0.0"}"#.to_string(),
+            r#"{"name":"foo","vers":"1.0.1"}"#.to_string(),
+        ];
+        let out = finalize_virtual_index_aggregation(lines)
+            .expect("Some(_) when called from aggregation path");
+        let body = out.expect("Ok(body) when lines were aggregated");
+        // Lines are joined with `\n` (no trailing newline added).
+        let text = std::str::from_utf8(&body).expect("utf-8 NDJSON");
+        assert!(text.contains("1.0.0"));
+        assert!(text.contains("1.0.1"));
+        assert!(text.contains('\n'));
+    }
+
+    #[test]
+    fn test_finalize_virtual_index_aggregation_returns_404_when_empty() {
+        let out = finalize_virtual_index_aggregation(Vec::new()).expect("Some(_)");
+        let resp = out.expect_err("empty aggregation must surface as 404");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // order_members_local_first (cargo virtual-index shadowing guard, #1143)
+    //
+    // Mirrors the equivalent hex.rs tests: Local/Staging members must
+    // precede Remote members in the iteration so a Remote-hosted crate
+    // version cannot pre-empt a locally-published `(name, vers)`.
+    // -----------------------------------------------------------------------
+
+    fn make_cargo_member(
+        repo_type: RepositoryType,
+        key: &str,
+    ) -> crate::models::repository::Repository {
+        use crate::models::repository::{ReplicationPriority, Repository, RepositoryFormat};
+        Repository {
+            id: uuid::Uuid::new_v4(),
+            key: key.to_string(),
+            name: key.to_string(),
+            description: None,
+            format: RepositoryFormat::Cargo,
+            repo_type,
+            storage_backend: "filesystem".to_string(),
+            storage_path: String::new(),
+            upstream_url: None,
+            is_public: false,
+            quota_bytes: None,
+            replication_priority: ReplicationPriority::OnDemand,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 0,
+            curation_auto_fetch: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_order_members_local_first_cargo_puts_local_before_remote() {
+        // Admin configured Remote at higher raw priority. The helper must
+        // still surface Local first so an upstream `serde 1.0.0` cannot
+        // shadow a locally-published `serde 1.0.0`.
+        let m1 = make_cargo_member(RepositoryType::Remote, "crates-io");
+        let m2 = make_cargo_member(RepositoryType::Local, "internal-fork");
+        let members = vec![m1, m2];
+        let ordered = order_members_local_first(&members);
+        assert_eq!(ordered[0].key, "internal-fork");
+        assert_eq!(ordered[1].key, "crates-io");
+    }
+
+    #[test]
+    fn test_order_members_local_first_cargo_preserves_within_group_order() {
+        // Within each group, original input order is preserved so
+        // configured priority still matters when there is no shadowing
+        // conflict to resolve.
+        let m1 = make_cargo_member(RepositoryType::Staging, "stage");
+        let m2 = make_cargo_member(RepositoryType::Remote, "crates-io");
+        let m3 = make_cargo_member(RepositoryType::Local, "fork");
+        let m4 = make_cargo_member(RepositoryType::Remote, "mirror");
+        let members = vec![m1, m2, m3, m4];
+        let ordered = order_members_local_first(&members);
+        assert_eq!(ordered[0].key, "stage");
+        assert_eq!(ordered[1].key, "fork");
+        assert_eq!(ordered[2].key, "crates-io");
+        assert_eq!(ordered[3].key, "mirror");
+    }
+
+    #[test]
+    fn test_order_members_local_first_cargo_empty_input() {
+        let members: Vec<crate::models::repository::Repository> = Vec::new();
+        let ordered = order_members_local_first(&members);
+        assert!(ordered.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -2203,78 +2746,85 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_index_cache() -> IndexCache {
-        use std::sync::{Arc, RwLock};
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
         Arc::new(RwLock::new(HashMap::new()))
     }
 
-    #[test]
-    fn test_index_cache_get_empty_cache_returns_none() {
+    #[tokio::test]
+    async fn test_index_cache_get_empty_cache_returns_none() {
         let cache = make_index_cache();
-        assert!(index_cache_get(&cache, "myrepo:serde").is_none());
+        assert!(index_cache_get(&cache, "myrepo:serde").await.is_none());
     }
 
-    #[test]
-    fn test_index_cache_get_unknown_key_returns_none() {
+    #[tokio::test]
+    async fn test_index_cache_get_unknown_key_returns_none() {
         let cache = make_index_cache();
         let data = Bytes::from_static(b"some index data");
-        index_cache_set(&cache, "myrepo:tokio".to_string(), data);
-        assert!(index_cache_get(&cache, "myrepo:serde").is_none());
+        index_cache_set(&cache, "myrepo:tokio".to_string(), data).await;
+        assert!(index_cache_get(&cache, "myrepo:serde").await.is_none());
     }
 
-    #[test]
-    fn test_index_cache_set_and_get_roundtrip() {
+    #[tokio::test]
+    async fn test_index_cache_set_and_get_roundtrip() {
         let cache = make_index_cache();
         let data = Bytes::from_static(b"{\"name\":\"serde\",\"vers\":\"1.0.0\"}");
-        index_cache_set(&cache, "myrepo:serde".to_string(), data.clone());
-        let result = index_cache_get(&cache, "myrepo:serde").expect("should be in cache");
+        index_cache_set(&cache, "myrepo:serde".to_string(), data.clone()).await;
+        let result = index_cache_get(&cache, "myrepo:serde")
+            .await
+            .expect("should be in cache");
         assert_eq!(result, data);
     }
 
-    #[test]
-    fn test_index_cache_set_overwrites_existing_entry() {
+    #[tokio::test]
+    async fn test_index_cache_set_overwrites_existing_entry() {
         let cache = make_index_cache();
         let v1 = Bytes::from_static(b"version 1 data");
         let v2 = Bytes::from_static(b"version 2 data");
-        index_cache_set(&cache, "repo:crate".to_string(), v1);
-        index_cache_set(&cache, "repo:crate".to_string(), v2.clone());
-        let result = index_cache_get(&cache, "repo:crate").expect("should be in cache");
+        index_cache_set(&cache, "repo:crate".to_string(), v1).await;
+        index_cache_set(&cache, "repo:crate".to_string(), v2.clone()).await;
+        let result = index_cache_get(&cache, "repo:crate")
+            .await
+            .expect("should be in cache");
         assert_eq!(result, v2);
     }
 
-    #[test]
-    fn test_index_cache_invalidate_removes_key() {
+    #[tokio::test]
+    async fn test_index_cache_invalidate_removes_key() {
         let cache = make_index_cache();
         let data = Bytes::from_static(b"data");
-        index_cache_set(&cache, "repo:serde".to_string(), data);
-        assert!(index_cache_get(&cache, "repo:serde").is_some());
-        index_cache_invalidate(&cache, "repo:serde");
-        assert!(index_cache_get(&cache, "repo:serde").is_none());
+        index_cache_set(&cache, "repo:serde".to_string(), data).await;
+        assert!(index_cache_get(&cache, "repo:serde").await.is_some());
+        index_cache_invalidate(&cache, "repo:serde").await;
+        assert!(index_cache_get(&cache, "repo:serde").await.is_none());
     }
 
-    #[test]
-    fn test_index_cache_invalidate_missing_key_is_noop() {
+    #[tokio::test]
+    async fn test_index_cache_invalidate_missing_key_is_noop() {
         let cache = make_index_cache();
         // Should not panic on a cache miss.
-        index_cache_invalidate(&cache, "repo:nonexistent");
-        assert!(index_cache_get(&cache, "repo:nonexistent").is_none());
+        index_cache_invalidate(&cache, "repo:nonexistent").await;
+        assert!(index_cache_get(&cache, "repo:nonexistent").await.is_none());
     }
 
-    #[test]
-    fn test_index_cache_invalidate_leaves_other_keys_intact() {
+    #[tokio::test]
+    async fn test_index_cache_invalidate_leaves_other_keys_intact() {
         let cache = make_index_cache();
         index_cache_set(
             &cache,
             "repo:serde".to_string(),
             Bytes::from_static(b"serde"),
-        );
+        )
+        .await;
         index_cache_set(
             &cache,
             "repo:tokio".to_string(),
             Bytes::from_static(b"tokio"),
-        );
-        index_cache_invalidate(&cache, "repo:serde");
-        assert!(index_cache_get(&cache, "repo:serde").is_none());
-        assert!(index_cache_get(&cache, "repo:tokio").is_some());
+        )
+        .await;
+        index_cache_invalidate(&cache, "repo:serde").await;
+        assert!(index_cache_get(&cache, "repo:serde").await.is_none());
+        assert!(index_cache_get(&cache, "repo:tokio").await.is_some());
     }
 
     #[test]
@@ -2286,51 +2836,59 @@ mod tests {
         assert_eq!(key, "cargo-proxy:serde_json");
     }
 
-    #[test]
-    fn test_index_cache_key_uses_lowercase_crate_name() {
+    #[tokio::test]
+    async fn test_index_cache_key_uses_lowercase_crate_name() {
         // Verify that upper-case input is folded before building the key,
         // matching what serve_index does with `crate_name.to_lowercase()`.
         let cache = make_index_cache();
         let data = Bytes::from_static(b"data");
         let lower_key = "repo:serde".to_string();
-        index_cache_set(&cache, lower_key, data.clone());
+        index_cache_set(&cache, lower_key, data.clone()).await;
         // A lookup with the pre-lowercased key must hit.
-        assert!(index_cache_get(&cache, "repo:serde").is_some());
+        assert!(index_cache_get(&cache, "repo:serde").await.is_some());
         // A lookup with a mixed-case key does NOT hit (the caller is responsible
         // for lowercasing before building the key).
-        assert!(index_cache_get(&cache, "repo:Serde").is_none());
+        assert!(index_cache_get(&cache, "repo:Serde").await.is_none());
     }
 
-    #[test]
-    fn test_index_cache_set_lazy_eviction_preserves_fresh_entries() {
+    #[tokio::test]
+    async fn test_index_cache_set_lazy_eviction_preserves_fresh_entries() {
         // After a set+get cycle the entry must still be retrievable: the
         // lazy eviction in index_cache_set only removes *expired* entries,
         // never fresh ones.
         let cache = make_index_cache();
         let data = Bytes::from_static(b"fresh");
-        index_cache_set(&cache, "repo:crate-a".to_string(), data.clone());
+        index_cache_set(&cache, "repo:crate-a".to_string(), data.clone()).await;
         // Trigger eviction pass by setting another entry.
-        index_cache_set(&cache, "repo:crate-b".to_string(), Bytes::from_static(b"b"));
+        index_cache_set(&cache, "repo:crate-b".to_string(), Bytes::from_static(b"b")).await;
         // The first entry must still be present.
         assert_eq!(
-            index_cache_get(&cache, "repo:crate-a").expect("should still be cached"),
+            index_cache_get(&cache, "repo:crate-a")
+                .await
+                .expect("should still be cached"),
             data
         );
     }
 
-    #[test]
-    fn test_index_cache_multiple_repos_isolated() {
+    #[tokio::test]
+    async fn test_index_cache_multiple_repos_isolated() {
         // Entries for different repo keys must not collide.
         let cache = make_index_cache();
         let data_a = Bytes::from_static(b"repo-a data");
         let data_b = Bytes::from_static(b"repo-b data");
-        index_cache_set(&cache, "repo-a:serde".to_string(), data_a.clone());
-        index_cache_set(&cache, "repo-b:serde".to_string(), data_b.clone());
-        assert_eq!(index_cache_get(&cache, "repo-a:serde").unwrap(), data_a);
-        assert_eq!(index_cache_get(&cache, "repo-b:serde").unwrap(), data_b);
-        index_cache_invalidate(&cache, "repo-a:serde");
-        assert!(index_cache_get(&cache, "repo-a:serde").is_none());
-        assert!(index_cache_get(&cache, "repo-b:serde").is_some());
+        index_cache_set(&cache, "repo-a:serde".to_string(), data_a.clone()).await;
+        index_cache_set(&cache, "repo-b:serde".to_string(), data_b.clone()).await;
+        assert_eq!(
+            index_cache_get(&cache, "repo-a:serde").await.unwrap(),
+            data_a
+        );
+        assert_eq!(
+            index_cache_get(&cache, "repo-b:serde").await.unwrap(),
+            data_b
+        );
+        index_cache_invalidate(&cache, "repo-a:serde").await;
+        assert!(index_cache_get(&cache, "repo-a:serde").await.is_none());
+        assert!(index_cache_get(&cache, "repo-b:serde").await.is_some());
     }
 
     #[test]
@@ -2351,32 +2909,33 @@ mod tests {
         assert_eq!(cache_control, &format!("max-age={}", INDEX_CACHE_TTL_SECS));
     }
 
-    #[test]
-    fn test_index_cache_concurrent_access() {
-        // Arc<RwLock<HashMap>> must allow concurrent reads and writes from
-        // multiple threads without panicking or losing data.
-        use std::thread;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_index_cache_concurrent_access() {
+        // Arc<tokio::sync::RwLock<HashMap>> must allow concurrent reads and
+        // writes from multiple tasks without panicking, losing data, or
+        // blocking the runtime worker threads (ak-2q98).
         let cache = make_index_cache();
-        let threads: Vec<_> = (0..8)
-            .map(|i| {
-                let c = cache.clone();
-                thread::spawn(move || {
-                    let key = format!("repo:crate-{}", i);
-                    let data = Bytes::from(format!("data-{}", i).into_bytes());
-                    index_cache_set(&c, key.clone(), data.clone());
-                    let result = index_cache_get(&c, &key);
-                    assert!(result.is_some());
-                    assert_eq!(result.unwrap(), data);
-                })
-            })
-            .collect();
-        for t in threads {
-            t.join().unwrap();
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let c = cache.clone();
+            handles.push(tokio::spawn(async move {
+                let key = format!("repo:crate-{}", i);
+                let data = Bytes::from(format!("data-{}", i).into_bytes());
+                index_cache_set(&c, key.clone(), data.clone()).await;
+                let result = index_cache_get(&c, &key).await;
+                assert!(result.is_some());
+                assert_eq!(result.unwrap(), data);
+            }));
         }
+        for h in handles {
+            h.await.expect("task panicked");
+        }
+        let guard = cache.read().await;
+        assert_eq!(guard.len(), 16);
     }
 
-    #[test]
-    fn test_virtual_repo_invalidation_pattern() {
+    #[tokio::test]
+    async fn test_virtual_repo_invalidation_pattern() {
         // Simulates the multi-key invalidation that publish performs:
         // invalidate the hosted repo's entry AND each virtual repo that
         // aggregates it.
@@ -2390,36 +2949,295 @@ mod tests {
             &cache,
             format!("{}:{}", hosted_key, crate_name),
             Bytes::from_static(b"hosted-index"),
-        );
+        )
+        .await;
         for vk in &virtual_keys {
             index_cache_set(
                 &cache,
                 format!("{}:{}", vk, crate_name),
                 Bytes::from_static(b"virtual-index"),
-            );
+            )
+            .await;
         }
 
         // Invalidate (mirrors the publish handler).
-        index_cache_invalidate(&cache, &format!("{}:{}", hosted_key, crate_name));
+        index_cache_invalidate(&cache, &format!("{}:{}", hosted_key, crate_name)).await;
         for vk in &virtual_keys {
-            index_cache_invalidate(&cache, &format!("{}:{}", vk, crate_name));
+            index_cache_invalidate(&cache, &format!("{}:{}", vk, crate_name)).await;
         }
 
         // All three entries must be gone.
-        assert!(index_cache_get(&cache, &format!("{}:{}", hosted_key, crate_name)).is_none());
+        assert!(
+            index_cache_get(&cache, &format!("{}:{}", hosted_key, crate_name))
+                .await
+                .is_none()
+        );
         for vk in &virtual_keys {
-            assert!(index_cache_get(&cache, &format!("{}:{}", vk, crate_name)).is_none());
+            assert!(index_cache_get(&cache, &format!("{}:{}", vk, crate_name))
+                .await
+                .is_none());
         }
     }
 
-    #[test]
-    fn test_index_cache_binary_content_round_trip() {
+    #[tokio::test]
+    async fn test_index_cache_binary_content_round_trip() {
         // The cache stores raw Bytes; arbitrary byte sequences (not just UTF-8
         // JSON) must be returned unchanged.
         let cache = make_index_cache();
         let binary_data = Bytes::from(vec![0u8, 1, 2, 127, 128, 255, b'"', b'\n']);
-        index_cache_set(&cache, "repo:binary-crate".to_string(), binary_data.clone());
-        let result = index_cache_get(&cache, "repo:binary-crate").unwrap();
+        index_cache_set(&cache, "repo:binary-crate".to_string(), binary_data.clone()).await;
+        let result = index_cache_get(&cache, "repo:binary-crate").await.unwrap();
         assert_eq!(result, binary_data);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_download_url (upstream config.json dl field)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_download_url_plain_base() {
+        // Standard crates.io style: dl is a plain URL, we append /{name}/{version}/download.
+        let dl = "https://crates.io/api/v1/crates";
+        let url = build_download_url(dl, "serde", "1.0.200");
+        assert_eq!(
+            url,
+            "https://crates.io/api/v1/crates/serde/1.0.200/download"
+        );
+    }
+
+    #[test]
+    fn test_build_download_url_plain_base_trailing_slash() {
+        let dl = "https://crates.io/api/v1/crates/";
+        let url = build_download_url(dl, "tokio", "1.38.0");
+        assert_eq!(url, "https://crates.io/api/v1/crates/tokio/1.38.0/download");
+    }
+
+    #[test]
+    fn test_build_download_url_template_with_markers() {
+        // Some registries use template markers in the dl field.
+        let dl = "https://dl.example.com/crates/{crate}/{version}/download";
+        let url = build_download_url(dl, "rand", "0.8.5");
+        assert_eq!(url, "https://dl.example.com/crates/rand/0.8.5/download");
+    }
+
+    #[test]
+    fn test_build_download_url_template_only_crate_marker() {
+        let dl = "https://cdn.example.com/{crate}/files/{version}.tgz";
+        let url = build_download_url(dl, "regex", "1.10.0");
+        assert_eq!(url, "https://cdn.example.com/regex/files/1.10.0.tgz");
+    }
+
+    #[test]
+    fn test_build_download_url_prerelease_version() {
+        let dl = "https://crates.io/api/v1/crates";
+        let url = build_download_url(dl, "my-crate", "0.1.0-alpha.1");
+        assert_eq!(
+            url,
+            "https://crates.io/api/v1/crates/my-crate/0.1.0-alpha.1/download"
+        );
+    }
+
+    #[test]
+    fn test_build_download_url_single_char_crate() {
+        let dl = "https://crates.io/api/v1/crates";
+        let url = build_download_url(dl, "a", "0.0.1");
+        assert_eq!(url, "https://crates.io/api/v1/crates/a/0.0.1/download");
+    }
+
+    // -----------------------------------------------------------------------
+    // split_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_split_url_standard() {
+        let (origin, path) =
+            split_url("https://crates.io/api/v1/crates/serde/1.0.0/download").unwrap();
+        assert_eq!(origin, "https://crates.io");
+        assert_eq!(path, "api/v1/crates/serde/1.0.0/download");
+    }
+
+    #[test]
+    fn test_split_url_with_port() {
+        let (origin, path) =
+            split_url("http://localhost:8080/api/v1/crates/tokio/1.0.0/download").unwrap();
+        assert_eq!(origin, "http://localhost:8080");
+        assert_eq!(path, "api/v1/crates/tokio/1.0.0/download");
+    }
+
+    #[test]
+    fn test_split_url_no_path() {
+        // A URL with no path after the host returns None.
+        assert!(split_url("https://crates.io").is_none());
+    }
+
+    #[test]
+    fn test_split_url_no_scheme() {
+        assert!(split_url("crates.io/api/v1/crates").is_none());
+    }
+
+    #[test]
+    fn test_split_url_root_path() {
+        let (origin, path) = split_url("https://example.com/download").unwrap();
+        assert_eq!(origin, "https://example.com");
+        assert_eq!(path, "download");
+    }
+
+    #[test]
+    fn test_split_url_deep_path() {
+        let (origin, path) = split_url("https://cdn.example.com/a/b/c/d/e").unwrap();
+        assert_eq!(origin, "https://cdn.example.com");
+        assert_eq!(path, "a/b/c/d/e");
+    }
+
+    // -----------------------------------------------------------------------
+    // config_cache_get / config_cache_set
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_config_cache_miss_returns_none() {
+        assert!(config_cache_get("https://nonexistent.example.com")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_config_cache_set_and_get_roundtrip() {
+        let base = format!(
+            "https://test-roundtrip-{}.example.com",
+            uuid::Uuid::new_v4()
+        );
+        let dl = "https://dl.example.com/api/v1/crates".to_string();
+        config_cache_set(base.clone(), dl.clone()).await;
+        let result = config_cache_get(&base).await.expect("should be in cache");
+        assert_eq!(result, dl);
+    }
+
+    #[tokio::test]
+    async fn test_config_cache_overwrites_previous_value() {
+        let base = format!(
+            "https://test-overwrite-{}.example.com",
+            uuid::Uuid::new_v4()
+        );
+        config_cache_set(base.clone(), "https://old.example.com/dl".to_string()).await;
+        config_cache_set(base.clone(), "https://new.example.com/dl".to_string()).await;
+        let result = config_cache_get(&base).await.unwrap();
+        assert_eq!(result, "https://new.example.com/dl");
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end download URL resolution scenario tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_crates_io_dl_url_produces_correct_download() {
+        // Simulates the crates.io scenario:
+        // config.json at index.crates.io has dl = "https://crates.io/api/v1/crates"
+        let dl = "https://crates.io/api/v1/crates";
+        let full_url = build_download_url(dl, "serde_json", "1.0.120");
+        assert_eq!(
+            full_url,
+            "https://crates.io/api/v1/crates/serde_json/1.0.120/download"
+        );
+
+        // The split must yield the correct origin for proxy_fetch.
+        let (origin, path) = split_url(&full_url).unwrap();
+        assert_eq!(origin, "https://crates.io");
+        assert_eq!(path, "api/v1/crates/serde_json/1.0.120/download");
+    }
+
+    #[test]
+    fn test_self_hosted_registry_same_host_dl() {
+        // A self-hosted registry where index and downloads share the same host.
+        // config.json has dl = "https://registry.company.com/api/v1/crates"
+        let dl = "https://registry.company.com/api/v1/crates";
+        let full_url = build_download_url(dl, "internal-lib", "2.0.0");
+        let (origin, path) = split_url(&full_url).unwrap();
+        assert_eq!(origin, "https://registry.company.com");
+        assert_eq!(path, "api/v1/crates/internal-lib/2.0.0/download");
+    }
+
+    #[test]
+    fn test_fallback_when_no_dl_url() {
+        // When resolve_upstream_dl_url returns None, the download handler
+        // falls back to upstream_url + the standard path.
+        let upstream_url = "https://index.crates.io";
+        let name = "serde";
+        let version = "1.0.0";
+        let fallback_path = format!("api/v1/crates/{}/{}/download", name, version);
+        assert_eq!(fallback_path, "api/v1/crates/serde/1.0.0/download");
+
+        // This would produce the wrong URL for crates.io (index.crates.io
+        // does not serve downloads), but it is the correct fallback for
+        // registries where index and downloads share the same host.
+        let full_fallback = format!("{}/{}", upstream_url, fallback_path);
+        assert_eq!(
+            full_fallback,
+            "https://index.crates.io/api/v1/crates/serde/1.0.0/download"
+        );
+    }
+
+    #[test]
+    fn test_build_download_url_rejects_internal_addresses() {
+        use crate::api::validation::validate_outbound_url;
+
+        // Cloud metadata endpoint (AWS IMDSv1)
+        let dl = "http://169.254.169.254/latest/meta-data/";
+        let url = build_download_url(dl, "evil", "1.0.0");
+        assert!(
+            validate_outbound_url(&url, "Cargo upstream download URL").is_err(),
+            "cloud metadata URL should be rejected"
+        );
+
+        // Localhost
+        let dl = "http://localhost:8080/evil";
+        let url = build_download_url(dl, "crate", "0.1.0");
+        assert!(
+            validate_outbound_url(&url, "Cargo upstream download URL").is_err(),
+            "localhost URL should be rejected"
+        );
+
+        // Private network (10.x)
+        let dl = "http://10.0.0.1/packages";
+        let url = build_download_url(dl, "crate", "0.1.0");
+        assert!(
+            validate_outbound_url(&url, "Cargo upstream download URL").is_err(),
+            "private network URL should be rejected"
+        );
+
+        // Docker-internal service name
+        let dl = "http://backend:8080/internal";
+        let url = build_download_url(dl, "crate", "0.1.0");
+        assert!(
+            validate_outbound_url(&url, "Cargo upstream download URL").is_err(),
+            "Docker-internal service URL should be rejected"
+        );
+
+        // Legitimate external URL should pass
+        let dl = "https://crates.io/api/v1/crates";
+        let url = build_download_url(dl, "serde", "1.0.0");
+        assert!(
+            validate_outbound_url(&url, "Cargo upstream download URL").is_ok(),
+            "legitimate external URL should be accepted"
+        );
+    }
+
+    /// Smoke test that the cargo `dl` field flows through
+    /// `validate_outbound_url`. The detailed coverage of each bypass
+    /// class lives in `api::validation::tests`; this test pins the
+    /// integration: a malicious upstream `config.json` returning a
+    /// crafted `dl` cannot reach AWS IMDS via the cargo download path.
+    /// One realistic case is sufficient — duplicating the full bypass
+    /// matrix here would shadow the validator's own tests.
+    #[test]
+    fn test_build_download_url_rejects_ipv6_ssrf_bypass() {
+        use crate::api::validation::validate_outbound_url;
+        let dl = "http://[::ffff:169.254.169.254]";
+        let url = build_download_url(dl, "evil", "1.0.0");
+        let err = validate_outbound_url(&url, "Cargo upstream download URL")
+            .expect_err("IPv4-mapped AWS IMDS via dl must be rejected");
+        assert!(
+            err.to_string().contains("private/internal network"),
+            "expected SSRF rejection reason in error message, got: {err}"
+        );
     }
 }

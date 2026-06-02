@@ -74,44 +74,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_config() -> Config {
-        Config {
-            database_url: String::new(),
-            bind_address: "0.0.0.0:8080".into(),
-            log_level: "info".into(),
-            storage_backend: "filesystem".into(),
-            storage_path: "/tmp".into(),
-            s3_bucket: None,
-            gcs_bucket: None,
-            s3_region: None,
-            s3_endpoint: None,
-            jwt_secret: "test-secret".into(),
-            jwt_expiration_secs: 3600,
-            jwt_access_token_expiry_minutes: 30,
-            jwt_refresh_token_expiry_days: 7,
-            oidc_issuer: None,
-            oidc_client_id: None,
-            oidc_client_secret: None,
-            ldap_url: None,
-            ldap_base_dn: None,
-            trivy_url: None,
-            openscap_url: None,
-            openscap_profile: "standard".into(),
-            meilisearch_url: None,
-            meilisearch_api_key: None,
-            scan_workspace_path: "/tmp".into(),
-            demo_mode: false,
-            peer_instance_name: "test".into(),
-            peer_public_endpoint: "http://localhost:8080".into(),
-            peer_api_key: "test".into(),
-            dependency_track_url: None,
-            otel_exporter_otlp_endpoint: None,
-            otel_service_name: "test".into(),
-            gc_schedule: "0 0 * * * *".into(),
-            lifecycle_check_interval_secs: 60,
-            max_upload_size_bytes: 10_737_418_240,
-            allow_local_admin_login: false,
-            metrics_port: None,
-        }
+        Config::test_config()
     }
 
     fn test_state() -> Arc<AppState> {

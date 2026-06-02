@@ -27,7 +27,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic, require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
 
@@ -438,7 +438,8 @@ async fn upload_object(
     Path((repo_key, oid)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "git-lfs")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "git-lfs", "write")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos
@@ -591,22 +592,18 @@ async fn download_object(
                     (&repo.upstream_url, &state.proxy_service)
                 {
                     let upstream_path = format!("objects/{}", oid);
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
+                    // #895: stream large LFS blobs (the whole reason LFS
+                    // exists). Default Content-Type matches the buffered
+                    // handler's prior fallback.
+                    return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo_key,
                         upstream_url,
                         &upstream_path,
+                        "application/octet-stream",
                     )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
+                    .await;
                 }
             }
 
@@ -656,6 +653,11 @@ async fn download_object(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
+    // Check quarantine status before serving
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
+        .await
+        .map_err(|e| e.into_response())?;
+
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         lfs_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -744,7 +746,8 @@ async fn create_lock(
     Path(repo_key): Path<String>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "git-lfs")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "git-lfs", "write")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     let request: CreateLockRequest = serde_json::from_slice(&body).map_err(|e| {
@@ -843,8 +846,15 @@ async fn create_lock(
 
 async fn list_locks(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
+    // Per the Git LFS file-locking spec, GET /locks requires authentication
+    // (https://github.com/git-lfs/git-lfs/blob/main/docs/api/locking.md).
+    // Without it, anyone can enumerate file locks (paths, owners, timestamps)
+    // for any LFS repo on this server. Match the auth pattern used by the
+    // sibling lock handlers (create_lock, delete_lock, verify_locks).
+    let _user_id = require_auth_basic(auth, "git-lfs")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     let rows = sqlx::query!(
@@ -899,7 +909,8 @@ async fn verify_locks(
     Path(repo_key): Path<String>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "git-lfs")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "git-lfs", "write")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     // Parse request body (optional, may be empty)
@@ -988,7 +999,8 @@ async fn delete_lock(
     Path((repo_key, lock_id)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "git-lfs")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "git-lfs", "delete")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     let force = if body.is_empty() {
@@ -1454,5 +1466,29 @@ mod tests {
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth-required lock endpoints (regression guard)
+    //
+    // Per the Git LFS file-locking spec, every locks endpoint requires
+    // authentication. `require_auth_basic` is the seam every lock handler
+    // (create_lock, delete_lock, verify_locks, list_locks) routes through.
+    // If a refactor ever drops the auth call from a handler, this test still
+    // proves the helper rejects unauthenticated callers — and the handler's
+    // type signature (Extension<Option<AuthExtension>>) makes the bypass a
+    // compile error rather than a silent regression.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_require_auth_basic_rejects_missing_auth() {
+        // Calling the auth helper without any AuthExtension must produce an
+        // error response — this is what every locks handler relies on to
+        // enforce authentication.
+        let result = require_auth_basic(None, "git-lfs");
+        assert!(
+            result.is_err(),
+            "require_auth_basic(None, ...) must return Err to deny unauthenticated callers"
+        );
     }
 }

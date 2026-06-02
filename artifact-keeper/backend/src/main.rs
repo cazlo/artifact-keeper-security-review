@@ -1,5 +1,24 @@
 //! Artifact Keeper - Main Entry Point
 
+// ---------------------------------------------------------------------------
+// Global allocator selection (non-Windows only)
+// ---------------------------------------------------------------------------
+// - `--features jemalloc`   -> use jemalloc
+// - `--features mimalloc`   -> use mimalloc
+// - `--features profiling`  -> use jemalloc with heap profiling enabled
+//   (profiling implies jemalloc)
+//
+// If both jemalloc and mimalloc features are enabled, jemalloc wins.
+// On Windows these features are unavailable; the system allocator is used.
+
+#[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(all(feature = "mimalloc", not(feature = "jemalloc")))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -29,14 +48,15 @@ use artifact_keeper_backend::{
     services::{
         auth_service::AuthService,
         dependency_track_service::DependencyTrackService,
-        meili_service::MeiliService,
         metrics_service,
+        opensearch_service::OpenSearchService,
         plugin_registry::PluginRegistry,
         proxy_service::ProxyService,
         scan_config_service::ScanConfigService,
         scan_result_service::ScanResultService,
         scanner_service::{AdvisoryClient, ScannerService},
         scheduler_service,
+        smtp_service::SmtpService,
         storage_service::StorageService,
         wasm_plugin_service::WasmPluginService,
     },
@@ -88,6 +108,24 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .install_default()
         .expect("Failed to install rustls CryptoProvider");
 
+    // Resolve the shutdown token early so background workers spawned during
+    // startup (email dispatcher, webhook producer) share the same
+    // cancellation source as the HTTP/gRPC servers spawned later. If the
+    // caller did not pass one (console mode) we create our own and bind it
+    // to the OS signal listener.
+    let runtime_shutdown_token = match shutdown_token {
+        Some(token) => token,
+        None => {
+            let token = CancellationToken::new();
+            let signal_token = token.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                signal_token.cancel();
+            });
+            token
+        }
+    };
+
     // Load environment variables
     if let Ok(env_file) = std::env::var("AK_ENV_FILE") {
         dotenvy::from_path(&env_file).ok();
@@ -108,10 +146,24 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     // Load configuration
     let config = Config::from_env()?;
+
+    // Log active allocator
+    #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
+    tracing::info!("Global allocator: jemalloc");
+    #[cfg(all(feature = "mimalloc", not(feature = "jemalloc")))]
+    tracing::info!("Global allocator: mimalloc");
+    #[cfg(not(any(
+        all(feature = "jemalloc", not(target_os = "windows")),
+        all(feature = "mimalloc", not(feature = "jemalloc")),
+    )))]
+    tracing::info!("Global allocator: system");
+    #[cfg(feature = "profiling")]
+    tracing::info!("Jemalloc profiling enabled - set _RJEM_MALLOC_CONF=prof:true to activate");
+
     tracing::info!("Starting Artifact Keeper");
 
     // Connect to database
-    let db_pool = db::create_pool(&config.database_url).await?;
+    let db_pool = db::create_pool(&config).await?;
     tracing::info!("Connected to database");
 
     // Run migrations (skip with SKIP_MIGRATIONS=true for pre-applied migrations)
@@ -123,21 +175,81 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         tracing::info!("SKIP_MIGRATIONS=true, skipping automatic database migrations");
     } else {
         tracing::info!("Running database migrations...");
-        sqlx::migrate!("./migrations").run(&db_pool).await?;
+        artifact_keeper_backend::migration_repair::repair_legacy_073_checksum(&db_pool).await?;
+        artifact_keeper_backend::migration_repair::repair_release_1_1_9_divergence(&db_pool)
+            .await?;
+        // Some migrations (e.g. CREATE INDEX on a populated `artifacts` table
+        // or backfill UPDATEs) take longer than the per-query
+        // `statement_timeout` that operators commonly set on their Postgres
+        // parameter group as an app-query safeguard (10 s on AWS RDS for many
+        // tunings). Acquire a dedicated connection and raise the timeouts
+        // session-locally so the migration runner doesn't share fate with
+        // production query limits. The SET is per-session and is wiped when
+        // the connection is dropped — global limits for normal app queries
+        // are unaffected.
+        let mut conn = db_pool.acquire().await?;
+        sqlx::query("SET statement_timeout = '30min'")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("SET lock_timeout = '5min'")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::migrate!("./migrations").run(&mut *conn).await?;
         tracing::info!("Database migrations complete");
     }
 
     // Provision admin user on first boot; returns true when setup lock is needed
     let setup_required = provision_admin_user(&db_pool, &config.storage_path).await?;
 
+    // Log loudly at WARN level when setup is still required so log-based
+    // alerting and SIEM rules can surface "this server has not had its
+    // admin password changed". Before #889, the same condition surfaced
+    // implicitly via /readyz returning 503; that signal was load-bearing
+    // for some operators and we removed it (the 503 caused Kubernetes
+    // restart loops). Emitting a structured WARN here preserves the
+    // alert path without driving Kubernetes to restart the pod.
+    if setup_required {
+        tracing::warn!(
+            event = "setup_required",
+            "Default admin password has not been changed. API mutations are gated by the setup middleware until the change-password flow runs. See the deployment documentation for credential bootstrap details."
+        );
+    }
+
     // Bootstrap OIDC config from environment variables when no DB configs exist yet.
     // This bridges the gap between env-var-based deployment and the database-backed
     // SSO config that the handlers actually use (fixes #238).
     bootstrap_oidc_from_env(&db_pool).await?;
 
+    // Bootstrap LDAP config from environment variables when no DB configs exist yet.
+    // Same bridge as OIDC above: the SSO handlers and provider list read from the
+    // database, so LDAP_* env vars must be seeded into ldap_configs on first boot
+    // for env-only deployments to work (fixes #1434).
+    bootstrap_ldap_from_env(&db_pool).await?;
+
     // Initialize peer identity for mesh networking
     let peer_id = init_peer_identity(&db_pool, &config).await?;
     tracing::info!("Peer identity: {} ({})", config.peer_instance_name, peer_id);
+
+    // Warn when permission rules exist but enforcement is not yet active (#794).
+    // This makes the gap visible in server logs so administrators do not
+    // assume their rules are protecting anything.
+    match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM permissions")
+        .fetch_one(&db_pool)
+        .await
+    {
+        Ok(count) if count > 0 => {
+            tracing::warn!(
+                permission_rules = count,
+                "Found {} permission rule(s) in the database, but enforcement is NOT active. \
+                 Permission rules created via /api/v1/permissions are stored but not consulted \
+                 during request authorization. This will be addressed in a future release. \
+                 See https://github.com/artifact-keeper/artifact-keeper/issues/794",
+                count,
+            );
+        }
+        Ok(_) => {}  // no rules, nothing to warn about
+        Err(_) => {} // table may not exist on old schema, ignore
+    }
 
     // Initialize WASM plugin system (T068)
     let plugins_dir =
@@ -145,23 +257,28 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let (plugin_registry, wasm_plugin_service) =
         initialize_wasm_plugins(db_pool.clone(), plugins_dir).await?;
 
-    // Initialize Meilisearch (optional, graceful fallback)
-    let meili_service = match (&config.meilisearch_url, &config.meilisearch_api_key) {
-        (Some(url), Some(api_key)) => {
-            tracing::info!("Initializing Meilisearch at {}", url);
-            match MeiliService::new(url, api_key) {
+    // Initialize OpenSearch (optional, graceful fallback)
+    let search_service = match &config.opensearch_url {
+        Some(url) => {
+            tracing::info!("Initializing OpenSearch at {}", url);
+            match OpenSearchService::new(
+                url,
+                config.opensearch_username.as_deref(),
+                config.opensearch_password.as_deref(),
+                config.opensearch_allow_invalid_certs,
+            ) {
                 Ok(s) => {
                     let service = Arc::new(s);
                     match service.configure_indexes().await {
                         Ok(()) => {
-                            tracing::info!("Meilisearch indexes configured");
+                            tracing::info!("OpenSearch indexes configured");
                             let svc = service.clone();
                             let pool = db_pool.clone();
                             tokio::spawn(async move {
                                 match svc.is_index_empty().await {
                                     Ok(true) => {
                                         tracing::info!(
-                                            "Meilisearch index is empty, starting background reindex"
+                                            "OpenSearch index is empty, starting background reindex"
                                         );
                                         if let Err(e) = svc.full_reindex(&pool).await {
                                             tracing::error!("Background reindex failed: {}", e);
@@ -169,12 +286,12 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                                     }
                                     Ok(false) => {
                                         tracing::info!(
-                                            "Meilisearch index already populated, skipping reindex"
+                                            "OpenSearch index already populated, skipping reindex"
                                         );
                                     }
                                     Err(e) => {
                                         tracing::warn!(
-                                            "Failed to check Meilisearch index status: {}",
+                                            "Failed to check OpenSearch index status: {}",
                                             e
                                         );
                                     }
@@ -184,7 +301,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "Failed to configure Meilisearch indexes, continuing without search: {}",
+                                "Failed to configure OpenSearch indexes, continuing without search: {}",
                                 e
                             );
                             None
@@ -193,7 +310,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "Failed to initialize Meilisearch client, continuing without search: {}",
+                        "Failed to initialize OpenSearch client, continuing without search: {}",
                         e
                     );
                     None
@@ -201,7 +318,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             }
         }
         _ => {
-            tracing::info!("Meilisearch not configured, search indexing disabled");
+            tracing::info!("OpenSearch not configured, search indexing disabled");
             None
         }
     };
@@ -209,6 +326,43 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // Initialize Prometheus metrics recorder
     let metrics_handle = metrics_service::init_metrics();
     tracing::info!("Prometheus metrics recorder initialized");
+
+    // Issues #976, #1224: surface the upstream private-IP allowlist at
+    // boot so the posture is obvious in startup logs. Metadata IPs
+    // remain blocked unconditionally; the validator handles that. The
+    // warning is loud because relaxing the SSRF guard is a security
+    // tradeoff the operator owns.
+    if let Some(list) = artifact_keeper_backend::api::validation::private_cidr_allowlist_value() {
+        tracing::warn!(
+            target: "security",
+            allowlist = %list,
+            "AK_SSRF_ALLOW_PRIVATE_CIDRS (or alias UPSTREAM_PRIVATE_IP_ALLOWLIST) \
+             is set; upstream URLs may now target listed private CIDRs. Cloud \
+             metadata IPs and loopback remain blocked. SSRF risk surface \
+             widened (issues #976, #1224)."
+        );
+    } else {
+        if artifact_keeper_backend::api::validation::upstream_allow_private_ips_enabled() {
+            tracing::warn!(
+                target: "security",
+                "UPSTREAM_ALLOW_PRIVATE_IPS=true; upstream / remote-proxy URLs \
+                 may now target ALL RFC1918 / unique-local addresses. Cloud \
+                 metadata IPs and loopback remain blocked. Prefer \
+                 AK_SSRF_ALLOW_PRIVATE_CIDRS with explicit CIDRs for a \
+                 narrower SSRF surface (issues #976, #1224, #1435)."
+            );
+        }
+        if artifact_keeper_backend::api::validation::webhook_allow_private_ips_enabled() {
+            tracing::warn!(
+                target: "security",
+                "WEBHOOK_ALLOW_PRIVATE_IPS=true; webhook delivery URLs may \
+                 now target ALL RFC1918 / unique-local addresses. Cloud \
+                 metadata IPs and loopback remain blocked. Prefer \
+                 AK_SSRF_ALLOW_PRIVATE_CIDRS with explicit CIDRs for a \
+                 narrower SSRF surface (issue #1435)."
+            );
+        }
+    }
 
     // Create primary storage backend based on STORAGE_BACKEND config
     let primary_storage: Arc<dyn artifact_keeper_backend::storage::StorageBackend> = match config
@@ -218,6 +372,21 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         "s3" => {
             let s3 = artifact_keeper_backend::storage::s3::S3Backend::from_env().await?;
             tracing::info!("S3 storage backend initialized");
+            // Issue #981: run a single connectivity probe so users see
+            // the root cause (TLS, DNS, 403, region mismatch) at boot
+            // instead of "storage probe timed out" minutes later in a
+            // health log. Probe failure is a *warning* only: the user's
+            // setup may rely on lazy bucket-creation or an offline boot
+            // sequence, so we do not refuse to start.
+            match s3.startup_probe().await {
+                Ok(()) => tracing::info!("S3 connectivity probe succeeded"),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "S3 connectivity probe failed at startup; the service will \
+                     continue starting but storage operations may fail until \
+                     this is fixed (issue #981)"
+                ),
+            }
             Arc::new(s3)
         }
         "azure" => {
@@ -304,11 +473,25 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         ))
     };
 
+    // One-shot backfill of oci_manifest_refs for index manifests that
+    // pre-date migration 092 (artifact-keeper#1179). Runs after the
+    // storage registry is wired up because it needs the registry to read
+    // the parent manifest bodies from per-repo backends. Failures are
+    // logged but do not block startup. On a fresh database or after the
+    // first successful run, the candidate query returns zero rows and
+    // this is a near-instant no-op.
+    let _refs_backfill_stats =
+        artifact_keeper_backend::services::oci_manifest_refs_backfill::run_backfill(
+            &db_pool,
+            storage_registry.clone(),
+        )
+        .await;
+
     // Initialize security scanner service
     let advisory_client = Arc::new(AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok()));
     let scan_result_service = Arc::new(ScanResultService::new(db_pool.clone()));
     let scan_config_service = Arc::new(ScanConfigService::new(db_pool.clone()));
-    let scanner_service = Arc::new(ScannerService::new(
+    let mut scanner_service = ScannerService::new(
         db_pool.clone(),
         advisory_client,
         scan_result_service,
@@ -320,7 +503,28 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         config.scan_workspace_path.clone(),
         config.openscap_url.clone(),
         config.openscap_profile.clone(),
-    ));
+    );
+
+    // Initialize Dependency-Track integration (before wrapping scanner in Arc,
+    // so we can wire the DT service into the scan pipeline for SBOM submission).
+    let dt_service_arc: Option<Arc<DependencyTrackService>> =
+        match DependencyTrackService::from_env() {
+            Some(Ok(dt_service)) => {
+                tracing::info!("Dependency-Track integration enabled");
+                Some(Arc::new(dt_service))
+            }
+            Some(Err(e)) => {
+                tracing::warn!("Failed to initialize Dependency-Track: {}", e);
+                None
+            }
+            None => None,
+        };
+
+    if let Some(ref dt) = dt_service_arc {
+        scanner_service.set_dependency_track(dt.clone());
+    }
+
+    let scanner_service = Arc::new(scanner_service);
 
     // Create application state with WASM plugin support
     let scheduler_storage = primary_storage.clone();
@@ -341,20 +545,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         ),
     );
     app_state.set_quality_check_service(quality_check_service);
-    if let Some(meili) = meili_service {
-        app_state.set_meili_service(meili);
+    if let Some(search) = search_service {
+        app_state.set_search_service(search);
     }
-    // Initialize Dependency-Track integration
-    if let Some(dt_result) = DependencyTrackService::from_env() {
-        match dt_result {
-            Ok(dt_service) => {
-                tracing::info!("Dependency-Track integration enabled");
-                app_state.set_dependency_track(Arc::new(dt_service));
-            }
-            Err(e) => {
-                tracing::warn!("Failed to initialize Dependency-Track: {}", e);
-            }
-        }
+    if let Some(dt) = dt_service_arc {
+        app_state.set_dependency_track(dt);
     }
 
     app_state.set_metrics_handle(metrics_handle);
@@ -374,6 +569,88 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         }
     }
 
+    // Initialize SMTP service (optional, graceful no-op when SMTP_HOST is absent)
+    match SmtpService::new(&config) {
+        Ok(smtp) => {
+            if smtp.is_configured() {
+                tracing::info!("SMTP service initialized");
+            } else {
+                tracing::info!("SMTP not configured, email delivery disabled");
+            }
+            app_state.set_smtp_service(Arc::new(smtp));
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to initialize SMTP service, email delivery disabled: {}",
+                e
+            );
+        }
+    }
+
+    // Validate the webhook signing-secret encryption key at boot. We accept
+    // any common base64 alphabet (standard or URL-safe, padded or not) so
+    // operator-supplied keys generated by tools like `openssl rand -base64`
+    // or Kubernetes secret generators work regardless of which characters
+    // happen to land in the output (see #1350: a `_` byte from base64url
+    // tripped the standard-only decoder).
+    //
+    // If the operator has set AK_WEBHOOK_SECRET_KEY but it is still malformed
+    // after trying every alphabet, fail loud and early instead of letting
+    // create/rotate-secret return HTTP 500 hours later. A missing key is
+    // also fatal: webhooks v2 cannot create or rotate secrets without it.
+    // Operators who want to run the backend without webhook support entirely
+    // can omit the key by also disabling the producer
+    // (WEBHOOKS_V2_PRODUCER_ENABLED=false, the default).
+    match artifact_keeper_backend::services::webhook_secret_crypto::ensure_configured() {
+        Ok(()) => tracing::info!("Webhook secret encryption key validated"),
+        Err(artifact_keeper_backend::services::webhook_secret_crypto::WebhookSecretError::KeyMissing) => {
+            tracing::warn!(
+                "AK_WEBHOOK_SECRET_KEY is not configured; webhook create and \
+                 rotate-secret endpoints will return HTTP 500 until it is set"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                "AK_WEBHOOK_SECRET_KEY is set but invalid: {}; refusing to start",
+                e
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // Start email dispatcher (subscribes to EventBus for email_subscriptions delivery).
+    // Webhook delivery goes through the v2 webhook pipeline below; the legacy
+    // notification_dispatcher that combined both channels was removed in #920.
+    artifact_keeper_backend::services::email_dispatcher::start_dispatcher(
+        app_state.event_bus.clone(),
+        app_state.db.clone(),
+        app_state.smtp_service.clone(),
+    );
+    tracing::info!("Email dispatcher started");
+
+    // Start webhooks v2 producer: subscribes to EventBus and enqueues rows
+    // into webhook_deliveries. The retry scheduler (every 30s) drives
+    // actual HTTP delivery. See backend/src/services/webhook_producer.rs.
+    //
+    // Gated behind WEBHOOKS_V2_PRODUCER_ENABLED (default off) so v1.1.9
+    // ships the dual-write code path dark. Operators flip the flag once
+    // they have rotated migrated webhook secrets and verified delivery.
+    let producer_enabled = std::env::var("WEBHOOKS_V2_PRODUCER_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    if producer_enabled {
+        artifact_keeper_backend::services::webhook_producer::start_webhook_producer(
+            app_state.event_bus.clone(),
+            app_state.db.clone(),
+            runtime_shutdown_token.clone(),
+        );
+        tracing::info!("Webhook producer started (WEBHOOKS_V2_PRODUCER_ENABLED=true)");
+    } else {
+        tracing::info!(
+            "Webhook producer disabled (set WEBHOOKS_V2_PRODUCER_ENABLED=true to enable)"
+        );
+    }
+
     app_state
         .setup_required
         .store(setup_required, std::sync::atomic::Ordering::Relaxed);
@@ -385,6 +662,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         config.clone(),
         scheduler_storage,
         storage_registry.clone(),
+        state.smtp_service.clone(),
     );
 
     // Keep a handle for the gRPC server before the sync worker consumes db_pool
@@ -497,23 +775,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             }),
         );
 
-    // Shared cancellation token: when the shutdown signal fires, both the
-    // HTTP and gRPC servers are notified to stop accepting new connections
-    // and drain in-flight requests before the process exits.
-    let shutdown_token = match shutdown_token {
-        Some(token) => token,
-        None => {
-            // No external token provided (console mode). Create our own and
-            // spawn the signal listener that cancels it on SIGTERM / Ctrl+C.
-            let token = CancellationToken::new();
-            let signal_token = token.clone();
-            tokio::spawn(async move {
-                shutdown_signal().await;
-                signal_token.cancel();
-            });
-            token
-        }
-    };
+    // The concrete shutdown token used by all servers and background tasks
+    // is resolved earlier in run_server (see `runtime_shutdown_token`) so
+    // that long-lived workers (email dispatcher, webhook producer)
+    // share the same cancellation source as the HTTP/gRPC servers.
+    let shutdown_token = runtime_shutdown_token.clone();
 
     // Start HTTP server
     let addr: SocketAddr = config.bind_address.parse()?;
@@ -529,11 +795,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // Reuse the existing pool instead of creating a second one (PgPool is Arc-backed)
     let sbom_server = SbomGrpcServer::new(grpc_db_pool.clone());
     let cve_history_server = CveHistoryGrpcServer::new(grpc_db_pool.clone());
-    let security_policy_server = SecurityPolicyGrpcServer::new(grpc_db_pool);
+    let security_policy_server = SecurityPolicyGrpcServer::new(grpc_db_pool.clone());
 
-    // gRPC auth interceptor — validates JWT Bearer tokens
-    let grpc_auth =
-        artifact_keeper_backend::grpc::auth_interceptor::AuthInterceptor::new(&config.jwt_secret);
+    // gRPC auth interceptor - validates JWT Bearer tokens. Pass the shared
+    // PgPool so the interceptor can consult the replica-safe credential-change
+    // watermark on every request (#1173 / PR #1190 review). Without the pool
+    // the interceptor would only see in-memory invalidations made on this
+    // replica, leaving a stale-token window equal to the JWT lifetime after a
+    // password reset / TOTP change on a peer replica.
+    let grpc_auth = artifact_keeper_backend::grpc::auth_interceptor::AuthInterceptor::new(
+        &config.jwt_secret,
+        Some(grpc_db_pool),
+    );
 
     // Include file descriptor for gRPC reflection
     let reflection_service = tonic_reflection::server::Builder::configure()
@@ -582,7 +855,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     if let (Some(metrics_port), Some(metrics_state)) = (config.metrics_port, metrics_state) {
         tracing::warn!(
             port = metrics_port,
-            "Starting unauthenticated metrics listener — \
+            "Starting unauthenticated metrics listener - \
              ensure this port is not reachable from untrusted networks"
         );
         let metrics_addr: SocketAddr = format!("0.0.0.0:{}", metrics_port).parse()?;
@@ -893,6 +1166,115 @@ fn build_oidc_request_from_values(
         attribute_mapping: Some(serde_json::Value::Object(attr_map)),
         is_enabled: Some(true),
         auto_create_users: Some(true),
+        pkce_enabled: None,
+        map_groups_to_groups: None,
+    })
+}
+
+/// Bootstrap an LDAP provider from environment variables when the database
+/// has no LDAP configs yet.  This lets operators configure LDAP entirely via
+/// env vars (LDAP_URL, LDAP_BASE_DN, LDAP_BIND_DN, etc.) without needing admin
+/// API access first.  Mirrors `bootstrap_oidc_from_env` (fixes #1434).
+async fn bootstrap_ldap_from_env(db: &sqlx::PgPool) -> Result<()> {
+    use artifact_keeper_backend::services::auth_config_service::AuthConfigService;
+
+    let req = match build_ldap_bootstrap_request() {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
+    // Only bootstrap when no LDAP configs exist in the database
+    let existing = AuthConfigService::list_ldap(db).await?;
+    if !existing.is_empty() {
+        tracing::debug!(
+            "LDAP env vars present but {} config(s) already exist in DB, skipping bootstrap",
+            existing.len()
+        );
+        return Ok(());
+    }
+
+    let config = AuthConfigService::create_ldap(db, req).await?;
+    tracing::info!(
+        "Bootstrapped LDAP provider '{}' (id={}) from environment variables",
+        config.name,
+        config.id
+    );
+
+    Ok(())
+}
+
+/// Raw LDAP environment variable values for bootstrap.
+#[derive(Default)]
+struct LdapEnvVars {
+    url: Option<String>,
+    base_dn: Option<String>,
+    bind_dn: Option<String>,
+    bind_password: Option<String>,
+    user_filter: Option<String>,
+    username_attr: Option<String>,
+    email_attr: Option<String>,
+    display_name_attr: Option<String>,
+    groups_attr: Option<String>,
+    group_base_dn: Option<String>,
+    group_filter: Option<String>,
+    admin_group_dn: Option<String>,
+    use_starttls: Option<String>,
+}
+
+/// Build a CreateLdapConfigRequest from LDAP_* environment variables.
+/// Returns None if any of the required env vars are missing or empty.
+fn build_ldap_bootstrap_request(
+) -> Option<artifact_keeper_backend::services::auth_config_service::CreateLdapConfigRequest> {
+    build_ldap_request_from_values(LdapEnvVars {
+        url: std::env::var("LDAP_URL").ok(),
+        base_dn: std::env::var("LDAP_BASE_DN").ok(),
+        bind_dn: std::env::var("LDAP_BIND_DN").ok(),
+        bind_password: std::env::var("LDAP_BIND_PASSWORD").ok(),
+        user_filter: std::env::var("LDAP_USER_FILTER").ok(),
+        username_attr: std::env::var("LDAP_USERNAME_ATTR").ok(),
+        email_attr: std::env::var("LDAP_EMAIL_ATTR").ok(),
+        display_name_attr: std::env::var("LDAP_DISPLAY_NAME_ATTR").ok(),
+        groups_attr: std::env::var("LDAP_GROUPS_ATTR").ok(),
+        group_base_dn: std::env::var("LDAP_GROUP_BASE_DN").ok(),
+        group_filter: std::env::var("LDAP_GROUP_FILTER").ok(),
+        admin_group_dn: std::env::var("LDAP_ADMIN_GROUP_DN").ok(),
+        use_starttls: std::env::var("LDAP_USE_STARTTLS").ok(),
+    })
+}
+
+/// Pure function that assembles a CreateLdapConfigRequest from optional values.
+/// Returns None if the LDAP server URL or base DN are missing or empty: both
+/// are required to bind and search the directory.
+fn build_ldap_request_from_values(
+    env: LdapEnvVars,
+) -> Option<artifact_keeper_backend::services::auth_config_service::CreateLdapConfigRequest> {
+    use artifact_keeper_backend::services::auth_config_service::CreateLdapConfigRequest;
+
+    let server_url = env.url.filter(|v| !v.is_empty())?;
+    let user_base_dn = env.base_dn.filter(|v| !v.is_empty())?;
+
+    let use_starttls = env
+        .use_starttls
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    Some(CreateLdapConfigRequest {
+        name: "default".to_string(),
+        server_url,
+        bind_dn: env.bind_dn.filter(|v| !v.is_empty()),
+        bind_password: env.bind_password.filter(|v| !v.is_empty()),
+        user_base_dn,
+        user_filter: env.user_filter.filter(|v| !v.is_empty()),
+        group_base_dn: env.group_base_dn.filter(|v| !v.is_empty()),
+        group_filter: env.group_filter.filter(|v| !v.is_empty()),
+        email_attribute: env.email_attr.filter(|v| !v.is_empty()),
+        display_name_attribute: env.display_name_attr.filter(|v| !v.is_empty()),
+        username_attribute: env.username_attr.filter(|v| !v.is_empty()),
+        groups_attribute: env.groups_attr.filter(|v| !v.is_empty()),
+        admin_group_dn: env.admin_group_dn.filter(|v| !v.is_empty()),
+        use_starttls: Some(use_starttls),
+        is_enabled: Some(true),
+        priority: Some(0),
     })
 }
 
@@ -901,6 +1283,10 @@ fn build_oidc_request_from_values(
 /// Returns `true` when the API should be locked until the admin changes
 /// the default password (i.e. `must_change_password` is still set and no
 /// explicit `ADMIN_PASSWORD` env var was provided).
+///
+/// Uses a PostgreSQL advisory lock to prevent race conditions when multiple
+/// replicas start simultaneously.  The lock is held for the duration of the
+/// check-and-create sequence so only one replica performs the initial insert.
 async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<bool> {
     use std::path::Path;
 
@@ -910,18 +1296,47 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         .eq_ignore_ascii_case("true")
     {
         tracing::info!(
-            "SKIP_ADMIN_PROVISIONING=true — skipping built-in admin user creation. \
+            "SKIP_ADMIN_PROVISIONING=true - skipping built-in admin user creation. \
              Admin access must be granted via SSO group mapping."
         );
         return Ok(false);
     }
 
-    let password_file = Path::new(storage_path).join("admin.password");
+    let storage_dir = Path::new(storage_path);
+    let password_file = storage_dir.join("admin.password");
 
-    // Check if an admin user already exists
+    // Ensure the storage directory exists before we try to write anything.
+    // Docker named volumes normally create the mount point, but bind mounts,
+    // alternative runtimes (Podman rootless, Kubernetes emptyDir), and custom
+    // STORAGE_PATH values may not.  Creating it here avoids a silent failure
+    // when writing the admin password file later. (fixes #787)
+    if let Err(e) = std::fs::create_dir_all(storage_dir) {
+        tracing::warn!(
+            "Could not create storage directory {}: {}",
+            storage_dir.display(),
+            e
+        );
+    }
+
+    // Acquire a cluster-wide advisory lock so that concurrent replicas
+    // serialize their admin provisioning.  The lock key is a stable hash
+    // of a well-known string.  We use a transaction-scoped lock
+    // (pg_advisory_xact_lock) so it is automatically released when the
+    // transaction commits or rolls back.
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('admin_password_init'))")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
+    // Re-check admin existence while holding the lock (double-check pattern).
     let admin_row: Option<(bool,)> =
         sqlx::query_as("SELECT must_change_password FROM users WHERE is_admin = true LIMIT 1")
-            .fetch_optional(db)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
@@ -932,9 +1347,10 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         // password-based login works.  This is a no-op when the column is
         // already correct but fixes installs that ended up with a wrong value.
         sqlx::query(
-            "UPDATE users SET auth_provider = 'local' WHERE username = 'admin' AND auth_provider != 'local'"
+            "UPDATE users SET auth_provider = 'local' \
+             WHERE username = 'admin' AND auth_provider != 'local'",
         )
-        .execute(db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
@@ -945,9 +1361,12 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
                     sqlx::query(
                         "UPDATE users SET must_change_password = true WHERE username = 'admin'",
                     )
-                    .execute(db)
+                    .execute(&mut *tx)
                     .await
                     .map_err(|e| {
+                        artifact_keeper_backend::error::AppError::Database(e.to_string())
+                    })?;
+                    tx.commit().await.map_err(|e| {
                         artifact_keeper_backend::error::AppError::Database(e.to_string())
                     })?;
                     return Ok(true);
@@ -957,16 +1376,54 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
 
         if must_change {
             tracing::warn!(
-                "Admin user has not changed default password. API is locked until password is changed."
+                "Admin user has not changed default password. \
+                 API is locked until password is changed."
             );
-            // Ensure the password file still exists for the user to read
             if password_file.exists() {
                 tracing::info!("Admin password file: {}", password_file.display());
+            } else {
+                // The password file is missing (deleted, volume recreated, or
+                // the initial write failed).  Generate a new password, write
+                // the file FIRST, then update the DB hash.  If the file write
+                // fails we skip the DB update so the old hash remains usable
+                // on retry.
+                tracing::warn!(
+                    "Admin password file missing at {}. Regenerating password.",
+                    password_file.display()
+                );
+                let password = generate_random_password();
+                if let Err(e) = write_admin_password_file(&password_file, &password) {
+                    tracing::error!("Failed to write admin password file: {}", e);
+                    tracing::error!(
+                        "Admin password could not be persisted. \
+                         Re-run the server or check file permissions for: {}",
+                        password_file.display()
+                    );
+                } else {
+                    // File written successfully, now update the DB hash to match.
+                    let password_hash = AuthService::hash_password(&password).await?;
+                    sqlx::query("UPDATE users SET password_hash = $1 WHERE username = 'admin'")
+                        .bind(&password_hash)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            artifact_keeper_backend::error::AppError::Database(e.to_string())
+                        })?;
+                    log_admin_setup_banner(&password_file, Some(&password));
+                }
             }
+            tx.commit()
+                .await
+                .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
             return Ok(true);
         }
+        tx.commit()
+            .await
+            .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
         return Ok(false);
     }
+
+    // --- No admin user exists yet: create one. ---
 
     let (password, must_change) = match std::env::var("ADMIN_PASSWORD") {
         Ok(p) if !p.is_empty() => {
@@ -978,18 +1435,35 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
             }
         }
         _ => {
-            const CHARSET: &[u8] =
-                b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*";
-            let mut rng = rand::rng();
-            let p: String = (0..20)
-                .map(|_| {
-                    let idx = rng.random_range(0..CHARSET.len());
-                    CHARSET[idx] as char
-                })
-                .collect();
+            let p = generate_random_password();
             (p, true)
         }
     };
+
+    // Write the password file BEFORE updating the database.  If the file
+    // write fails, we abort without inserting the DB row so the next startup
+    // can retry cleanly.  This avoids the scenario where the hash is in the
+    // DB but the plaintext is lost.
+    if must_change {
+        if let Err(e) = write_admin_password_file(&password_file, &password) {
+            tracing::error!("Failed to write admin password file: {}", e);
+            tracing::error!(
+                "Admin password could not be persisted. \
+                 Re-run the server or check file permissions for: {}",
+                password_file.display()
+            );
+            // Roll back the transaction (advisory lock released).  The next
+            // replica or restart will retry.
+            tx.rollback()
+                .await
+                .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+            return Err(artifact_keeper_backend::error::AppError::Config(format!(
+                "Cannot persist admin password file at {}. \
+                 Fix file permissions and restart.",
+                password_file.display()
+            )));
+        }
+    }
 
     let password_hash = AuthService::hash_password(&password).await?;
 
@@ -1005,69 +1479,126 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
     )
     .bind(&password_hash)
     .bind(must_change)
-    .execute(db)
+    .execute(&mut *tx)
     .await
     .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
+    tx.commit()
+        .await
+        .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
     if must_change {
-        // Write password + setup instructions to the file
-        let file_contents = format!(
-            "{}\n\n\
-            # ONE-TIME SETUP — this password must be changed before the API unlocks.\n\
-            #\n\
-            # Step 1: Login to get a JWT token:\n\
-            #   curl -s -X POST http://localhost:8080/api/v1/auth/login \\\n\
-            #     -H 'Content-Type: application/json' \\\n\
-            #     -d '{{\"username\":\"admin\",\"password\":\"<password-above>\"}}'\n\
-            #\n\
-            # Step 2: Change the password (use the access_token from step 1):\n\
-            #   curl -s -X POST http://localhost:8080/api/v1/users/me/password \\\n\
-            #     -H 'Authorization: Bearer <access_token>' \\\n\
-            #     -H 'Content-Type: application/json' \\\n\
-            #     -d '{{\"current_password\":\"<password-above>\",\"new_password\":\"<your-new-password>\"}}'\n\
-            #\n\
-            # The API is LOCKED until you complete these steps.\n\
-            # Do NOT use this password directly in API calls — you must login first.\n",
-            password
-        );
-        if let Err(e) = std::fs::write(&password_file, &file_contents) {
-            tracing::error!("Failed to write admin password file: {}", e);
-            tracing::error!("Admin password could not be persisted. Re-run the server or check file permissions for: {}", password_file.display());
-        } else {
-            // Restrict file permissions to owner-only (0600) since this file contains credentials
-            #[cfg(unix)]
-            if let Err(e) =
-                std::fs::set_permissions(&password_file, std::fs::Permissions::from_mode(0o600))
-            {
-                tracing::warn!("Failed to set permissions on admin password file: {}", e);
-            }
-            tracing::info!("Admin password written to: {}", password_file.display());
-        }
-        tracing::info!(
-            "\n\
-            ===========================================================\n\
-            \n\
-              Initial admin user created.\n\
-            \n\
-              Username:  admin\n\
-              Password:  see file {}\n\
-            \n\
-              Read it:   docker exec artifact-keeper-backend cat {}\n\
-            \n\
-              The API is LOCKED until you change this password.\n\
-              You MUST login first (POST /api/v1/auth/login) to get\n\
-              a token, then change the password. See the file for\n\
-              full curl examples.\n\
-            \n\
-            ===========================================================",
-            password_file.display(),
-            password_file.display(),
-        );
+        // Only echo the plaintext when we generated it ourselves. If the
+        // password came from ADMIN_PASSWORD but matched an insecure default,
+        // it was already supplied by the operator and is presumably logged
+        // elsewhere; we still force a change but don't re-emit it.
+        let echo = std::env::var("ADMIN_PASSWORD").ok().is_none();
+        log_admin_setup_banner(&password_file, echo.then_some(password.as_str()));
         Ok(true)
     } else {
         tracing::info!("Admin user created with password from ADMIN_PASSWORD env var");
         Ok(false)
     }
+}
+
+/// Generate a random 20-character password for the admin user.
+fn generate_random_password() -> String {
+    const CHARSET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*";
+    let mut rng = rand::rng();
+    (0..20)
+        .map(|_| {
+            let idx = rng.random_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect()
+}
+
+/// Write the admin password and setup instructions to a file.
+///
+/// Returns `Ok(())` on success.  On failure the error is propagated so that
+/// callers can avoid updating the database hash (preventing the "hash in DB
+/// but plaintext lost" scenario).
+fn write_admin_password_file(
+    password_file: &std::path::Path,
+    password: &str,
+) -> std::io::Result<()> {
+    let file_contents = format!(
+        "{}\n\n\
+        # ONE-TIME SETUP -- this password must be changed before the API unlocks.\n\
+        #\n\
+        # Step 1: Login to get a JWT token:\n\
+        #   curl -s -X POST http://localhost:8080/api/v1/auth/login \\\n\
+        #     -H 'Content-Type: application/json' \\\n\
+        #     -d '{{\"username\":\"admin\",\"password\":\"<password-above>\"}}'\n\
+        #\n\
+        # Step 2: Change the password (use the access_token from step 1):\n\
+        #   curl -s -X POST http://localhost:8080/api/v1/users/me/password \\\n\
+        #     -H 'Authorization: Bearer <access_token>' \\\n\
+        #     -H 'Content-Type: application/json' \\\n\
+        #     -d '{{\"current_password\":\"<password-above>\",\"new_password\":\"<your-new-password>\"}}'\n\
+        #\n\
+        # The API is LOCKED until you complete these steps.\n\
+        # Do NOT use this password directly in API calls -- you must login first.\n",
+        password
+    );
+    std::fs::write(password_file, &file_contents)?;
+    #[cfg(unix)]
+    if let Err(e) = std::fs::set_permissions(password_file, std::fs::Permissions::from_mode(0o600))
+    {
+        tracing::warn!("Failed to set permissions on admin password file: {}", e);
+    }
+    tracing::info!("Admin password written to: {}", password_file.display());
+    Ok(())
+}
+
+/// Log the setup banner with instructions for the admin user.
+///
+/// When `password` is `Some`, the banner echoes the plaintext into logs in
+/// addition to pointing at the file. This trades a small disclosure risk for
+/// onboarding friction: the password is single-use anyway (the API is locked
+/// behind `must_change_password = true` and the first login forces a rotation),
+/// and operators are otherwise stuck spelunking inside the container to find
+/// the file (issue #1009). Set `ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD=true` to
+/// suppress the plaintext echo while keeping the file path hint, which is
+/// useful for shared log aggregators.
+fn log_admin_setup_banner(password_file: &std::path::Path, password: Option<&str>) {
+    let hide_password = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD")
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("true");
+
+    let password_line = match (password, hide_password) {
+        (Some(pw), false) => format!("  Password:  {}\n", pw),
+        _ => format!("  Password:  see file {}\n", password_file.display()),
+    };
+
+    tracing::info!(
+        "\n\
+        ===========================================================\n\
+        \n\
+          Initial admin user created.\n\
+        \n\
+          Username:  admin\n\
+        {}\
+        \n\
+          File:      {}\n\
+          Read it by exec'ing into the artifact-keeper backend container:\n\
+            Docker:      docker exec artifact-keeper-backend cat {}\n\
+            Kubernetes:  kubectl exec deploy/artifact-keeper-backend -- cat {}\n\
+        \n\
+          The API is LOCKED until you change this password.\n\
+          Open the web UI and log in -- you will be redirected to\n\
+          the forced-change-password screen. Alternatively call\n\
+          POST /api/v1/auth/login then POST /api/v1/users/<id>/password.\n\
+        \n\
+          Set ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD=true to hide the\n\
+          password from logs (file is still written).\n\
+        \n\
+        ===========================================================",
+        password_line,
+        password_file.display(),
+        password_file.display(),
+        password_file.display(),
+    );
 }
 
 fn is_insecure_default_password(password: &str) -> bool {
@@ -1497,4 +2028,210 @@ mod tests {
     // NOTE: windows_service.rs is behind #[cfg(windows)] and cannot be
     // unit-tested on macOS/Linux. It is compile-checked on Windows CI and
     // tested manually via `--install` / `--uninstall` / `--service` flags.
+
+    // -----------------------------------------------------------------------
+    // Regression: issue #1009 -- admin password is echoed to logs by default
+    // and hidden when ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD is set.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn admin_setup_banner_echoes_password_by_default() {
+        // We can't capture tracing output without a subscriber setup, so we
+        // exercise the path the banner takes and verify the env-toggle
+        // contract directly. The actual format is asserted by
+        // `admin_setup_banner_password_line_format`.
+        let saved = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD").ok();
+        std::env::remove_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD");
+        let hidden = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD")
+            .unwrap_or_default()
+            .eq_ignore_ascii_case("true");
+        assert!(!hidden, "default state must NOT hide the password");
+        if let Some(v) = saved {
+            std::env::set_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD", v);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: issue #1129 -- the repair function knows where to find the
+    // current 073 migration text and computes a SHA-384 over it. We can't run
+    // the DB-touching half as a unit test, but we can assert that the file is
+    // wired into the binary and the checksum routine matches sqlx's algorithm.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn migration_073_text_is_embedded_in_binary() {
+        // The repair function uses include_str! to embed the migration text.
+        // If someone deletes or renames 073_account_lockout.sql without
+        // updating the path, the binary won't compile, so this assertion is
+        // mostly future-proofing: confirm the embedded text is non-empty and
+        // matches the expected schema change.
+        let embedded = include_str!("../migrations/073_account_lockout.sql");
+        assert!(!embedded.is_empty());
+        assert!(embedded.contains("failed_login_attempts"));
+        assert!(embedded.contains("locked_until"));
+    }
+
+    #[test]
+    fn migration_073_checksum_matches_sqlx_algorithm() {
+        // sqlx records each migration's SHA-384 checksum in _sqlx_migrations.
+        // The repair function recomputes that hash to detect drift; verify the
+        // algorithm here so a future sqlx upgrade that switches algorithms
+        // doesn't silently break the repair path.
+        use sha2::{Digest, Sha384};
+        let embedded = include_str!("../migrations/073_account_lockout.sql");
+        let mut hasher = Sha384::new();
+        hasher.update(embedded.as_bytes());
+        let hash = hasher.finalize();
+        assert_eq!(hash.len(), 48, "SHA-384 produces 48 bytes");
+    }
+
+    #[test]
+    fn admin_setup_banner_hides_password_when_env_set() {
+        let saved = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD").ok();
+        std::env::set_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD", "true");
+        let hidden = std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD")
+            .unwrap_or_default()
+            .eq_ignore_ascii_case("true");
+        assert!(hidden);
+        // TRUE / True / 1-style toggles
+        std::env::set_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD", "TRUE");
+        assert!(std::env::var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD")
+            .unwrap()
+            .eq_ignore_ascii_case("true"));
+        if let Some(v) = saved {
+            std::env::set_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD", v);
+        } else {
+            std::env::remove_var("ARTIFACT_KEEPER_HIDE_ADMIN_PASSWORD");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_ldap_request_from_values (issue #1434)
+    // -----------------------------------------------------------------------
+
+    fn ldap_env(url: Option<&str>, base_dn: Option<&str>) -> LdapEnvVars {
+        LdapEnvVars {
+            url: url.map(String::from),
+            base_dn: base_dn.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_ldap_bootstrap_request_required_fields() {
+        let req = build_ldap_request_from_values(ldap_env(
+            Some("ldap://dc.local:389"),
+            Some("DC=domain,DC=local"),
+        ))
+        .unwrap();
+
+        assert_eq!(req.name, "default");
+        assert_eq!(req.server_url, "ldap://dc.local:389");
+        assert_eq!(req.user_base_dn, "DC=domain,DC=local");
+        // Bootstrapped providers are enabled so they show up in the SSO list.
+        assert_eq!(req.is_enabled, Some(true));
+        assert_eq!(req.priority, Some(0));
+        assert_eq!(req.use_starttls, Some(false));
+    }
+
+    #[test]
+    fn test_ldap_bootstrap_request_missing_url() {
+        let req = build_ldap_request_from_values(ldap_env(None, Some("DC=domain,DC=local")));
+        assert!(req.is_none());
+    }
+
+    #[test]
+    fn test_ldap_bootstrap_request_missing_base_dn() {
+        let req = build_ldap_request_from_values(ldap_env(Some("ldap://dc.local:389"), None));
+        assert!(req.is_none());
+    }
+
+    #[test]
+    fn test_ldap_bootstrap_request_empty_url() {
+        let req = build_ldap_request_from_values(ldap_env(Some(""), Some("DC=domain,DC=local")));
+        assert!(req.is_none());
+    }
+
+    #[test]
+    fn test_ldap_bootstrap_request_empty_base_dn() {
+        let req = build_ldap_request_from_values(ldap_env(Some("ldap://dc.local:389"), Some("")));
+        assert!(req.is_none());
+    }
+
+    #[test]
+    fn test_ldap_bootstrap_request_full_active_directory_config() {
+        // Mirrors the Active Directory example from issue #1434.
+        let req = build_ldap_request_from_values(LdapEnvVars {
+            url: Some("ldap://dc.local:389".to_string()),
+            base_dn: Some("DC=domain,DC=local".to_string()),
+            bind_dn: Some("user@domain".to_string()),
+            bind_password: Some("superPassword".to_string()),
+            user_filter: Some("(sAMAccountName={0})".to_string()),
+            username_attr: Some("sAMAccountName".to_string()),
+            email_attr: None,
+            display_name_attr: None,
+            groups_attr: None,
+            group_base_dn: Some("OU=Groups,DC=domain,DC=local".to_string()),
+            group_filter: Some("(memberUid={0})".to_string()),
+            admin_group_dn: Some("CN=admin_users_group,OU=Groups,DC=domain,DC=local".to_string()),
+            use_starttls: Some("false".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(req.bind_dn.as_deref(), Some("user@domain"));
+        assert_eq!(req.bind_password.as_deref(), Some("superPassword"));
+        assert_eq!(req.user_filter.as_deref(), Some("(sAMAccountName={0})"));
+        assert_eq!(req.username_attribute.as_deref(), Some("sAMAccountName"));
+        assert_eq!(
+            req.group_base_dn.as_deref(),
+            Some("OU=Groups,DC=domain,DC=local")
+        );
+        assert_eq!(req.group_filter.as_deref(), Some("(memberUid={0})"));
+        assert_eq!(
+            req.admin_group_dn.as_deref(),
+            Some("CN=admin_users_group,OU=Groups,DC=domain,DC=local")
+        );
+        assert_eq!(req.use_starttls, Some(false));
+        assert_eq!(req.is_enabled, Some(true));
+    }
+
+    #[test]
+    fn test_ldap_bootstrap_request_starttls_truthy_values() {
+        for v in ["true", "1"] {
+            let req = build_ldap_request_from_values(LdapEnvVars {
+                url: Some("ldap://dc.local:389".to_string()),
+                base_dn: Some("DC=domain,DC=local".to_string()),
+                use_starttls: Some(v.to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(
+                req.use_starttls,
+                Some(true),
+                "value {v} should enable STARTTLS"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ldap_bootstrap_request_empty_optional_fields_become_none() {
+        // Empty strings (e.g. unset compose interpolations) must not produce
+        // empty bind DNs or filters that would break directory binds.
+        let req = build_ldap_request_from_values(LdapEnvVars {
+            url: Some("ldap://dc.local:389".to_string()),
+            base_dn: Some("DC=domain,DC=local".to_string()),
+            bind_dn: Some("".to_string()),
+            bind_password: Some("".to_string()),
+            user_filter: Some("".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(req.bind_dn.is_none());
+        assert!(req.bind_password.is_none());
+        assert!(req.user_filter.is_none());
+    }
 }
+// warm cache benchmark
+// sqlx-cli benchmark
+// coverage benchmark

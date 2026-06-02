@@ -4,14 +4,28 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::{AppError, Result};
+
+/// Result of a streaming put operation. Returned by [`StorageBackend::put_stream`]
+/// / [`StorageService::put_stream`] so callers can verify the bytes-written count
+/// and the SHA-256 the storage layer observed (used by proxy caching to set the
+/// cache metadata sidecar without buffering the full body first; #895).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutStreamResult {
+    /// Hex-encoded SHA-256 over the streamed bytes.
+    pub checksum_sha256: String,
+    /// Total number of bytes the stream produced.
+    pub bytes_written: u64,
+}
 
 /// Storage backend trait
 #[async_trait]
@@ -25,6 +39,18 @@ pub trait StorageBackend: Send + Sync {
     /// Check if content exists
     async fn exists(&self, key: &str) -> Result<bool>;
 
+    /// Return the storage backend's opaque ETag for `key`, or `Ok(None)`
+    /// when the backend has no ETag concept (filesystem) or the object is
+    /// missing. Used by the proxy cache fast-path revalidation (#1051) to
+    /// detect tampering before signing a presigned URL. Default
+    /// implementation returns `Ok(None)` so legacy mock backends keep
+    /// compiling and the fast path simply skips revalidation, matching
+    /// pre-#1051 behavior for filesystem and test backends.
+    async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+        let _ = key;
+        Ok(None)
+    }
+
     /// Delete content by key
     async fn delete(&self, key: &str) -> Result<()>;
 
@@ -36,6 +62,49 @@ pub trait StorageBackend: Send + Sync {
 
     /// Get content size without fetching full content
     async fn size(&self, key: &str) -> Result<u64>;
+
+    /// Retrieve content as a byte stream instead of buffering the full
+    /// object in memory. Default implementation wraps `get()` in a
+    /// single-item stream; backends should override to actually stream
+    /// from the underlying store (filesystem `read_buf` loop, S3 ranged
+    /// GET, etc.). Used by the proxy cache fast path to serve large
+    /// cached artifacts without OOM on 1 GiB-limited pods (#895 / #737).
+    async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+        let content = self.get(key).await?;
+        Ok(Box::pin(futures::stream::once(async move { Ok(content) })))
+    }
+
+    /// Store content from a byte stream and return the observed SHA-256
+    /// plus byte count. Default implementation buffers into memory and
+    /// delegates to `put()`; backends should override to actually stream
+    /// into the underlying store. Used by the proxy cache slow path to
+    /// tee an upstream response simultaneously to client + storage
+    /// without buffering the full body (#895 / #737).
+    async fn put_stream(
+        &self,
+        key: &str,
+        stream: BoxStream<'static, Result<Bytes>>,
+    ) -> Result<PutStreamResult> {
+        use futures::StreamExt;
+
+        let mut hasher = Sha256::new();
+        let mut buf = Vec::new();
+        let mut total: u64 = 0;
+
+        tokio::pin!(stream);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            hasher.update(&chunk);
+            total += chunk.len() as u64;
+            buf.extend_from_slice(&chunk);
+        }
+
+        self.put(key, Bytes::from(buf)).await?;
+        Ok(PutStreamResult {
+            checksum_sha256: format!("{:x}", hasher.finalize()),
+            bytes_written: total,
+        })
+    }
 }
 
 /// Filesystem storage backend
@@ -58,6 +127,20 @@ impl FilesystemBackend {
             .collect();
         self.base_path.join(sanitized)
     }
+
+    fn temp_write_path(&self, path: &std::path::Path) -> Result<PathBuf> {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                AppError::Storage(format!(
+                    "Cannot derive temporary storage path for {}",
+                    path.display()
+                ))
+            })?;
+
+        Ok(path.with_file_name(format!(".{}.{}.tmp", file_name, Uuid::new_v4().simple())))
+    }
 }
 
 #[async_trait]
@@ -70,15 +153,22 @@ impl StorageBackend for FilesystemBackend {
             fs::create_dir_all(parent).await?;
         }
 
-        // Write atomically via temp file
-        let temp_path = path.with_extension("tmp");
+        // Write atomically via a unique temp file so concurrent same-key writes
+        // do not stomp each other's staging path before rename.
+        let temp_path = self.temp_write_path(&path)?;
         let mut file = fs::File::create(&temp_path).await?;
-        file.write_all(&content).await?;
+        if let Err(e) = file.write_all(&content).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::Storage(e.to_string()));
+        }
         file.sync_all().await?;
         drop(file);
 
         // Rename to final location
-        fs::rename(&temp_path, &path).await?;
+        if let Err(e) = fs::rename(&temp_path, &path).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::Storage(e.to_string()));
+        }
 
         Ok(())
     }
@@ -159,6 +249,100 @@ impl StorageBackend for FilesystemBackend {
         })?;
         Ok(metadata.len())
     }
+
+    /// Stream file contents in 64 KiB chunks instead of buffering the whole
+    /// file into memory. Used by the proxy cache fast path on large
+    /// artifacts (`.deb`, container blobs) so a 1 GiB pod can serve
+    /// 800 MiB cached objects without OOM (#895).
+    async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+        use tokio::io::AsyncReadExt;
+
+        let path = self.key_to_path(key);
+        let file = fs::File::open(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::NotFound(format!("Storage key not found: {}", key))
+            } else {
+                AppError::Storage(e.to_string())
+            }
+        })?;
+
+        // 64 KiB matches the page-aligned chunk size most HTTP clients
+        // and S3 SDKs use on the read side; tuning higher risks doubling
+        // the working set when many concurrent streams are in flight,
+        // tuning lower defeats kernel readahead.
+        const CHUNK: usize = 64 * 1024;
+        let stream = async_stream::try_stream! {
+            let mut file = file;
+            loop {
+                let mut buf = vec![0u8; CHUNK];
+                let n = file
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| AppError::Storage(format!("filesystem stream read: {}", e)))?;
+                if n == 0 {
+                    break;
+                }
+                buf.truncate(n);
+                yield Bytes::from(buf);
+            }
+        };
+        Ok(Box::pin(stream))
+    }
+
+    /// Write a stream to the filesystem atomically via a temp file +
+    /// rename, hashing chunks as they arrive. Used by the proxy cache
+    /// slow path so an upstream response can be tee'd to the client
+    /// AND to the local cache without buffering the full body (#895).
+    async fn put_stream(
+        &self,
+        key: &str,
+        stream: BoxStream<'static, Result<Bytes>>,
+    ) -> Result<PutStreamResult> {
+        use futures::StreamExt;
+
+        let path = self.key_to_path(key);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let temp_path = self.temp_write_path(&path)?;
+        let mut file = fs::File::create(&temp_path).await?;
+
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+
+        tokio::pin!(stream);
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(b) => b,
+                Err(e) => {
+                    // Best-effort temp-file cleanup. If the rename has not
+                    // happened the partial bytes never reach the final
+                    // path; we just drop the tmp file. Ignore the cleanup
+                    // result since the original stream error is the one
+                    // the caller cares about.
+                    let _ = fs::remove_file(&temp_path).await;
+                    return Err(e);
+                }
+            };
+            hasher.update(&chunk);
+            total += chunk.len() as u64;
+            if let Err(e) = file.write_all(&chunk).await {
+                let _ = fs::remove_file(&temp_path).await;
+                return Err(AppError::Storage(format!("filesystem stream write: {}", e)));
+            }
+        }
+        file.sync_all().await?;
+        drop(file);
+        if let Err(e) = fs::rename(&temp_path, &path).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::Storage(e.to_string()));
+        }
+
+        Ok(PutStreamResult {
+            checksum_sha256: format!("{:x}", hasher.finalize()),
+            bytes_written: total,
+        })
+    }
 }
 
 /// Generate a StorageBackend wrapper that delegates to an inner backend.
@@ -178,6 +362,9 @@ macro_rules! impl_storage_wrapper {
             async fn exists(&self, key: &str) -> Result<bool> {
                 crate::storage::StorageBackend::exists(&self.inner, key).await
             }
+            async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+                crate::storage::StorageBackend::head_etag(&self.inner, key).await
+            }
             async fn delete(&self, key: &str) -> Result<()> {
                 crate::storage::StorageBackend::delete(&self.inner, key).await
             }
@@ -189,6 +376,26 @@ macro_rules! impl_storage_wrapper {
             }
             async fn size(&self, key: &str) -> Result<u64> {
                 self.inner.size(key).await
+            }
+            // Streaming methods (#895): forward to the inner backend's
+            // streaming impls so we pick up S3 ranged GETs, GCS chunked
+            // reads, etc., without buffering through this wrapper.
+            async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+                crate::storage::StorageBackend::get_stream(&self.inner, key).await
+            }
+            async fn put_stream(
+                &self,
+                key: &str,
+                stream: BoxStream<'static, Result<Bytes>>,
+            ) -> Result<PutStreamResult> {
+                let inner_result =
+                    crate::storage::StorageBackend::put_stream(&self.inner, key, stream).await?;
+                // The two PutStreamResult types are structurally identical
+                // (sha256 hex + byte count); translate at the boundary.
+                Ok(PutStreamResult {
+                    checksum_sha256: inner_result.checksum_sha256,
+                    bytes_written: inner_result.bytes_written,
+                })
             }
         }
     };
@@ -328,6 +535,13 @@ impl StorageService {
         self.backend.exists(key).await
     }
 
+    /// Return the backend's opaque ETag for `key`. Used by the proxy
+    /// cache fast-path revalidation (#1051). See
+    /// [`StorageBackend::head_etag`] for the per-backend contract.
+    pub async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+        self.backend.head_etag(key).await
+    }
+
     /// Delete content
     pub async fn delete(&self, key: &str) -> Result<()> {
         self.backend.delete(key).await
@@ -341,6 +555,24 @@ impl StorageService {
     /// Copy content
     pub async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         self.backend.copy(source, dest).await
+    }
+
+    /// Stream content out instead of buffering the full body. Used by
+    /// proxy cache fast-path serves of large artifacts (#895).
+    pub async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+        self.backend.get_stream(key).await
+    }
+
+    /// Write a stream into the backend, returning the SHA-256 and byte count
+    /// observed without buffering the body. Used by the proxy cache slow
+    /// path to tee an upstream response simultaneously to the client and
+    /// to the local cache (#895).
+    pub async fn put_stream(
+        &self,
+        key: &str,
+        stream: BoxStream<'static, Result<Bytes>>,
+    ) -> Result<PutStreamResult> {
+        self.backend.put_stream(key, stream).await
     }
 
     /// Get content size
@@ -530,6 +762,19 @@ mod tests {
         let backend = FilesystemBackend::new(PathBuf::from("/storage"));
         let path = backend.key_to_path("file.bin");
         assert_eq!(path, PathBuf::from("/storage/file.bin"));
+    }
+
+    #[test]
+    fn test_filesystem_backend_temp_write_path_is_unique() {
+        let backend = FilesystemBackend::new(PathBuf::from("/storage"));
+        let path = backend.key_to_path("proxy-cache/repo/pkg/__content__");
+
+        let first = backend.temp_write_path(&path).expect("temp path");
+        let second = backend.temp_write_path(&path).expect("temp path");
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), path.parent());
+        assert_eq!(second.parent(), path.parent());
     }
 
     #[tokio::test]
@@ -732,42 +977,8 @@ mod tests {
 
     fn minimal_config(storage_backend: &str) -> crate::config::Config {
         crate::config::Config {
-            database_url: "postgresql://test/test".to_string(),
-            bind_address: "0.0.0.0:8080".to_string(),
-            log_level: "info".to_string(),
             storage_backend: storage_backend.to_string(),
-            storage_path: "/tmp/test-storage".to_string(),
-            s3_bucket: None,
-            gcs_bucket: None,
-            s3_region: None,
-            s3_endpoint: None,
-            jwt_secret: "test-secret".to_string(),
-            jwt_expiration_secs: 86400,
-            jwt_access_token_expiry_minutes: 30,
-            jwt_refresh_token_expiry_days: 7,
-            oidc_issuer: None,
-            oidc_client_id: None,
-            oidc_client_secret: None,
-            ldap_url: None,
-            ldap_base_dn: None,
-            trivy_url: None,
-            openscap_url: None,
-            openscap_profile: "xccdf_org.ssgproject.content_profile_standard".to_string(),
-            meilisearch_url: None,
-            meilisearch_api_key: None,
-            scan_workspace_path: "/scan-workspace".to_string(),
-            demo_mode: false,
-            peer_instance_name: "test".to_string(),
-            peer_public_endpoint: "http://localhost:8080".to_string(),
-            peer_api_key: "test-api-key".to_string(),
-            dependency_track_url: None,
-            otel_exporter_otlp_endpoint: None,
-            otel_service_name: "artifact-keeper".to_string(),
-            gc_schedule: "0 0 * * * *".to_string(),
-            lifecycle_check_interval_secs: 60,
-            max_upload_size_bytes: 10_737_418_240,
-            allow_local_admin_login: false,
-            metrics_port: None,
+            ..crate::config::Config::test_config()
         }
     }
 
@@ -822,5 +1033,263 @@ mod tests {
             result.is_ok(),
             "StorageService::from_config should succeed with storage_backend=gcs"
         );
+    }
+
+    // ── presigned URL support tests (via crate::storage::StorageBackend) ──
+
+    use crate::storage::{PresignedUrl, PresignedUrlSource};
+
+    /// A mock backend implementing `crate::storage::StorageBackend` with
+    /// presigned URL support.
+    struct MockPresignedInner;
+
+    #[async_trait]
+    impl crate::storage::StorageBackend for MockPresignedInner {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> Result<Bytes> {
+            Ok(Bytes::from_static(b"mock"))
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        fn supports_redirect(&self) -> bool {
+            true
+        }
+        async fn get_presigned_url(
+            &self,
+            key: &str,
+            expires_in: std::time::Duration,
+        ) -> Result<Option<PresignedUrl>> {
+            Ok(Some(PresignedUrl {
+                url: format!("https://mock.example.com/{}", key),
+                expires_in,
+                source: PresignedUrlSource::S3,
+            }))
+        }
+    }
+
+    #[test]
+    fn test_filesystem_storage_does_not_support_redirect() {
+        let backend = crate::storage::filesystem::FilesystemStorage::new("/tmp/test-artifacts");
+        assert!(!crate::storage::StorageBackend::supports_redirect(&backend));
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_storage_presigned_url_returns_none() {
+        let backend = crate::storage::filesystem::FilesystemStorage::new("/tmp/test-artifacts");
+        let result = crate::storage::StorageBackend::get_presigned_url(
+            &backend,
+            "test-key",
+            std::time::Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_mock_presigned_inner_supports_redirect() {
+        let backend = MockPresignedInner;
+        assert!(crate::storage::StorageBackend::supports_redirect(&backend));
+    }
+
+    #[tokio::test]
+    async fn test_mock_presigned_inner_returns_url() {
+        let backend = MockPresignedInner;
+        let result = crate::storage::StorageBackend::get_presigned_url(
+            &backend,
+            "test-key",
+            std::time::Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_some());
+        let presigned = result.unwrap();
+        assert!(presigned.url.contains("test-key"));
+        assert_eq!(presigned.source, PresignedUrlSource::S3);
+    }
+
+    // -----------------------------------------------------------------------
+    // #895 streaming primitives — FilesystemBackend put_stream / get_stream
+    //
+    // The trait defaults buffer the body; the real OOM relief only kicks in
+    // when the FilesystemBackend overrides actually stream from disk + write
+    // in chunks. These tests exercise that override.
+    // -----------------------------------------------------------------------
+
+    use futures::stream::StreamExt as _StreamExt;
+
+    #[tokio::test]
+    async fn test_filesystem_put_stream_round_trip_through_get_stream() {
+        let tmp = TempDir::new().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf());
+
+        let payload = Bytes::from_static(b"streaming hello world");
+        let upload_stream: BoxStream<'static, Result<Bytes>> =
+            Box::pin(futures::stream::iter(vec![Ok(payload.clone())]));
+
+        let put_result = backend
+            .put_stream("k1", upload_stream)
+            .await
+            .expect("put_stream must succeed");
+        assert_eq!(put_result.bytes_written, payload.len() as u64);
+        // SHA-256 is a 64-char lowercase hex string; verify shape rather
+        // than the literal value to keep the test independent of payload
+        // changes. Empty + known values are covered by other tests.
+        assert_eq!(put_result.checksum_sha256.len(), 64);
+        assert!(put_result
+            .checksum_sha256
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+        // Round-trip read via streaming
+        let mut read_stream = backend
+            .get_stream("k1")
+            .await
+            .expect("get_stream must succeed");
+        let mut received: Vec<u8> = Vec::new();
+        while let Some(chunk) = read_stream.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(received, payload.as_ref());
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_put_stream_multi_chunk_streams_to_disk() {
+        let tmp = TempDir::new().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf());
+
+        let chunks: Vec<&[u8]> = vec![b"alpha-", b"beta-", b"gamma"];
+        let total: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+        let upload: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(
+            chunks
+                .iter()
+                .map(|c| Ok(Bytes::from_static(c)))
+                .collect::<Vec<_>>(),
+        ));
+
+        let result = backend.put_stream("k-multi", upload).await.unwrap();
+        assert_eq!(result.bytes_written, total);
+
+        // Read back end-to-end and confirm reassembled content.
+        let mut stream = backend.get_stream("k-multi").await.unwrap();
+        let mut got = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            got.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(got, b"alpha-beta-gamma");
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_put_stream_cleans_temp_on_stream_error() {
+        let tmp = TempDir::new().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf());
+
+        // A stream that yields one chunk then an error.
+        let upload: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"partial")),
+            Err(AppError::Storage(
+                "simulated mid-stream failure".to_string(),
+            )),
+        ]));
+
+        let err = backend
+            .put_stream("k-fail", upload)
+            .await
+            .expect_err("stream error must propagate from put_stream");
+        match err {
+            AppError::Storage(_) => {}
+            other => panic!("expected Storage error, got {:?}", other),
+        }
+
+        // The final key must not exist (atomic rename never ran).
+        let exists = backend.exists("k-fail").await.unwrap();
+        assert!(
+            !exists,
+            "atomic temp file must NOT promote to final key on stream error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_get_stream_missing_key_returns_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf());
+
+        match backend.get_stream("nope").await {
+            Ok(_) => panic!("missing key must error, not yield empty stream"),
+            Err(AppError::NotFound(_)) => {}
+            Err(other) => panic!(
+                "missing key must map to AppError::NotFound (cache-miss \
+                 contract from #1016 / #1089); got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_put_stream_empty_stream_writes_empty_file() {
+        let tmp = TempDir::new().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf());
+
+        let empty: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![]));
+        let result = backend.put_stream("k-empty", empty).await.unwrap();
+        assert_eq!(result.bytes_written, 0);
+        // SHA-256 of empty input is well-known:
+        assert_eq!(
+            result.checksum_sha256,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+
+        // The key exists and reads back as 0 bytes via streaming.
+        let mut stream = backend.get_stream("k-empty").await.unwrap();
+        let mut bytes_seen: u64 = 0;
+        while let Some(chunk) = stream.next().await {
+            bytes_seen += chunk.unwrap().len() as u64;
+        }
+        assert_eq!(bytes_seen, 0);
+    }
+
+    #[tokio::test]
+    async fn test_storage_service_put_stream_get_stream_delegate_to_backend() {
+        // StorageService is the facade ProxyService uses; verify the
+        // pub get_stream / put_stream methods round-trip through the
+        // underlying backend rather than silently no-op'ing.
+        let tmp = TempDir::new().unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(FilesystemBackend::new(tmp.path().to_path_buf()));
+        let service = StorageService::new(backend);
+
+        let upload: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![Ok(
+            Bytes::from_static(b"via facade"),
+        )]));
+        let put_result = service.put_stream("facade-key", upload).await.unwrap();
+        assert_eq!(put_result.bytes_written, 10);
+
+        let mut stream = service.get_stream("facade-key").await.unwrap();
+        let mut buf = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(buf, b"via facade");
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_result_equality_and_clone() {
+        let r1 = PutStreamResult {
+            checksum_sha256: "abc".to_string(),
+            bytes_written: 42,
+        };
+        let r2 = r1.clone();
+        assert_eq!(r1, r2);
+        let r3 = PutStreamResult {
+            checksum_sha256: "def".to_string(),
+            bytes_written: 42,
+        };
+        assert_ne!(r1, r3);
     }
 }

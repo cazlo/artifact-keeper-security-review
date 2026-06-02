@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::services::meili_service::{ArtifactDocument, MeiliService};
+use crate::services::opensearch_service::{ArtifactDocument, OpenSearchService};
 use crate::services::plugin_service::{ArtifactInfo, PluginEventType, PluginService};
 use crate::services::quality_check_service::QualityCheckService;
 use crate::services::repository_service::RepositoryService;
@@ -27,7 +27,7 @@ pub struct ArtifactService {
     plugin_service: Option<Arc<PluginService>>,
     scanner_service: Option<Arc<ScannerService>>,
     quality_check_service: Option<Arc<QualityCheckService>>,
-    meili_service: Option<Arc<MeiliService>>,
+    search_service: Option<Arc<OpenSearchService>>,
 }
 
 impl ArtifactService {
@@ -41,15 +41,15 @@ impl ArtifactService {
             plugin_service: None,
             scanner_service: None,
             quality_check_service: None,
-            meili_service: None,
+            search_service: None,
         }
     }
 
-    /// Create a new artifact service with Meilisearch indexing support.
-    pub fn new_with_meili(
+    /// Create a new artifact service with search indexing support.
+    pub fn new_with_search(
         db: PgPool,
         storage: Arc<dyn StorageBackend>,
-        meili_service: Option<Arc<MeiliService>>,
+        search_service: Option<Arc<OpenSearchService>>,
     ) -> Self {
         let repo_service = RepositoryService::new(db.clone());
         Self {
@@ -59,7 +59,7 @@ impl ArtifactService {
             plugin_service: None,
             scanner_service: None,
             quality_check_service: None,
-            meili_service,
+            search_service,
         }
     }
 
@@ -77,7 +77,7 @@ impl ArtifactService {
             plugin_service: Some(plugin_service),
             scanner_service: None,
             quality_check_service: None,
-            meili_service: None,
+            search_service: None,
         }
     }
 
@@ -96,9 +96,9 @@ impl ArtifactService {
         self.quality_check_service = Some(qc_service);
     }
 
-    /// Set the Meilisearch service for search indexing.
-    pub fn set_meili_service(&mut self, meili_service: Arc<MeiliService>) {
-        self.meili_service = Some(meili_service);
+    /// Set the search service for search indexing.
+    pub fn set_search_service(&mut self, search_service: Arc<OpenSearchService>) {
+        self.search_service = Some(search_service);
     }
 
     /// Trigger a plugin hook, logging but not failing if plugin service is unavailable.
@@ -226,8 +226,23 @@ impl ArtifactService {
             ));
         }
 
-        // Calculate checksum
+        // Calculate checksums.
+        //
+        // We persist SHA-256, SHA-1, and MD5 so that the checksum-search
+        // endpoint can locate an artifact by any of the three (registry
+        // clients lean heavily on SHA-1 and MD5 for legacy reasons: Maven
+        // central distributes .sha1 sidecar files, PyPI publishes MD5
+        // digests in package metadata, etc.). Prior to this change only
+        // SHA-256 was written, so SHA-1 / MD5 lookups always returned
+        // empty results. See fix/search-checksum-sha1-md5-case.
+        //
+        // All three are stored as lowercase hex (the `{:x}` format
+        // specifier in `calculate_*` produces lowercase) so the search
+        // handler's `to_lowercase()` normalization of the input parameter
+        // yields a direct byte-wise match against the column.
         let checksum_sha256 = Self::calculate_sha256(&data);
+        let checksum_sha1 = Self::calculate_sha1(&data);
+        let checksum_md5 = Self::calculate_md5(&data);
         let storage_key = Self::storage_key_from_checksum(&checksum_sha256);
 
         // Build artifact info for plugin hooks (before artifact is created)
@@ -274,20 +289,29 @@ impl ArtifactService {
             self.storage.put(&storage_key, data).await?;
         }
 
-        // Create artifact record
+        // Create artifact record.
+        //
+        // `ON CONFLICT DO UPDATE` re-uploads must refresh sha1/md5 in
+        // lockstep with sha256 -- otherwise an artifact whose content was
+        // replaced would still expose the *old* sha1/md5 via the
+        // checksum-search endpoint, which would point dedup-by-checksum
+        // clients at the wrong artifact.
         let artifact = sqlx::query_as!(
             Artifact,
             r#"
             INSERT INTO artifacts (
                 repository_id, path, name, version, size_bytes,
-                checksum_sha256, content_type, storage_key, uploaded_by
+                checksum_sha256, checksum_sha1, checksum_md5,
+                content_type, storage_key, uploaded_by
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             ON CONFLICT (repository_id, path) DO UPDATE SET
                 name = EXCLUDED.name,
                 version = EXCLUDED.version,
                 size_bytes = EXCLUDED.size_bytes,
                 checksum_sha256 = EXCLUDED.checksum_sha256,
+                checksum_sha1 = EXCLUDED.checksum_sha1,
+                checksum_md5 = EXCLUDED.checksum_md5,
                 content_type = EXCLUDED.content_type,
                 storage_key = EXCLUDED.storage_key,
                 uploaded_by = EXCLUDED.uploaded_by,
@@ -297,6 +321,7 @@ impl ArtifactService {
                 id, repository_id, path, name, version, size_bytes,
                 checksum_sha256, checksum_md5, checksum_sha1,
                 content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
                 created_at, updated_at
             "#,
             repository_id,
@@ -305,6 +330,8 @@ impl ArtifactService {
             version,
             size_bytes,
             checksum_sha256,
+            checksum_sha1,
+            checksum_md5,
             content_type,
             storage_key,
             uploaded_by
@@ -312,6 +339,36 @@ impl ArtifactService {
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Apply quarantine hold if enabled for this repository
+        {
+            use crate::services::quarantine_service;
+            let qconfig = quarantine_service::resolve_config(&self.db, repository_id).await;
+            if quarantine_service::should_quarantine(&qconfig) {
+                let now = chrono::Utc::now();
+                let until = quarantine_service::quarantine_until(&qconfig, now);
+                if let Err(e) = quarantine_service::set_quarantine(
+                    &self.db,
+                    artifact.id,
+                    "quarantined",
+                    Some(until),
+                )
+                .await
+                {
+                    tracing::error!(
+                        artifact_id = %artifact.id,
+                        error = %e,
+                        "Failed to set quarantine status on uploaded artifact"
+                    );
+                } else {
+                    tracing::info!(
+                        artifact_id = %artifact.id,
+                        quarantine_until = %until,
+                        "Artifact quarantined on upload"
+                    );
+                }
+            }
+        }
 
         // Check quota warning threshold after successful upload
         if let Ok(repo) = self.repo_service.get_by_id(repository_id).await {
@@ -485,9 +542,9 @@ impl ArtifactService {
             });
         }
 
-        // Index artifact in Meilisearch (non-blocking)
-        if let Some(ref meili) = self.meili_service {
-            let meili = meili.clone();
+        // Index artifact in OpenSearch (non-blocking)
+        if let Some(ref search) = self.search_service {
+            let search = search.clone();
             let db = self.db.clone();
             let artifact_id = artifact.id;
             let artifact_name = artifact.name.clone();
@@ -499,15 +556,15 @@ impl ArtifactService {
             let repo_id = artifact.repository_id;
             tokio::spawn(async move {
                 // Fetch repository info for the document
-                let repo_info = sqlx::query_as::<_, (String, String, String)>(
-                    "SELECT key, name, format::text FROM repositories WHERE id = $1",
+                let repo_info = sqlx::query_as::<_, (String, String, String, bool)>(
+                    "SELECT key, name, format::text, is_public FROM repositories WHERE id = $1",
                 )
                 .bind(repo_id)
                 .fetch_optional(&db)
                 .await;
 
                 match repo_info {
-                    Ok(Some((repo_key, repo_name, format))) => {
+                    Ok(Some((repo_key, repo_name, format, is_public))) => {
                         let doc = ArtifactDocument {
                             id: artifact_id.to_string(),
                             name: artifact_name,
@@ -520,11 +577,12 @@ impl ArtifactService {
                             content_type: artifact_content_type,
                             size_bytes: artifact_size,
                             download_count: 0,
+                            is_public,
                             created_at: artifact_created.timestamp(),
                         };
-                        if let Err(e) = meili.index_artifact(&doc).await {
+                        if let Err(e) = search.index_artifact(&doc).await {
                             tracing::warn!(
-                                "Failed to index artifact {} in Meilisearch: {}",
+                                "Failed to index artifact {} in OpenSearch: {}",
                                 artifact_id,
                                 e
                             );
@@ -538,10 +596,7 @@ impl ArtifactService {
                         );
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to fetch repository for Meilisearch indexing: {}",
-                            e
-                        );
+                        tracing::warn!("Failed to fetch repository for search indexing: {}", e);
                     }
                 }
             });
@@ -567,6 +622,7 @@ impl ArtifactService {
                 id, repository_id, path, name, version, size_bytes,
                 checksum_sha256, checksum_md5, checksum_sha1,
                 content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
                 created_at, updated_at
             FROM artifacts
             WHERE repository_id = $1 AND path = $2 AND is_deleted = false
@@ -578,6 +634,13 @@ impl ArtifactService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
+
+        // Check quarantine status before serving the artifact
+        crate::services::quarantine_service::check_download_allowed(
+            artifact.quarantine_status.as_deref(),
+            artifact.quarantine_until,
+            chrono::Utc::now(),
+        )?;
 
         // Trigger BeforeDownload hooks - validators can reject the download
         let artifact_info = ArtifactInfo::from(&artifact);
@@ -618,6 +681,7 @@ impl ArtifactService {
                 id, repository_id, path, name, version, size_bytes,
                 checksum_sha256, checksum_md5, checksum_sha1,
                 content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
                 created_at, updated_at
             FROM artifacts
             WHERE id = $1 AND is_deleted = false
@@ -651,6 +715,7 @@ impl ArtifactService {
                 id, repository_id, path, name, version, size_bytes,
                 checksum_sha256, checksum_md5, checksum_sha1,
                 content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
                 created_at, updated_at
             FROM artifacts
             WHERE repository_id = $1
@@ -724,12 +789,14 @@ impl ArtifactService {
                 id, repository_id, path, name, version, size_bytes,
                 checksum_sha256, checksum_md5, checksum_sha1,
                 content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
                 created_at, updated_at
             FROM (
                 SELECT DISTINCT ON (a.path)
                     a.id, a.repository_id, a.path, a.name, a.version, a.size_bytes,
                     a.checksum_sha256, a.checksum_md5, a.checksum_sha1,
                     a.content_type, a.storage_key, a.is_deleted, a.uploaded_by,
+                    a.quarantine_status, a.quarantine_until,
                     a.created_at, a.updated_at,
                     array_position($1::uuid[], a.repository_id) as repo_priority
                 FROM artifacts a
@@ -830,14 +897,14 @@ impl ArtifactService {
         self.trigger_hook_non_blocking(PluginEventType::AfterDelete, &artifact_info)
             .await;
 
-        // Remove artifact from Meilisearch index (non-blocking)
-        if let Some(ref meili) = self.meili_service {
-            let meili = meili.clone();
+        // Remove artifact from search index (non-blocking)
+        if let Some(ref search) = self.search_service {
+            let search = search.clone();
             let artifact_id_str = id.to_string();
             tokio::spawn(async move {
-                if let Err(e) = meili.remove_artifact(&artifact_id_str).await {
+                if let Err(e) = search.remove_artifact(&artifact_id_str).await {
                     tracing::warn!(
-                        "Failed to remove artifact {} from Meilisearch: {}",
+                        "Failed to remove artifact {} from search index: {}",
                         artifact_id_str,
                         e
                     );
@@ -916,6 +983,7 @@ impl ArtifactService {
                 id, repository_id, path, name, version, size_bytes,
                 checksum_sha256, checksum_md5, checksum_sha1,
                 content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
                 created_at, updated_at
             FROM artifacts
             WHERE is_deleted = false
@@ -961,6 +1029,7 @@ impl ArtifactService {
                 id, repository_id, path, name, version, size_bytes,
                 checksum_sha256, checksum_md5, checksum_sha1,
                 content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
                 created_at, updated_at
             FROM artifacts
             WHERE checksum_sha256 = $1 AND is_deleted = false
@@ -1486,6 +1555,8 @@ mod tests {
             storage_key: "sh/a2/sha256hash".to_string(),
             is_deleted: false,
             uploaded_by: Some(user_id),
+            quarantine_status: None,
+            quarantine_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1522,6 +1593,8 @@ mod tests {
             storage_key: "em/pt/empty".to_string(),
             is_deleted: false,
             uploaded_by: None,
+            quarantine_status: None,
+            quarantine_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

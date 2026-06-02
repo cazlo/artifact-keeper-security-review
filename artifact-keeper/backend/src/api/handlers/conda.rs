@@ -43,7 +43,7 @@ use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic, require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::conda_native::CondaNativeHandler;
 use crate::models::repository::RepositoryType;
@@ -2421,6 +2421,11 @@ async fn download_package(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
+    // Check quarantine status before serving
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
+        .await
+        .map_err(|e| e.into_response())?;
+
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         tracing::error!("Storage error reading conda package: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
@@ -2465,7 +2470,8 @@ async fn upload_package_put(
     Path((repo_key, subdir, filename)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "conda")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "conda", "write")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
@@ -2491,7 +2497,8 @@ async fn upload_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "conda")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "conda", "write")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
@@ -2527,8 +2534,9 @@ async fn upload_package_put_with_token(
     body: Bytes,
 ) -> Result<Response, Response> {
     // Try middleware auth first (if present), fall back to URL token
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = if auth.is_some() {
-        require_auth_basic(auth, "conda")?.user_id
+        require_auth_basic_scope(auth, "conda", "write")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
@@ -2556,8 +2564,9 @@ async fn upload_post_with_token(
     body: Bytes,
 ) -> Result<Response, Response> {
     // Try middleware auth first (if present), fall back to URL token
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = if auth.is_some() {
-        require_auth_basic(auth, "conda")?.user_id
+        require_auth_basic_scope(auth, "conda", "write")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };
@@ -2925,7 +2934,8 @@ async fn put_attestation(
     Path((repo_key, subdir, filename)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let _user_id = require_auth_basic(auth, "conda")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let _user_id = require_auth_basic_scope(auth, "conda", "write")?.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body).await
 }
@@ -2953,8 +2963,9 @@ async fn put_attestation_with_token(
     Path((token, repo_key, subdir, filename)): Path<(String, String, String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let _user_id = if auth.is_some() {
-        require_auth_basic(auth, "conda")?.user_id
+        require_auth_basic_scope(auth, "conda", "write")?.user_id
     } else {
         authenticate_with_token(&state.db, &state.config, &token).await?
     };

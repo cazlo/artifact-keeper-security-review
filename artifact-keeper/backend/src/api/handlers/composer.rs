@@ -26,7 +26,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::composer::ComposerHandler;
 use crate::models::repository::RepositoryType;
@@ -65,6 +65,40 @@ async fn resolve_composer_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, 
 // ---------------------------------------------------------------------------
 // Composer metadata helpers
 // ---------------------------------------------------------------------------
+
+/// Build the upstream path for the Composer v2 metadata document of a package.
+///
+/// The Composer v2 wire shape is `p2/{vendor}/{package}.json`. Helper-extracted
+/// so the proxy fallback in `metadata_v2` is unit-testable without spinning up
+/// a database + proxy_service (#1096).
+fn composer_v2_upstream_path(full_name: &str) -> String {
+    format!("p2/{}.json", full_name)
+}
+
+/// Build the upstream path for the Composer v1 metadata document of a package.
+///
+/// The Composer v1 wire shape is `p/{vendor}/{package}.json`. Helper-extracted
+/// for the same reason as [`composer_v2_upstream_path`] (#1096).
+fn composer_v1_upstream_path(full_name: &str) -> String {
+    format!("p/{}.json", full_name)
+}
+
+/// Build the 200 response that the metadata_v1 / metadata_v2 proxy fallback
+/// returns to the composer client. Extracted from the handler body so the
+/// response-construction path (status, content-type default, body wiring) is
+/// unit-testable without DB or proxy_service (#1096).
+///
+/// `content_type` is taken from the upstream response when present; we default
+/// to `application/json` because the composer client treats anything else as
+/// a fetch error.
+fn build_composer_proxy_response(content: Bytes, content_type: Option<String>) -> Response {
+    let ct = content_type.unwrap_or_else(|| "application/json".to_string());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, ct)
+        .body(Body::from(content))
+        .unwrap()
+}
 
 /// Keys from composer.json that should be merged into version entries.
 const COMPOSER_METADATA_KEYS: &[&str] = &[
@@ -227,6 +261,29 @@ async fn metadata_v2(
     })?;
 
     if artifacts.is_empty() {
+        // #1096: For remote repos, proxy the v2 metadata document from
+        // upstream when we have nothing cached locally. The composer CLI
+        // hits `/p2/{vendor}/{package}.json` as its first lookup; returning
+        // 404 here means `composer install` fails even when the upstream
+        // (packagist.org or any mirror) has the package. The proxy_service
+        // also caches the response body so subsequent requests hit the
+        // cache, matching the behaviour of the PyPI and OCI handlers.
+        if repo.repo_type == RepositoryType::Remote {
+            if let (Some(ref upstream_url), Some(ref proxy)) =
+                (&repo.upstream_url, &state.proxy_service)
+            {
+                let upstream_path = composer_v2_upstream_path(&full_name);
+                let (content, content_type) = proxy_helpers::proxy_fetch(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    upstream_url,
+                    &upstream_path,
+                )
+                .await?;
+                return Ok(build_composer_proxy_response(content, content_type));
+            }
+        }
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
 
@@ -300,6 +357,24 @@ async fn metadata_v1(
     })?;
 
     if artifacts.is_empty() {
+        // #1096: Also proxy the v1 metadata format for older composer
+        // clients. The upstream path mirrors the v1 URL shape (`p/`).
+        if repo.repo_type == RepositoryType::Remote {
+            if let (Some(ref upstream_url), Some(ref proxy)) =
+                (&repo.upstream_url, &state.proxy_service)
+            {
+                let upstream_path = composer_v1_upstream_path(&full_name);
+                let (content, content_type) = proxy_helpers::proxy_fetch(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    upstream_url,
+                    &upstream_path,
+                )
+                .await?;
+                return Ok(build_composer_proxy_response(content, content_type));
+            }
+        }
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
 
@@ -458,6 +533,11 @@ async fn download_archive(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
+    // Check quarantine status before serving
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
+        .await
+        .map_err(|e| e.into_response())?;
+
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -639,7 +719,8 @@ async fn upload(
     body: Bytes,
 ) -> Result<Response, Response> {
     // Authenticate
-    let user_id = require_auth_basic(auth, "composer")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "composer", "write")?.user_id;
     let repo = resolve_composer_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
@@ -782,6 +863,30 @@ async fn upload(
     )
     .execute(&state.db)
     .await;
+
+    // Populate packages / package_versions tables (best-effort).
+    //
+    // #1341: the WebUI Packages tab reads the `packages` table, not
+    // `artifacts`. Every other artifact-publishing handler (npm, pypi,
+    // nuget) calls PackageService after the artifact insert; the Composer
+    // handler did not, so a successfully uploaded Composer package was
+    // stored and served over the Composer wire protocol but never appeared
+    // in the WebUI. Mirror the npm/pypi pattern here. The call is
+    // fire-and-forget so a packages-table failure never blocks the upload.
+    {
+        let pkg_svc = crate::services::package_service::PackageService::new(state.db.clone());
+        pkg_svc
+            .try_create_or_update_from_artifact(
+                repo.id,
+                full_name,
+                &version,
+                size_bytes,
+                &sha256,
+                composer_json.description.as_deref(),
+                Some(serde_json::json!({ "format": "composer" })),
+            )
+            .await;
+    }
 
     info!(
         "Composer upload: {} {} to repo {}",
@@ -1310,5 +1415,493 @@ mod tests {
         assert_eq!(metadata["name"], "vendor/pkg");
         assert_eq!(metadata["version"], "2.0.0");
         assert_eq!(metadata["composer"]["description"], "Test");
+    }
+
+    // -----------------------------------------------------------------------
+    // Upstream path construction for remote-proxy fallback (#1096)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_composer_v2_upstream_path_simple() {
+        // The v2 wire shape is `p2/{vendor}/{package}.json` (no leading slash;
+        // proxy_service prepends the upstream base URL itself).
+        assert_eq!(
+            composer_v2_upstream_path("monolog/monolog"),
+            "p2/monolog/monolog.json"
+        );
+    }
+
+    #[test]
+    fn test_composer_v2_upstream_path_keeps_full_name_verbatim() {
+        // No re-canonicalization: a hyphen-separated package name flows
+        // through unchanged so Packagist sees the same path the client used.
+        assert_eq!(
+            composer_v2_upstream_path("symfony/http-foundation"),
+            "p2/symfony/http-foundation.json"
+        );
+    }
+
+    #[test]
+    fn test_composer_v2_upstream_path_does_not_include_leading_slash() {
+        // proxy_service::build_upstream_url joins base + "/" + path; a leading
+        // slash here would produce `https://packagist.org//p2/...` which some
+        // mirrors reject.
+        let path = composer_v2_upstream_path("acme/widget");
+        assert!(!path.starts_with('/'), "path must be relative: {}", path);
+    }
+
+    #[test]
+    fn test_composer_v1_upstream_path_simple() {
+        // The v1 wire shape is `p/{vendor}/{package}.json` (older Composer
+        // clients hit this before p2).
+        assert_eq!(
+            composer_v1_upstream_path("monolog/monolog"),
+            "p/monolog/monolog.json"
+        );
+    }
+
+    #[test]
+    fn test_composer_v1_upstream_path_keeps_full_name_verbatim() {
+        assert_eq!(
+            composer_v1_upstream_path("symfony/http-foundation"),
+            "p/symfony/http-foundation.json"
+        );
+    }
+
+    #[test]
+    fn test_composer_v1_and_v2_paths_diverge_on_p_segment() {
+        // Regression guard: the only difference between v1 and v2 in the
+        // upstream URL is the leading `p/` vs `p2/`. If a future refactor
+        // unifies the two helpers, this assertion fails loudly.
+        let v1 = composer_v1_upstream_path("vendor/pkg");
+        let v2 = composer_v2_upstream_path("vendor/pkg");
+        assert_ne!(v1, v2);
+        assert!(v1.starts_with("p/"));
+        assert!(v2.starts_with("p2/"));
+        assert!(v1.ends_with(".json"));
+        assert!(v2.ends_with(".json"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_composer_proxy_response (#1096)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_composer_proxy_response_status_is_ok() {
+        let body = Bytes::from_static(br#"{"packages":{}}"#);
+        let resp = build_composer_proxy_response(body, Some("application/json".to_string()));
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_build_composer_proxy_response_uses_upstream_content_type() {
+        // Upstream told us the body is JSON: pass that through unchanged.
+        let body = Bytes::from_static(b"{}");
+        let resp = build_composer_proxy_response(body, Some("application/json".to_string()));
+        let ct = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("response must set Content-Type");
+        assert_eq!(ct.to_str().unwrap(), "application/json");
+    }
+
+    #[test]
+    fn test_build_composer_proxy_response_defaults_content_type_to_json() {
+        // Cache hits with empty metadata can land here without a content_type;
+        // default to `application/json` because the composer client treats
+        // anything else as a fetch error.
+        let body = Bytes::from_static(b"{}");
+        let resp = build_composer_proxy_response(body, None);
+        let ct = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("response must set Content-Type");
+        assert_eq!(ct.to_str().unwrap(), "application/json");
+    }
+
+    #[test]
+    fn test_build_composer_proxy_response_preserves_custom_content_type() {
+        // If the upstream returns a vendor-prefixed JSON content type
+        // (some mirrors do), we must not silently rewrite it.
+        let body = Bytes::from_static(b"{}");
+        let resp = build_composer_proxy_response(
+            body,
+            Some("application/vnd.composer+json; charset=utf-8".to_string()),
+        );
+        let ct = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("response must set Content-Type");
+        assert_eq!(
+            ct.to_str().unwrap(),
+            "application/vnd.composer+json; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn test_build_composer_proxy_response_empty_body_is_ok() {
+        // Upstream returned an empty body but a 200 status: pass through.
+        let resp = build_composer_proxy_response(Bytes::new(), None);
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_composer_v2_upstream_path_with_subnamespace() {
+        // Vendor namespaces with dots / numeric suffixes (e.g.
+        // `phpunit/phpunit`, `psr/log`, `aws/aws-sdk-php-v2`) must round-trip
+        // through the helper untouched.
+        assert_eq!(composer_v2_upstream_path("psr/log"), "p2/psr/log.json");
+        assert_eq!(
+            composer_v2_upstream_path("aws/aws-sdk-php-v2"),
+            "p2/aws/aws-sdk-php-v2.json"
+        );
+        assert_eq!(
+            composer_v2_upstream_path("phpunit/phpunit"),
+            "p2/phpunit/phpunit.json"
+        );
+    }
+
+    #[test]
+    fn test_composer_v1_upstream_path_with_subnamespace() {
+        assert_eq!(composer_v1_upstream_path("psr/log"), "p/psr/log.json");
+        assert_eq!(
+            composer_v1_upstream_path("aws/aws-sdk-php-v2"),
+            "p/aws/aws-sdk-php-v2.json"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DB-backed router tests for the packages-index population added in
+// fix/1341-composer-webui-packages:
+//
+// After a successful Composer upload, the handler calls
+// `PackageService::try_create_or_update_from_artifact` so the package
+// surfaces in the WebUI Packages tab (which reads the `packages` table,
+// not `artifacts`). Before this fix, Composer was the only publishing
+// handler that did not populate `packages` / `package_versions`.
+//
+// These tests rely on `DATABASE_URL` being set. CI seeds + migrates a
+// Postgres before running `cargo llvm-cov --lib`, so they execute there
+// and cover the new lib lines in `upload`. In local environments without
+// a database they no-op cleanly via `tdh::Fixture::setup` returning None.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod upload_db_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use std::io::Write;
+
+    /// Build a minimal valid Composer package archive: a zip with a single
+    /// `composer.json` entry carrying the required fields. Stored (no
+    /// compression) so the tiny payload doesn't pay the deflate cost.
+    fn build_composer_zip(name: &str, version: &str, description: &str) -> Vec<u8> {
+        let composer_json = serde_json::json!({
+            "name": name,
+            "version": version,
+            "description": description,
+            "type": "library",
+            "license": "MIT",
+        });
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut cursor);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("composer.json", options)
+                .expect("start composer.json");
+            zip.write_all(serde_json::to_string(&composer_json).unwrap().as_bytes())
+                .expect("write composer.json");
+            zip.finish().expect("finish zip");
+        }
+        cursor.into_inner()
+    }
+
+    /// Build a PUT request shaped like a real Composer publish.
+    fn put_composer(uri: String, zip_bytes: Vec<u8>) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("content-type", "application/zip")
+            .body(axum::body::Body::from(zip_bytes))
+            .expect("build PUT request")
+    }
+
+    // -----------------------------------------------------------------------
+    // Happy path: a Composer upload populates the `packages` table with the
+    // description from composer.json and the `format: composer` metadata
+    // tag, AND inserts the matching `package_versions` row keyed by the
+    // package id. This is the new lib code path the coverage gate watches.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn upload_populates_packages_index_with_description() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        let name = "acme/widget";
+        let version = "1.2.3";
+        let description = "An indexed Composer package (#1341)";
+        let zip = build_composer_zip(name, version, description);
+        let app = f.router_with_auth(super::router());
+        let req = put_composer(format!("/{}/api/packages", f.repo_key), zip);
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "expected 2xx for Composer upload, got {}: {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // The artifact row was already correct pre-fix.
+        let artifact_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint FROM artifacts \
+             WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false",
+        )
+        .bind(f.repo_id)
+        .bind(name)
+        .bind(version)
+        .fetch_one(&f.pool)
+        .await
+        .expect("query artifacts");
+        assert_eq!(
+            artifact_count.0, 1,
+            "exactly one artifact row expected after upload"
+        );
+
+        // The regression assertion: the packages row must exist with the
+        // description folded from composer.json and the format-tag metadata
+        // the handler passes to PackageService.
+        let row: Option<(String, Option<String>, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT name, description, metadata FROM packages \
+             WHERE repository_id = $1 AND name = $2 AND version = $3",
+        )
+        .bind(f.repo_id)
+        .bind(name)
+        .bind(version)
+        .fetch_optional(&f.pool)
+        .await
+        .expect("query packages");
+
+        let (pkg_name, desc, meta) = row.expect("packages row must exist after Composer upload");
+        assert_eq!(pkg_name, name);
+        assert_eq!(
+            desc.as_deref(),
+            Some(description),
+            "composer.json description must be persisted to packages.description"
+        );
+        let meta = meta.expect("metadata must be set");
+        assert_eq!(
+            meta["format"], "composer",
+            "handler passes {{format: composer}} to PackageService"
+        );
+
+        // package_versions UPSERTed by PackageService.
+        let version_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint FROM package_versions pv \
+             JOIN packages p ON p.id = pv.package_id \
+             WHERE p.repository_id = $1 AND p.name = $2 AND pv.version = $3",
+        )
+        .bind(f.repo_id)
+        .bind(name)
+        .bind(version)
+        .fetch_one(&f.pool)
+        .await
+        .expect("query package_versions");
+        assert_eq!(
+            version_count.0, 1,
+            "exactly one package_versions row expected after a single upload"
+        );
+
+        f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // composer.json without a `description` key: the handler passes
+    // `composer_json.description.as_deref()` (== None) into
+    // `try_create_or_update_from_artifact`, which must land as NULL in the
+    // packages table (COALESCE keeps existing NULL on conflict).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn upload_packages_index_missing_description_maps_to_null() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        // No `description` field in the composer.json.
+        let composer_json = serde_json::json!({
+            "name": "acme/no-desc",
+            "version": "0.1.0",
+            "type": "library",
+            "license": "MIT",
+        });
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut cursor);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("composer.json", options).unwrap();
+            zip.write_all(serde_json::to_string(&composer_json).unwrap().as_bytes())
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        let zip_bytes = cursor.into_inner();
+
+        let app = f.router_with_auth(super::router());
+        let req = put_composer(format!("/{}/api/packages", f.repo_key), zip_bytes);
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "upload without description must still succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT description FROM packages \
+             WHERE repository_id = $1 AND name = $2 AND version = $3",
+        )
+        .bind(f.repo_id)
+        .bind("acme/no-desc")
+        .bind("0.1.0")
+        .fetch_optional(&f.pool)
+        .await
+        .expect("query packages");
+
+        let (desc,) = row.expect("packages row must exist even without description");
+        assert!(
+            desc.is_none(),
+            "missing composer.json description must fold to NULL, got {:?}",
+            desc
+        );
+
+        f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // composer.json without `version`: the handler defaults to `dev-main`
+    // (see `composer_json.version.as_deref().unwrap_or("dev-main")`). The
+    // packages-index row must use that resolved version so the WebUI lists
+    // the package as a dev branch rather than dropping it. Covers the
+    // `&version` argument the new code passes after the fallback resolves.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn upload_default_version_indexed_as_dev_main() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        // No `version` field: the handler should fall back to "dev-main".
+        let composer_json = serde_json::json!({
+            "name": "acme/dev-pkg",
+            "description": "dev-branch package",
+            "type": "library",
+            "license": "MIT",
+        });
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut cursor);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("composer.json", options).unwrap();
+            zip.write_all(serde_json::to_string(&composer_json).unwrap().as_bytes())
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        let zip_bytes = cursor.into_inner();
+
+        let app = f.router_with_auth(super::router());
+        let req = put_composer(format!("/{}/api/packages", f.repo_key), zip_bytes);
+        let (status, _) = tdh::send(app, req).await;
+        assert!(status.is_success(), "upload must succeed: {}", status);
+
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT version FROM packages \
+             WHERE repository_id = $1 AND name = $2",
+        )
+        .bind(f.repo_id)
+        .bind("acme/dev-pkg")
+        .fetch_optional(&f.pool)
+        .await
+        .expect("query packages");
+
+        let (ver,) = row.expect("packages row must exist for default-version upload");
+        assert_eq!(
+            ver, "dev-main",
+            "missing composer.json version must index as dev-main"
+        );
+
+        // And the matching package_versions row carries the resolved
+        // `&sha256` checksum (non-empty hex string) the handler passed.
+        let checksum: (String,) = sqlx::query_as(
+            "SELECT pv.checksum_sha256 FROM package_versions pv \
+             JOIN packages p ON p.id = pv.package_id \
+             WHERE p.repository_id = $1 AND p.name = $2 AND pv.version = $3",
+        )
+        .bind(f.repo_id)
+        .bind("acme/dev-pkg")
+        .bind("dev-main")
+        .fetch_one(&f.pool)
+        .await
+        .expect("query package_versions checksum");
+        assert_eq!(
+            checksum.0.len(),
+            64,
+            "package_versions.checksum_sha256 must be a 64-char hex digest"
+        );
+
+        f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // POST verb: composer's upload route is `put(upload).post(upload)`, so
+    // a POST publish must follow the same code path and end up in the
+    // packages index too. Guards against a future refactor that drops the
+    // POST handler and silently regresses CI clients that publish with
+    // POST.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn upload_via_post_also_populates_packages_index() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        let name = "acme/postpkg";
+        let version = "2.0.0";
+        let zip = build_composer_zip(name, version, "posted via POST");
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/packages", f.repo_key))
+            .header("content-type", "application/zip")
+            .body(axum::body::Body::from(zip))
+            .expect("build POST request");
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "POST publish must succeed: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        let row: Option<(String, i64)> = sqlx::query_as(
+            "SELECT name, size_bytes FROM packages \
+             WHERE repository_id = $1 AND name = $2 AND version = $3",
+        )
+        .bind(f.repo_id)
+        .bind(name)
+        .bind(version)
+        .fetch_optional(&f.pool)
+        .await
+        .expect("query packages");
+        let (got_name, size) = row.expect("packages row must exist after POST publish");
+        assert_eq!(got_name, name);
+        assert!(
+            size > 0,
+            "size_bytes must be the archive length the handler passed, got {}",
+            size
+        );
+
+        f.teardown().await;
     }
 }

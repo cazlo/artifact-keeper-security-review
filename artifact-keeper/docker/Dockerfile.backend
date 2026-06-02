@@ -1,6 +1,6 @@
 # ---------- Base: Rust toolchain on UBI 9 ----------
 # syntax=docker/dockerfile:1
-FROM registry.access.redhat.com/ubi9/ubi:9.7 AS rust-base
+FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rust-base
 RUN dnf install -y --nodocs \
     gcc gcc-c++ make pkg-config perl-core \
     openssl-devel zlib-devel xz-devel bzip2-devel \
@@ -32,7 +32,12 @@ FROM rust-base AS deps
 WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
 ENV SQLX_OFFLINE=true
-RUN cargo chef cook --release --recipe-path recipe.json
+ARG CARGO_FEATURES=""
+RUN if [ -n "$CARGO_FEATURES" ]; then \
+      cargo chef cook --release --features "$CARGO_FEATURES" --recipe-path recipe.json; \
+    else \
+      cargo chef cook --release --recipe-path recipe.json; \
+    fi
 
 # ---------- Stage 3: Build binary ----------
 FROM rust-base AS builder
@@ -43,16 +48,33 @@ COPY Cargo.toml Cargo.lock ./
 COPY .sqlx ./.sqlx
 COPY backend ./backend
 ARG GIT_SHA=unknown
+ARG CARGO_FEATURES=""
+ARG APP_VERSION=""
 ENV SQLX_OFFLINE=true
 ENV GIT_SHA=${GIT_SHA}
-RUN cargo build --release --bin artifact-keeper
+RUN if [ -n "${APP_VERSION}" ]; then \
+      CLEAN_VERSION=$(echo "${APP_VERSION}" | sed 's/^v//'); \
+      sed -i "s/^version = \".*\"/version = \"${CLEAN_VERSION}\"/" Cargo.toml; \
+    fi && \
+    if [ -n "$CARGO_FEATURES" ]; then \
+      cargo build --release --features "$CARGO_FEATURES" --bin artifact-keeper; \
+    else \
+      cargo build --release --bin artifact-keeper; \
+    fi
 
 # ---------- Stage 4: Build minimal rootfs ----------
-FROM registry.access.redhat.com/ubi9/ubi:9.7 AS rootfs-builder
+FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rootfs-builder
 
-# Install only essential runtime libraries into a clean rootfs
+# Install only essential runtime libraries into a clean rootfs.
+# --refresh forces fresh repo metadata and the follow-up upgrade pulls
+# z-stream errata (e.g. jq el9_7 security fixes) that the install step
+# alone may miss when the cache is stale. The reposdir override is
+# required on the upgrade step because once the installroot has a
+# populated /etc, dnf reads repos from inside it (which is empty)
+# instead of falling back to the host's /etc/yum.repos.d.
 RUN mkdir -p /mnt/rootfs && \
-    dnf install --installroot /mnt/rootfs --releasever 9 \
+    dnf install --installroot /mnt/rootfs --releasever 9 --refresh \
+        --setopt=reposdir=/etc/yum.repos.d/ \
         --setopt install_weak_deps=0 --nodocs -y \
         glibc-minimal-langpack \
         ca-certificates \
@@ -62,6 +84,10 @@ RUN mkdir -p /mnt/rootfs && \
         bzip2-libs \
         curl-minimal \
         jq \
+        tar \
+        gzip \
+    && dnf --installroot /mnt/rootfs --releasever 9 \
+        --setopt=reposdir=/etc/yum.repos.d/ upgrade -y \
     && dnf --installroot /mnt/rootfs clean all \
     && rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
@@ -119,11 +145,24 @@ RUN if [ -f /mnt/rootfs/etc/dnf/dnf.conf ]; then \
 RUN rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
 # ---------- Stage 5: Copy scanner CLIs from official images ----------
-FROM ghcr.io/aquasecurity/trivy:0.69.3 AS trivy-bin
-FROM ghcr.io/anchore/grype:v0.110.0 AS grype-bin
+FROM ghcr.io/aquasecurity/trivy:0.70.0 AS trivy-bin
+FROM ghcr.io/anchore/grype:v0.112.0 AS grype-bin
+
+# ---------- Stage 5b: Pre-seed the Grype vulnerability DB ----------
+# Populates the Grype DB at build time so the image works on egress-restricted
+# networks (e.g. ARC runner pods) without a first-scan network fetch from
+# grype.anchore.io. See artifact-keeper#1001.
+#
+# Uses the GHCR mirror (maintained by .github/workflows/mirror-images.yml) to
+# avoid Docker Hub anonymous-pull rate limits that intermittently break CI.
+FROM ghcr.io/artifact-keeper/ci-mirror/alpine:3.23 AS grype-db-seed
+RUN apk add --no-cache ca-certificates
+COPY --from=grype-bin /grype /usr/local/bin/grype
+ENV GRYPE_DB_CACHE_DIR=/grype-db
+RUN mkdir -p /grype-db && grype db update && grype db status
 
 # ---------- Stage 6: UBI 9 Micro runtime ----------
-FROM registry.access.redhat.com/ubi9/ubi-micro:9.7
+FROM registry.access.redhat.com/ubi9/ubi-micro:9.8
 
 # Copy minimal rootfs (glibc, openssl, ca-certs, curl, user/group, dirs)
 COPY --from=rootfs-builder /mnt/rootfs /
@@ -132,16 +171,33 @@ COPY --from=rootfs-builder /mnt/rootfs /
 COPY --from=trivy-bin /usr/local/bin/trivy /usr/local/bin/
 COPY --from=grype-bin /grype /usr/local/bin/
 
+# Pre-seeded Grype vulnerability DB (avoids first-scan network fetch)
+COPY --from=grype-db-seed --chown=1001:0 /grype-db /home/artifact/.cache/grype
+
 # Copy application binary
 COPY --from=builder /app/target/release/artifact-keeper /usr/local/bin/
 
 WORKDIR /app
 USER 1001
 
+# Grype defaults `db.auto-update=true` and `db.validate-age=true`. With those
+# defaults, Grype at scan time checks the pre-seeded DB's build timestamp; if
+# it is older than `db.max-allowed-built-age` (5 days), Grype refuses to use
+# it and tries to download a fresh copy from grype.anchore.io. In the
+# network-restricted environments PR #1002 (#1001) was meant to fix (ARC
+# runner pods, release-gate jobs), that fetch fails and Grype exits 1 with
+# no stderr (because the scanner invocation passes `-q`). We disable both
+# knobs so the seeded DB is honored for the full image lifetime; the DB is
+# refreshed by rebuilding the image, not at runtime. See artifact-keeper#1001
+# and PR #1002 (commit 23d9743) which added the seed stage.
 ENV RUST_LOG=info \
     DATABASE_URL=set-database-url-at-runtime \
     STORAGE_PATH=/data/storage \
     BACKUP_PATH=/data/backups \
+    GRYPE_DB_CACHE_DIR=/home/artifact/.cache/grype \
+    GRYPE_DB_AUTO_UPDATE=false \
+    GRYPE_DB_VALIDATE_AGE=false \
+    GRYPE_CHECK_FOR_APP_UPDATE=false \
     HOST=0.0.0.0 \
     PORT=8080
 

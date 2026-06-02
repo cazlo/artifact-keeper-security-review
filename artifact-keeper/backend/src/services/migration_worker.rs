@@ -6,6 +6,7 @@
 //! - Progress tracking
 //! - Checkpoint saving for resumability
 
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use uuid::Uuid;
 use crate::models::migration::{MigrationItemType, MigrationJobStatus};
 use crate::services::artifact_service::ArtifactService;
 use crate::services::artifactory_client::ArtifactoryClient;
-use crate::services::migration_service::{MigrationError, MigrationService};
+use crate::services::migration_service::{ConflictType, MigrationError, MigrationService};
 use crate::services::source_registry::SourceRegistry;
 use crate::storage::StorageBackend;
 
@@ -43,11 +44,39 @@ impl Default for WorkerConfig {
             concurrency: 4,
             throttle_delay_ms: 100,
             max_retries: 3,
-            batch_size: 100,
+            // AQL default page size. Kept at 1000 (Artifactory's typical
+            // ceiling) so a single page can cover most repositories without
+            // hammering the source API. The migration worker still paginates
+            // through as many pages as needed to enumerate every artifact.
+            batch_size: 1000,
             verify_checksums: true,
             dry_run: false,
         }
     }
+}
+
+/// Maximum number of AQL pages a single repository migration is allowed to
+/// fetch. Acts as a safety guard against an infinite pagination loop if the
+/// source API misbehaves (for example, by always returning a full page of
+/// results regardless of offset). At the default batch size of 1000 this
+/// still lets a single repository contain up to 100 million artifacts.
+pub(crate) const MAX_ARTIFACT_PAGES: usize = 100_000;
+
+/// Decide whether artifact pagination should continue after processing a
+/// page. The Artifactory AQL `range.total` field reports the number of rows
+/// in the current page (not the overall result set), so the termination
+/// decision must be based on page shape, not on a running total.
+///
+/// Returns `true` when the caller should fetch the next page, `false` when
+/// the enumeration is complete.
+pub(crate) fn should_fetch_next_page(page_len: usize, limit: i64) -> bool {
+    if page_len == 0 {
+        return false;
+    }
+    // A short page means we've reached the end of the result set. AQL always
+    // fills pages up to the requested limit unless there are no more rows.
+    let limit_usize = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+    page_len >= limit_usize
 }
 
 /// Conflict resolution strategy
@@ -150,8 +179,132 @@ impl MigrationWorker {
         let mut total_skipped = 0i32;
         let mut total_transferred = 0i64;
 
+        // Provision destination repositories before transferring artifacts.
+        //
+        // Without this step, `transfer_artifact` looks up the destination
+        // repository row inside an `if let Some(...) = repo_id` and silently
+        // skips the `INSERT INTO artifacts` when the lookup misses. The job
+        // then reports "completed" with bytes in CAS but no addressable
+        // entries in the registry — silent data loss.
+        //
+        // We fetch the source-side repository list once, then for each repo
+        // requested by the job ensure a destination row exists with the same
+        // key. Conflicts (existing repo with same key but different type or
+        // format) are logged and the source repo is skipped so the rest of
+        // the job can still make progress.
+        //
+        // `list_repositories` returns `ArtifactoryError`; the `?` converts via
+        // `MigrationError::from(ArtifactoryError)` on the existing `#[from]` impl.
+        // NOTE: total_failed below is incremented per *repo* during
+        // provisioning (missing-from-source, unsupported config, conflict,
+        // create_repository failure). A skipped repo with N artifacts
+        // contributes 1 to failed, not N. determine_final_status only
+        // checks failed > 0 && completed == 0, so the final job status is
+        // still correct, but the operator-facing failed count understates
+        // impact. Per-artifact accounting would require listing the
+        // source repo's artifacts before deciding to skip — deferred.
+        let source_repos = client.list_repositories().await.map_err(|e| {
+            tracing::error!(
+                job_id = %job_id, error = %e,
+                "Failed to list source repositories; aborting provisioning pre-pass",
+            );
+            e
+        })?;
+        let plan = resolve_repos_for_provisioning(&repos, &source_repos);
+        for missing_key in &plan.missing {
+            tracing::error!(
+                job_id = %job_id, repo = %missing_key,
+                "Source repository not found in source registry; skipping",
+            );
+            total_failed += 1;
+        }
+        for unsupported in &plan.unsupported {
+            tracing::error!(
+                job_id = %job_id, repo = %unsupported.repo_key, error = %unsupported.reason,
+                "Failed to prepare repository migration config; skipping",
+            );
+            total_failed += 1;
+        }
+
+        // (target_key, package_type) — package_type is threaded into
+        // process_repository_artifacts so the INSERT can populate name+version
+        // using format-aware filename parsing (see artifact_metadata module).
+        let mut repos_to_process: Vec<(String, String)> = Vec::with_capacity(plan.resolved.len());
+        for migration_config in plan.resolved {
+            // Skip if a repo with the same key already exists with a
+            // compatible type+format; recreate would be ambiguous and
+            // potentially destructive. Surface incompatible matches as an
+            // error so the operator can resolve manually.
+            let conflict = self
+                .migration_service
+                .check_repository_conflict(
+                    &migration_config.target_key,
+                    migration_config.repo_type,
+                    &migration_config.package_type,
+                )
+                .await?;
+            if conflict.has_conflict {
+                match conflict.conflict_type {
+                    Some(ConflictType::SameKey) => {
+                        tracing::info!(
+                            job_id = %job_id, repo = %migration_config.target_key,
+                            "Destination repository already exists with matching type+format; reusing",
+                        );
+                    }
+                    Some(other) => {
+                        tracing::error!(
+                            job_id = %job_id, repo = %migration_config.target_key,
+                            conflict = ?other,
+                            message = %conflict.message,
+                            "Destination repository conflict; skipping artifact transfer for this repo",
+                        );
+                        total_failed += 1;
+                        continue;
+                    }
+                    None => {
+                        // has_conflict=true with conflict_type=None is a
+                        // contract violation in check_repository_conflict.
+                        // Treat it as a conflict (don't silently route
+                        // through the "other" arm) so the bug surfaces.
+                        tracing::error!(
+                            job_id = %job_id, repo = %migration_config.target_key,
+                            message = %conflict.message,
+                            "has_conflict=true but conflict_type=None; treating as conflict",
+                        );
+                        total_failed += 1;
+                        continue;
+                    }
+                }
+            } else {
+                match self
+                    .migration_service
+                    .create_repository(&migration_config)
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::info!(
+                            job_id = %job_id, repo = %migration_config.target_key,
+                            format = %migration_config.package_type,
+                            repo_type = ?migration_config.repo_type,
+                            "Provisioned destination repository",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            job_id = %job_id, repo = %migration_config.target_key, error = %e,
+                            "Failed to create destination repository; skipping",
+                        );
+                        total_failed += 1;
+                        continue;
+                    }
+                }
+            }
+
+            repos_to_process.push((migration_config.target_key, migration_config.package_type));
+        }
+
         // Process each repository
-        for repo_key in &repos {
+        for (repo_key, package_type) in &repos_to_process {
             // Check for pause/cancel
             if self.cancel_token.is_cancelled() {
                 tracing::info!(job_id = %job_id, "Migration cancelled by user");
@@ -171,6 +324,7 @@ impl MigrationWorker {
                         job_id,
                         client.clone(),
                         repo_key,
+                        package_type,
                         conflict_resolution,
                         include_metadata,
                         &mut total_completed,
@@ -238,6 +392,7 @@ impl MigrationWorker {
         job_id: Uuid,
         client: Arc<dyn SourceRegistry>,
         repo_key: &str,
+        package_type: &str,
         conflict_resolution: ConflictResolution,
         include_metadata: bool,
         completed: &mut i32,
@@ -247,13 +402,29 @@ impl MigrationWorker {
         progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
     ) -> Result<(), MigrationError> {
         let mut offset = 0i64;
-        let limit = self.config.batch_size;
+        let limit = self.config.batch_size.max(1);
+        let mut pages_fetched = 0usize;
 
         loop {
+            // Safety guard: refuse to keep paginating forever if the source
+            // API repeatedly returns full pages without advancing.
+            if pages_fetched >= MAX_ARTIFACT_PAGES {
+                tracing::warn!(
+                    job_id = %job_id,
+                    repo = %repo_key,
+                    pages = pages_fetched,
+                    "Reached MAX_ARTIFACT_PAGES while listing artifacts; stopping pagination"
+                );
+                break;
+            }
+
             // List artifacts with pagination
             let artifacts = client.list_artifacts(repo_key, offset, limit).await?;
+            pages_fetched += 1;
 
-            if artifacts.results.is_empty() {
+            let page_len = artifacts.results.len();
+
+            if page_len == 0 {
                 break;
             }
 
@@ -267,13 +438,40 @@ impl MigrationWorker {
 
                 let source_path = build_source_path(repo_key, &artifact_path);
                 let size = artifact.size.unwrap_or(0);
-                let checksum = artifact
-                    .sha256
-                    .clone()
-                    .or_else(|| artifact.actual_sha1.clone());
+                // Keep sha256 and sha1 separate so verification can compare
+                // each digest against the corresponding locally computed
+                // value. Picking a single "checksum" field and computing
+                // only sha256 locally would cause a false mismatch whenever
+                // the source advertises only sha1 (issue #856).
+                let expected_sha256 = artifact.sha256.clone();
+                let expected_sha1 = artifact.actual_sha1.clone();
+                // Prefer sha256 for bookkeeping/dedup since that is what
+                // Artifact Keeper uses internally.
+                let item_checksum = expected_sha256.clone().or_else(|| expected_sha1.clone());
 
                 // Skip if already completed (resume support)
                 if self.is_item_already_completed(job_id, &source_path).await? {
+                    *skipped += 1;
+                    continue;
+                }
+
+                // Check for duplicates in the artifacts table (cross-job support)
+                // This is checked BEFORE creating migration_item so we avoid tracking
+                // duplicates that already exist, which makes delta migrations work
+                let should_skip_duplicate = self
+                    .check_artifact_duplicate(
+                        &source_path,
+                        item_checksum.as_deref(),
+                        conflict_resolution,
+                    )
+                    .await?;
+
+                if should_skip_duplicate {
+                    tracing::debug!(
+                        repo = %repo_key,
+                        path = %artifact_path,
+                        "Skipping duplicate artifact (already exists with matching checksum)"
+                    );
                     *skipped += 1;
                     continue;
                 }
@@ -285,18 +483,31 @@ impl MigrationWorker {
                         MigrationItemType::Artifact,
                         &source_path,
                         size,
-                        checksum.as_deref(),
+                        item_checksum.as_deref(),
                     )
                     .await?;
+
+                // Log debug info for Docker manifests (especially helpful if they fail due to repo not being offline)
+                if is_docker_manifest_path(&artifact_path) {
+                    tracing::debug!(
+                        repo = %repo_key,
+                        path = %artifact_path,
+                        "Attempting download of Docker manifest (requires source repo to be offline)"
+                    );
+                }
 
                 self.process_single_artifact(
                     item_id,
                     client.clone(),
                     repo_key,
+                    package_type,
                     &artifact_path,
                     &source_path,
                     size,
-                    &checksum,
+                    ExpectedChecksums {
+                        sha256: expected_sha256,
+                        sha1: expected_sha1,
+                    },
                     conflict_resolution,
                     include_metadata,
                     completed,
@@ -325,12 +536,29 @@ impl MigrationWorker {
                 self.apply_throttle().await;
             }
 
-            // Check if we've processed all artifacts
-            if (offset + artifacts.results.len() as i64) >= artifacts.range.total {
+            // Advance the cursor. AQL's `range.total` reports the count of
+            // rows in the current page (matching `end_pos - start_pos`), so
+            // termination must be decided from the page shape, not from a
+            // running total. A short page (fewer rows than `limit`) means
+            // the result set is exhausted.
+            if !should_fetch_next_page(page_len, limit) {
                 break;
             }
 
-            offset += limit;
+            // Guard against a pathological source that returns full pages
+            // without advancing the cursor. This prevents an infinite loop
+            // if the offset fails to move forward.
+            let new_offset = offset.saturating_add(page_len as i64);
+            if new_offset <= offset {
+                tracing::warn!(
+                    job_id = %job_id,
+                    repo = %repo_key,
+                    offset,
+                    "AQL pagination cursor failed to advance; stopping to avoid infinite loop"
+                );
+                break;
+            }
+            offset = new_offset;
         }
 
         Ok(())
@@ -359,10 +587,11 @@ impl MigrationWorker {
         item_id: Uuid,
         client: Arc<dyn SourceRegistry>,
         repo_key: &str,
+        package_type: &str,
         artifact_path: &str,
         source_path: &str,
         size: i64,
-        checksum: &Option<String>,
+        expected: ExpectedChecksums,
         conflict_resolution: ConflictResolution,
         include_metadata: bool,
         completed: &mut i32,
@@ -370,8 +599,13 @@ impl MigrationWorker {
         skipped: &mut i32,
         transferred: &mut i64,
     ) -> Result<(), MigrationError> {
+        // Prefer sha256 for duplicate detection since that is what Artifact
+        // Keeper stores internally. Fall back to sha1 when the source only
+        // provides that (common for older Nexus artifacts).
+        let dedup_checksum = expected.sha256.clone().or_else(|| expected.sha1.clone());
+
         let should_skip = self
-            .check_artifact_duplicate(source_path, checksum.as_deref(), conflict_resolution)
+            .check_artifact_duplicate(source_path, dedup_checksum.as_deref(), conflict_resolution)
             .await?;
 
         if should_skip {
@@ -383,14 +617,21 @@ impl MigrationWorker {
         }
 
         match self
-            .transfer_artifact(client, repo_key, artifact_path, include_metadata)
+            .transfer_artifact(
+                client,
+                repo_key,
+                package_type,
+                artifact_path,
+                include_metadata,
+                &expected,
+            )
             .await
         {
             Ok(transfer_result) => {
                 self.finalize_transfer(
                     item_id,
                     &transfer_result,
-                    checksum,
+                    &expected,
                     size,
                     completed,
                     failed,
@@ -399,10 +640,28 @@ impl MigrationWorker {
                 .await?;
             }
             Err(e) => {
-                self.migration_service
-                    .fail_item(item_id, &e.to_string())
-                    .await?;
-                *failed += 1;
+                let err_msg = e.to_string();
+
+                // Skip only when source reports not found right now.
+                // This keeps items eligible for future migration runs when cache entries become available.
+                if should_skip_failed_cache_artifact(&err_msg, repo_key, artifact_path) {
+                    let skip_reason = build_cache_skip_reason(&err_msg);
+
+                    tracing::info!(
+                        item_id = %item_id,
+                        repo = %repo_key,
+                        path = %artifact_path,
+                        "Cache metadata/index artifact currently unavailable from source; skipping for this run and eligible on future runs"
+                    );
+
+                    self.migration_service
+                        .skip_item(item_id, &skip_reason)
+                        .await?;
+                    *skipped += 1;
+                } else {
+                    self.migration_service.fail_item(item_id, &err_msg).await?;
+                    *failed += 1;
+                }
             }
         }
 
@@ -415,22 +674,14 @@ impl MigrationWorker {
         &self,
         item_id: Uuid,
         transfer_result: &TransferResult,
-        expected_checksum: &Option<String>,
+        expected: &ExpectedChecksums,
         size: i64,
         completed: &mut i32,
         failed: &mut i32,
         transferred: &mut i64,
     ) -> Result<(), MigrationError> {
-        if !self.verify_transfer_checksum(expected_checksum, &transfer_result.calculated_checksum) {
-            self.migration_service
-                .fail_item(
-                    item_id,
-                    &format!(
-                        "Checksum mismatch: expected {:?}, got {:?}",
-                        expected_checksum, transfer_result.calculated_checksum
-                    ),
-                )
-                .await?;
+        if let Some(mismatch) = self.verify_transfer_checksums(expected, transfer_result) {
+            self.migration_service.fail_item(item_id, &mismatch).await?;
             *failed += 1;
             return Ok(());
         }
@@ -447,10 +698,27 @@ impl MigrationWorker {
         Ok(())
     }
 
-    /// Verify a transfer's checksum against the expected value.
-    /// Returns true if verification passes or is not applicable.
-    fn verify_transfer_checksum(&self, expected: &Option<String>, actual: &Option<String>) -> bool {
-        verify_checksums_match(self.config.verify_checksums, expected, actual)
+    /// Verify a transfer's checksums against the expected values.
+    ///
+    /// Compares each advertised digest (sha256 and sha1) against the
+    /// locally computed digest of the same algorithm. A previous version
+    /// of this check compared the single "best" expected digest against a
+    /// locally computed sha256, which produced a guaranteed false positive
+    /// whenever the source only advertised sha1 (issue #856).
+    ///
+    /// Returns `None` when verification passes or is not applicable, and
+    /// `Some(error_message)` when a mismatch is detected.
+    fn verify_transfer_checksums(
+        &self,
+        expected: &ExpectedChecksums,
+        actual: &TransferResult,
+    ) -> Option<String> {
+        verify_expected_checksums(
+            self.config.verify_checksums,
+            expected,
+            actual.calculated_sha256.as_deref(),
+            actual.calculated_sha1.as_deref(),
+        )
     }
 
     /// Send a progress update through the channel, if one is configured
@@ -546,22 +814,146 @@ impl MigrationWorker {
         }
     }
 
-    /// Transfer an artifact from Artifactory to Artifact Keeper
+    /// Transfer an artifact from Artifactory to Artifact Keeper.
+    ///
+    /// Streams the source response straight to a temp file on disk. Each
+    /// chunk is hashed (sha256 + sha1) and discarded as soon as it lands on
+    /// disk, so peak memory usage is O(chunk_size) instead of
+    /// O(artifact_size). Without this, a 10 GB Maven artifact would buffer
+    /// the entire body into a `Bytes` before storage write and OOM the AK
+    /// host (issue #1422).
+    ///
+    /// The temp file is then handed to `StorageBackend::put_stream` (not
+    /// `put_file`) using a `ReaderStream`, so the upload path is also
+    /// memory-bounded. The previous default `put_file` impl called
+    /// `tokio::fs::read(path)` which reintroduced the full-body buffer at
+    /// the storage layer (#1512 review): cloud backends inherited it, so
+    /// streaming to a temp file but then loading 10 GB into RAM still OOM'd
+    /// the host. Routing through `put_stream` engages each backend's real
+    /// streaming primitive (S3 multipart, GCS resumable, filesystem
+    /// temp-and-rename, Azure single-PUT with `wrap_stream`).
+    ///
+    /// Checksum verification (when an expected sha256/sha1 was advertised
+    /// by the source) runs BEFORE the storage put, not after. A truncated
+    /// or corrupted body is detected on the temp file and returns
+    /// `MigrationError::ChecksumMismatch` without ever writing to permanent
+    /// storage or inserting an `artifacts` row. Previously, mismatch
+    /// detection happened in `finalize_transfer` AFTER the bytes were
+    /// committed, leaving corrupt blobs in storage on failure (#1512
+    /// review).
     async fn transfer_artifact(
         &self,
         client: Arc<dyn SourceRegistry>,
         repo_key: &str,
+        package_type: &str,
         artifact_path: &str,
         include_metadata: bool,
+        expected: &ExpectedChecksums,
     ) -> Result<TransferResult, MigrationError> {
-        // Download artifact from Artifactory
-        let artifact_data = client.download_artifact(repo_key, artifact_path).await?;
-        let content_size = artifact_data.len();
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
 
-        // Calculate checksum
-        let mut hasher = Sha256::new();
-        hasher.update(&artifact_data);
-        let checksum = hex::encode(hasher.finalize());
+        // Open the source as a chunked stream rather than `download_artifact`,
+        // which buffers the whole body in memory (#1422).
+        let mut stream = client
+            .download_artifact_stream(repo_key, artifact_path)
+            .await?;
+
+        // Spill chunks to a NamedTempFile while computing checksums
+        // incrementally. `NamedTempFile` is created via the blocking
+        // tempfile crate, but reopened as a `tokio::fs::File` so writes go
+        // through the async executor without per-chunk blocking-thread
+        // hops. Each chunk is hashed (sha256 + sha1) and dropped as soon
+        // as it lands on disk so peak memory is O(chunk_size).
+        let temp = tempfile::NamedTempFile::new().map_err(|e| {
+            MigrationError::StorageError(format!("Failed to create temp file: {e}"))
+        })?;
+        let temp_path = temp.path().to_path_buf();
+        let mut writer = tokio::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)
+            .await
+            .map_err(|e| {
+                MigrationError::StorageError(format!("Failed to open temp file for write: {e}"))
+            })?;
+
+        let mut sha256_hasher = Sha256::new();
+        let mut sha1_hasher = Sha1::new();
+        let mut content_size: usize = 0;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(MigrationError::from)?;
+            sha256_hasher.update(&chunk);
+            sha1_hasher.update(&chunk);
+            content_size += chunk.len();
+            writer.write_all(&chunk).await.map_err(|e| {
+                MigrationError::StorageError(format!("Failed to write chunk to temp: {e}"))
+            })?;
+            // Explicit drop so the chunk's heap allocation is released
+            // before we await the next read. Belt-and-suspenders: the
+            // borrow checker would drop it at end of scope anyway.
+            drop(chunk);
+        }
+
+        // Drop the stream so the underlying connection can be reused.
+        drop(stream);
+
+        // Flush and sync so the file's contents are fully on disk before
+        // storage reads back from `temp_path` and before we hand off to
+        // metadata extraction. Without this, a fast `put_file` rename can
+        // race the kernel's writeback and surface a short read.
+        writer
+            .flush()
+            .await
+            .map_err(|e| MigrationError::StorageError(format!("Failed to flush temp file: {e}")))?;
+        writer
+            .sync_all()
+            .await
+            .map_err(|e| MigrationError::StorageError(format!("Failed to sync temp file: {e}")))?;
+        drop(writer);
+
+        let sha256_hex = hex::encode(sha256_hasher.finalize());
+        let sha1_hex = hex::encode(sha1_hasher.finalize());
+
+        // Verify advertised checksums against locally computed digests
+        // BEFORE committing the temp file to storage. This is the
+        // "fail-fast on corruption" guarantee added in #1512 review: prior
+        // versions of this code ran verification in `finalize_transfer`,
+        // AFTER `put_file` had already written the (potentially corrupt)
+        // bytes to storage and inserted an `artifacts` row. The
+        // `NamedTempFile` is dropped on the early return, so the
+        // truncated/tampered body never reaches permanent storage and no
+        // database rows are inserted.
+        if let Some(mismatch) = verify_expected_checksums(
+            self.config.verify_checksums,
+            expected,
+            Some(&sha256_hex),
+            Some(&sha1_hex),
+        ) {
+            return Err(MigrationError::ChecksumMismatch {
+                path: artifact_path.to_string(),
+                expected: format!(
+                    "sha256={} sha1={}",
+                    expected.sha256.as_deref().unwrap_or("none"),
+                    expected.sha1.as_deref().unwrap_or("none"),
+                ),
+                actual: mismatch,
+            });
+        }
+
+        // Extract format-specific package metadata (npm package.json, helm
+        // Chart.yaml, etc.) from the on-disk temp file BEFORE storage takes
+        // ownership of it. Reading from disk (vs. an in-memory buffer)
+        // keeps the streaming-memory guarantee for non-npm/helm formats
+        // and is bounded for npm/helm because those tarballs are small.
+        // Returns None for unknown formats; the artifact INSERT proceeds
+        // either way and only the metadata row is skipped.
+        let extracted_metadata =
+            crate::services::artifact_metadata::extract_artifact_metadata_from_path(
+                package_type,
+                &temp_path,
+            );
 
         // Get metadata if requested
         let metadata = if include_metadata {
@@ -574,14 +966,40 @@ impl MigrationWorker {
         };
 
         // Upload to Artifact Keeper storage using CAS key
-        let storage_key = ArtifactService::storage_key_from_checksum(&checksum);
+        let storage_key = ArtifactService::storage_key_from_checksum(&sha256_hex);
 
         if !self.config.dry_run {
             // Check if content already exists (deduplication)
             let exists = self.storage.exists(&storage_key).await.unwrap_or(false);
             if !exists {
+                // Open the temp file as a `ReaderStream` and hand it to
+                // `put_stream` so the upload itself is memory-bounded. The
+                // previous code called `put_file`, whose default trait impl
+                // loaded the whole file into a `Bytes` before forwarding to
+                // `put` -- which would OOM the host on a 10 GB Maven artifact
+                // even though the download path streamed to disk (#1512
+                // review). S3, GCS, and Azure all back `put_stream` with their
+                // native streaming upload primitives; filesystem still does a
+                // temp-and-rename internally.
+                use tokio::io::BufReader;
+                use tokio_util::io::ReaderStream;
+
+                let file = tokio::fs::File::open(&temp_path).await.map_err(|e| {
+                    MigrationError::StorageError(format!(
+                        "Failed to reopen temp file for upload: {e}"
+                    ))
+                })?;
+                let reader = BufReader::with_capacity(256 * 1024, file);
+                let stream = ReaderStream::with_capacity(reader, 256 * 1024);
+                let mapped = futures::StreamExt::map(stream, |r| {
+                    r.map_err(|e| {
+                        crate::error::AppError::Storage(format!(
+                            "Temp file read error during upload: {e}"
+                        ))
+                    })
+                });
                 self.storage
-                    .put(&storage_key, artifact_data)
+                    .put_stream(&storage_key, Box::pin(mapped))
                     .await
                     .map_err(|e| MigrationError::StorageError(e.to_string()))?;
             }
@@ -594,23 +1012,87 @@ impl MigrationWorker {
                     .await?;
 
             if let Some((repository_id,)) = repo_id {
-                let name = extract_name_from_path(artifact_path);
-                let path_str = format!("{}/{}", repo_key, artifact_path);
+                // Format-aware name + version. extract_name_from_path returns
+                // the filename, which is what Artifact Keeper stored prior to
+                // this fix — leaving `name` set to the full filename and
+                // `version` NULL. That broke per-format index endpoints
+                // (PyPI simple/, Helm index.yaml, npm metadata) since those
+                // group by canonical package name and require a version.
+                // parse_name_and_version uses the destination repo's package
+                // type to choose the right parser; unknown formats fall back
+                // to the legacy filename-as-name behaviour with NULL version.
+                let filename = extract_name_from_path(artifact_path);
+                let parsed = crate::services::artifact_metadata::parse_name_and_version(
+                    package_type,
+                    filename,
+                    artifact_path,
+                );
+                // Match the path shape AK's per-format publish handlers
+                // already use: `<name>/<version>/<filename>`. Without this,
+                // the migration produced paths like
+                // `<repo>/<source-relative-path>` which collide with the
+                // download lookups: npm's `serve_tarball` matches
+                // `path LIKE '<package>/%/<filename>'` (no leading wildcard)
+                // and never finds migrated rows. PyPI and Helm tolerate the
+                // legacy shape because their lookups use a leading-wildcard
+                // pattern, but writing the canonical publish shape here
+                // closes the inconsistency for everyone and keeps a single
+                // source-of-truth path layout in the artifacts table.
+                // Falls back to the legacy `<repo>/<source-path>` shape only
+                // when the format-aware parser couldn't recover a version
+                // (unknown format / unparseable filename).
+                let path_str = match parsed.version.as_deref() {
+                    Some(ver) if !ver.is_empty() => {
+                        format!("{}/{}/{}", parsed.name, ver, filename)
+                    }
+                    _ => format!("{}/{}", repo_key, artifact_path),
+                };
                 sqlx::query(
                     r#"
-                    INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, storage_key, content_type)
-                    VALUES ($1, $2, $3, $4, $5, $6, 'application/octet-stream')
+                    INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, storage_key, content_type)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, 'application/octet-stream')
                     ON CONFLICT (repository_id, path) WHERE is_deleted = false DO NOTHING
                     "#,
                 )
                 .bind(repository_id)
                 .bind(&path_str)
-                .bind(name)
+                .bind(&parsed.name)
+                .bind(parsed.version.as_deref())
                 .bind(content_size as i64)
-                .bind(&checksum)
+                .bind(&sha256_hex)
                 .bind(&storage_key)
                 .execute(&self.db)
                 .await?;
+
+                // Upsert format-specific package metadata. Look up the
+                // artifact id by (repository_id, path) — works whether the
+                // INSERT above produced a new row or hit ON CONFLICT DO
+                // NOTHING on a re-run, and avoids the RETURNING/DO UPDATE
+                // dance that ON CONFLICT DO NOTHING would require.
+                if let Some(metadata_json) = &extracted_metadata {
+                    let artifact_row: Option<(Uuid,)> = sqlx::query_as(
+                        "SELECT id FROM artifacts \
+                         WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
+                         LIMIT 1",
+                    )
+                    .bind(repository_id)
+                    .bind(&path_str)
+                    .fetch_optional(&self.db)
+                    .await?;
+                    if let Some((artifact_id,)) = artifact_row {
+                        sqlx::query(
+                            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+                             VALUES ($1, $2, $3) \
+                             ON CONFLICT (artifact_id) DO UPDATE \
+                             SET metadata = EXCLUDED.metadata",
+                        )
+                        .bind(artifact_id)
+                        .bind(package_type)
+                        .bind(metadata_json)
+                        .execute(&self.db)
+                        .await?;
+                    }
+                }
             }
         }
 
@@ -619,13 +1101,16 @@ impl MigrationWorker {
         tracing::debug!(
             path = %artifact_path,
             size = content_size,
-            checksum = %checksum,
+            sha256 = %sha256_hex,
+            sha1 = %sha1_hex,
             "Artifact transferred"
         );
 
         Ok(TransferResult {
             target_path,
-            calculated_checksum: Some(checksum),
+            calculated_checksum: Some(sha256_hex.clone()),
+            calculated_sha256: Some(sha256_hex),
+            calculated_sha1: Some(sha1_hex),
             metadata,
         })
     }
@@ -1048,12 +1533,175 @@ impl MigrationWorker {
     }
 }
 
-/// Result of a successful artifact transfer
+/// Result of a successful artifact transfer.
+///
+/// Carries both locally computed digests so the caller can compare against
+/// whichever algorithm the source advertised (issue #856).
 #[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
 struct TransferResult {
     target_path: String,
+    /// Legacy alias for `calculated_sha256`, retained so existing callers
+    /// that inspect `calculated_checksum` continue to see the sha256 value.
     calculated_checksum: Option<String>,
+    calculated_sha256: Option<String>,
+    calculated_sha1: Option<String>,
     metadata: Option<std::collections::HashMap<String, Vec<String>>>,
+}
+
+/// Digests that the source registry declared for an artifact.
+///
+/// Both fields are optional because sources vary in what they report.
+/// Nexus, for example, always returns `sha1` for Maven artifacts but may
+/// omit `sha256` for older ones. Keeping them separate lets the worker
+/// compare each advertised digest against the matching locally computed
+/// value instead of guessing which algorithm to verify against (issue
+/// #856).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ExpectedChecksums {
+    pub sha256: Option<String>,
+    pub sha1: Option<String>,
+}
+
+impl ExpectedChecksums {
+    /// Returns true when at least one digest was declared.
+    #[allow(dead_code)]
+    pub fn has_any(&self) -> bool {
+        self.sha256.is_some() || self.sha1.is_some()
+    }
+}
+
+/// Compute both sha256 and sha1 hex digests over the same payload in a
+/// single pass over the bytes. Returns `(sha256_hex, sha1_hex)`.
+///
+/// Kept for test fixtures and any future buffered callers. The streaming
+/// `transfer_artifact` path (#1422) hashes chunks incrementally instead of
+/// calling this on a full in-memory buffer.
+#[allow(dead_code)]
+pub(crate) fn compute_dual_checksums(data: &[u8]) -> (String, String) {
+    let mut sha256 = Sha256::new();
+    sha256.update(data);
+    let sha256_hex = hex::encode(sha256.finalize());
+
+    let mut sha1 = Sha1::new();
+    sha1.update(data);
+    let sha1_hex = hex::encode(sha1.finalize());
+
+    (sha256_hex, sha1_hex)
+}
+
+/// Compare each advertised digest against the matching locally computed
+/// digest. Returns `None` when verification passes (all advertised digests
+/// match, or verification is disabled, or no digests were advertised) and
+/// `Some(error_message)` when any advertised digest disagrees with the
+/// locally computed value of the same algorithm.
+///
+/// Comparison is hex and case-insensitive. A missing local digest for an
+/// algorithm the source advertised is treated as a verification failure
+/// rather than a pass, so we never silently accept an unverified artifact
+/// when the user has verification enabled.
+pub(crate) fn verify_expected_checksums(
+    verify_enabled: bool,
+    expected: &ExpectedChecksums,
+    actual_sha256: Option<&str>,
+    actual_sha1: Option<&str>,
+) -> Option<String> {
+    if !verify_enabled {
+        return None;
+    }
+
+    if let Some(exp_sha256) = expected.sha256.as_deref() {
+        let exp_norm = exp_sha256.to_ascii_lowercase();
+        match actual_sha256 {
+            Some(actual) if actual.eq_ignore_ascii_case(&exp_norm) => {}
+            Some(actual) => {
+                return Some(format!(
+                    "Checksum mismatch (sha256): expected {}, got {}",
+                    exp_norm, actual
+                ));
+            }
+            None => {
+                return Some(format!(
+                    "Checksum mismatch (sha256): expected {}, got none",
+                    exp_norm
+                ));
+            }
+        }
+    }
+
+    if let Some(exp_sha1) = expected.sha1.as_deref() {
+        let exp_norm = exp_sha1.to_ascii_lowercase();
+        match actual_sha1 {
+            Some(actual) if actual.eq_ignore_ascii_case(&exp_norm) => {}
+            Some(actual) => {
+                return Some(format!(
+                    "Checksum mismatch (sha1): expected {}, got {}",
+                    exp_norm, actual
+                ));
+            }
+            None => {
+                return Some(format!(
+                    "Checksum mismatch (sha1): expected {}, got none",
+                    exp_norm
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+/// A source repository requested for migration that could not be turned
+/// into a [`RepositoryMigrationConfig`] (typically because the source's
+/// repository type or package format isn't recognized by Artifact Keeper).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnsupportedRepo {
+    pub repo_key: String,
+    pub reason: String,
+}
+
+/// Outcome of pre-pass resolution before destination provisioning.
+///
+/// Each requested key in `process_job`'s `include_repos` list lands in
+/// exactly one of the three buckets: it has a valid source-side row and
+/// gets turned into a `RepositoryMigrationConfig` (`resolved`); the source
+/// has no row with that key (`missing`); or the source row exists but its
+/// type/format can't be mapped to a destination config (`unsupported`).
+#[derive(Debug, Default)]
+pub(crate) struct ResolveRepoPlan {
+    pub resolved: Vec<crate::services::migration_service::RepositoryMigrationConfig>,
+    pub missing: Vec<String>,
+    pub unsupported: Vec<UnsupportedRepo>,
+}
+
+/// Match each requested repository key against the source-side repository
+/// list and prepare a `RepositoryMigrationConfig` for it.
+///
+/// Pure (no DB, no I/O) so it can be unit-tested end-to-end. The DB-touching
+/// `check_repository_conflict` / `create_repository` follow-up runs in
+/// `MigrationWorker::process_job` over the `resolved` slice.
+pub(crate) fn resolve_repos_for_provisioning(
+    requested: &[String],
+    source_repos: &[crate::services::artifactory_client::RepositoryListItem],
+) -> ResolveRepoPlan {
+    let mut plan = ResolveRepoPlan::default();
+    for repo_key in requested {
+        let source_repo = match source_repos.iter().find(|r| &r.key == repo_key) {
+            Some(r) => r,
+            None => {
+                plan.missing.push(repo_key.clone());
+                continue;
+            }
+        };
+        match MigrationService::prepare_repository_migration(source_repo, None) {
+            Ok(c) => plan.resolved.push(c),
+            Err(e) => plan.unsupported.push(UnsupportedRepo {
+                repo_key: repo_key.clone(),
+                reason: e.to_string(),
+            }),
+        }
+    }
+    plan
 }
 
 /// Determine the final job status based on completed and failed counts.
@@ -1071,8 +1719,14 @@ pub(crate) fn determine_final_status(
 }
 
 /// Check whether an expected checksum matches an actual checksum.
+///
 /// Returns true (pass) when verification is disabled, when either value
-/// is missing, or when both values are present and equal.
+/// is missing, or when both values are present and equal. This is a thin
+/// legacy wrapper retained so callers and tests outside the worker can
+/// still perform a single-digest comparison; the worker itself now uses
+/// [`verify_expected_checksums`] to compare each advertised digest against
+/// the locally computed value of the same algorithm (issue #856).
+#[allow(dead_code)]
 pub(crate) fn verify_checksums_match(
     verify_enabled: bool,
     expected: &Option<String>,
@@ -1082,7 +1736,7 @@ pub(crate) fn verify_checksums_match(
         return true;
     }
     match (expected, actual) {
-        (Some(exp), Some(act)) => exp == act,
+        (Some(exp), Some(act)) => exp.eq_ignore_ascii_case(act),
         _ => true,
     }
 }
@@ -1100,6 +1754,97 @@ pub(crate) fn build_artifact_path(path: &str, name: &str) -> String {
 /// Build the full source path by combining a repository key with an artifact path.
 pub(crate) fn build_source_path(repo_key: &str, artifact_path: &str) -> String {
     format!("{}/{}", repo_key, artifact_path)
+}
+
+/// Detect Docker/OCI manifest paths laid out by Artifactory's filesystem
+/// layout (`.../sha256__<digest>/manifest.json` or `.../list.manifest.json`).
+///
+/// Used purely for logging context when initiating a download attempt of a
+/// manifest, since manifest downloads require the source repo to be offline
+/// for Artifactory to surface them via the storage API.
+fn is_docker_manifest_path(artifact_path: &str) -> bool {
+    artifact_path.contains("/sha256__")
+        && (artifact_path.ends_with("/manifest.json")
+            || artifact_path.ends_with("/list.manifest.json"))
+}
+
+/// Detect cache-only artifacts from Artifactory remote cache repositories.
+///
+/// These are metadata/index files that exist in AQL but cannot be downloaded via HTTP
+/// because they are:
+/// 1. Dynamically generated during cache revalidation
+/// 2. Index files (e.g., Debian Release files, Cargo config, PyPI index pages)
+/// 3. Expired cache entries that cannot be revalidated with upstream
+///
+/// Skipping these prevents failed migration items while preserving actual downloadable
+/// artifacts (packages, blobs, tarballs, etc.)
+fn should_skip_cache_only_artifact(repo_key: &str, artifact_path: &str) -> bool {
+    let repo_lower = repo_key.to_lowercase();
+    let path_lower = artifact_path.to_lowercase();
+
+    // Docker/OCI: skip cache metadata manifests, not blob payloads.
+    if (repo_lower.contains("docker") || repo_lower.contains("oci"))
+        && path_lower.contains("sha256__")
+        && (path_lower.ends_with("/manifest.json") || path_lower.ends_with("/list.manifest.json"))
+    {
+        return true;
+    }
+
+    // PyPI cache: simple index HTML files
+    if repo_lower.contains("pypi")
+        && path_lower.starts_with(".pypi/")
+        && path_lower.ends_with(".html")
+    {
+        return true;
+    }
+
+    // Cargo cache: auto-generated config.json
+    if repo_lower.contains("cargo") && artifact_path.ends_with("config.json") {
+        return true;
+    }
+
+    // Debian/Apt/Ubuntu repository metadata and package indices
+    let is_deb_metadata = path_lower.ends_with("release")
+        || path_lower.ends_with("release.gpg")
+        || path_lower.ends_with("inrelease")
+        || path_lower.ends_with("packages.gz")
+        || path_lower.ends_with("packages.bz2")
+        || path_lower.ends_with("packages.xz")
+        || path_lower.ends_with("packages")
+        || path_lower.ends_with("packages.dir")
+        || path_lower.ends_with("contents.gz")
+        || path_lower.ends_with("contents");
+
+    if is_deb_metadata
+        && (repo_lower.contains("debian")
+            || repo_lower.contains("apt")
+            || repo_lower.contains("ubuntu")
+            || repo_lower.contains("bazel"))
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Decide whether a failed transfer should be marked as skipped (versus
+/// failed) so the item stays eligible for a future migration run.
+///
+/// The combined predicate is intentionally narrow: only when the source
+/// reports the artifact as currently missing AND the (repo, path) pair
+/// matches the known cache-only metadata layout. Anything else surfaces
+/// as a hard failure so genuine outages stay visible.
+fn should_skip_failed_cache_artifact(err_msg: &str, repo_key: &str, artifact_path: &str) -> bool {
+    err_msg.contains("Artifact not found")
+        && should_skip_cache_only_artifact(repo_key, artifact_path)
+}
+
+/// Build the user-facing reason string recorded on migration items that
+/// were skipped because their cache entry is currently unavailable.
+fn build_cache_skip_reason(err_msg: &str) -> String {
+    format!(
+        "{err_msg} | Cache metadata/index artifact is currently unavailable from source. Skipped for this run only; rerun migration when source cache entry becomes available."
+    )
 }
 
 /// Extract the file name from an artifact path.
@@ -1151,9 +1896,356 @@ mod tests {
         assert_eq!(config.concurrency, 4);
         assert_eq!(config.throttle_delay_ms, 100);
         assert_eq!(config.max_retries, 3);
-        assert_eq!(config.batch_size, 100);
+        assert_eq!(config.batch_size, 1000);
         assert!(config.verify_checksums);
         assert!(!config.dry_run);
+    }
+
+    // -----------------------------------------------------------------------
+    // should_fetch_next_page (#671 pagination fix)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_fetch_next_page_full_page_continues() {
+        // A full page (page_len == limit) means more rows are likely available
+        assert!(should_fetch_next_page(1000, 1000));
+        assert!(should_fetch_next_page(100, 100));
+    }
+
+    #[test]
+    fn test_should_fetch_next_page_short_page_terminates() {
+        // A short page (page_len < limit) means the result set is exhausted
+        assert!(!should_fetch_next_page(42, 1000));
+        assert!(!should_fetch_next_page(999, 1000));
+    }
+
+    #[test]
+    fn test_should_fetch_next_page_empty_terminates() {
+        // An empty page always terminates
+        assert!(!should_fetch_next_page(0, 1000));
+        assert!(!should_fetch_next_page(0, 1));
+    }
+
+    #[test]
+    fn test_should_fetch_next_page_negative_limit_handled() {
+        // Defensive: negative or zero limits should not panic
+        assert!(!should_fetch_next_page(0, -1));
+        assert!(should_fetch_next_page(5, -1));
+    }
+
+    #[test]
+    fn test_should_fetch_next_page_boundary_limit_of_one() {
+        // A single-row page with limit=1 means more rows could exist
+        assert!(should_fetch_next_page(1, 1));
+        // Zero rows with limit=1 means empty result set
+        assert!(!should_fetch_next_page(0, 1));
+    }
+
+    #[test]
+    fn test_should_fetch_next_page_limit_zero_always_continues() {
+        // Zero limit collapses to max usize so any non-empty page continues
+        assert!(should_fetch_next_page(1, 0));
+        assert!(!should_fetch_next_page(0, 0));
+    }
+
+    #[test]
+    fn test_should_fetch_next_page_page_larger_than_limit() {
+        // Defensive: if the server returns more rows than requested,
+        // treat it as a full page (continue fetching)
+        assert!(should_fetch_next_page(200, 100));
+    }
+
+    #[test]
+    fn test_max_artifact_pages_constant_is_safety_guard() {
+        // Sanity check the safety guard is reasonable: with 1000 rows per
+        // page, this allows enumerating up to 100M artifacts in a single
+        // repository before bailing out.
+        let min_pages = 10_000;
+        assert!(MAX_ARTIFACT_PAGES >= min_pages);
+    }
+
+    #[test]
+    fn test_default_batch_size_is_reasonable_for_aql() {
+        // Default batch size should be large enough to avoid excessive
+        // round trips but not so large it stresses the source API.
+        let config = WorkerConfig::default();
+        assert!(config.batch_size >= 100);
+        assert!(config.batch_size <= 10_000);
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_docker() {
+        // Docker/OCI cache paths with sha256__
+        assert!(should_skip_cache_only_artifact(
+            "docker-remote-cache",
+            "anchore/grype/sha256__1a58983ca4abb6bd0b0ae9f171541ff67d8f6a15bfcc49203ab97f9d01d3294e/manifest.json"
+        ));
+        assert!(should_skip_cache_only_artifact(
+            "oci-cache",
+            "library/nginx/sha256__52e3/list.manifest.json"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_pypi() {
+        // PyPI cache HTML index files
+        assert!(should_skip_cache_only_artifact(
+            "pypi-remote-cache",
+            ".pypi/invoke.html"
+        ));
+        assert!(should_skip_cache_only_artifact(
+            "pypi-cache",
+            ".pypi/ipaddress.html"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_cargo() {
+        // Cargo auto-generated config
+        assert!(should_skip_cache_only_artifact(
+            "cargo-remote-cache",
+            "config.json"
+        ));
+        assert!(should_skip_cache_only_artifact(
+            "cargo-cache",
+            "1/registry/config.json"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_debian_metadata() {
+        // Debian/Apt/Ubuntu repository metadata
+        assert!(should_skip_cache_only_artifact(
+            "debian-cache",
+            "dists/focal/Release"
+        ));
+        assert!(should_skip_cache_only_artifact(
+            "ubuntu-cache",
+            "dists/jammy/InRelease"
+        ));
+        assert!(should_skip_cache_only_artifact(
+            "apt-cache",
+            "dists/bullseye/Packages.gz"
+        ));
+        assert!(should_skip_cache_only_artifact(
+            "bazel-cache",
+            "dists/Contents.gz"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_allows_real_packages() {
+        // Non-cache artifacts should not be skipped
+        assert!(!should_skip_cache_only_artifact(
+            "pypi-cache",
+            "13/2c/5e079cefe955ae58e5a052fe037c850ce493eb7269dedeb960237e78fb0f/wheel-0.46.2-py3-none-any.whl"
+        ));
+        assert!(!should_skip_cache_only_artifact(
+            "docker-cache",
+            "library/nginx/sha256__52e3/layer.tar"
+        ));
+        assert!(!should_skip_cache_only_artifact(
+            "cargo-cache",
+            "requests/requests-2.28.0-py3-none-any.whl"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_docker_manifest_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_docker_manifest_path_detects_single_arch_manifest() {
+        assert!(is_docker_manifest_path(
+            "library/nginx/sha256__abc123/manifest.json"
+        ));
+    }
+
+    #[test]
+    fn test_is_docker_manifest_path_detects_multi_arch_list_manifest() {
+        assert!(is_docker_manifest_path(
+            "library/nginx/sha256__abc123/list.manifest.json"
+        ));
+    }
+
+    #[test]
+    fn test_is_docker_manifest_path_rejects_layer_payload() {
+        // sha256__ subdirectory but not a manifest filename
+        assert!(!is_docker_manifest_path(
+            "library/nginx/sha256__abc123/layer.tar"
+        ));
+    }
+
+    #[test]
+    fn test_is_docker_manifest_path_rejects_manifest_without_sha256_prefix() {
+        // manifest.json filename but no sha256__ marker upstream
+        assert!(!is_docker_manifest_path(
+            "library/nginx/latest/manifest.json"
+        ));
+    }
+
+    #[test]
+    fn test_is_docker_manifest_path_rejects_empty_path() {
+        assert!(!is_docker_manifest_path(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // should_skip_failed_cache_artifact + build_cache_skip_reason
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_skip_failed_cache_artifact_matches_not_found_for_cache_metadata() {
+        // Real-world error string from Artifactory client wrapping a 404
+        let err = "Artifact not found: docker-remote-cache/library/nginx/sha256__abc/manifest.json";
+        assert!(should_skip_failed_cache_artifact(
+            err,
+            "docker-remote-cache",
+            "library/nginx/sha256__abc/manifest.json"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_failed_cache_artifact_rejects_not_found_for_real_payload() {
+        // A 404 on an actual package payload is a real failure, not a cache skip
+        let err = "Artifact not found: pypi-remote-cache/wheel-0.46.2-py3-none-any.whl";
+        assert!(!should_skip_failed_cache_artifact(
+            err,
+            "pypi-remote-cache",
+            "wheel-0.46.2-py3-none-any.whl"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_failed_cache_artifact_rejects_non_not_found_errors() {
+        // Connection errors, 500s, etc. must surface as failures even on
+        // cache-metadata paths so genuine outages stay visible.
+        let err = "Connection refused while contacting source registry";
+        assert!(!should_skip_failed_cache_artifact(
+            err,
+            "docker-remote-cache",
+            "library/nginx/sha256__abc/manifest.json"
+        ));
+    }
+
+    #[test]
+    fn test_build_cache_skip_reason_preserves_underlying_error_message() {
+        let reason = build_cache_skip_reason("Artifact not found: foo/bar.json");
+        assert!(reason.starts_with("Artifact not found: foo/bar.json"));
+        assert!(reason.contains("currently unavailable from source"));
+        assert!(reason.contains("rerun migration"));
+    }
+
+    // -----------------------------------------------------------------------
+    // should_skip_cache_only_artifact - additional branch coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_docker_rejects_non_manifest_filenames() {
+        // Docker/OCI repo but path does not match the manifest filename
+        // pattern: must not be skipped (it is a real blob/payload).
+        assert!(!should_skip_cache_only_artifact(
+            "docker-remote-cache",
+            "library/nginx/sha256__abc/config.json"
+        ));
+        assert!(!should_skip_cache_only_artifact(
+            "oci-remote-cache",
+            "library/nginx/sha256__abc/blob.bin"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_docker_rejects_manifest_without_sha256_marker() {
+        // manifest.json filename but no sha256__ in the path: not a cache
+        // manifest, must not be skipped.
+        assert!(!should_skip_cache_only_artifact(
+            "docker-remote-cache",
+            "library/nginx/manifest.json"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_pypi_rejects_non_html() {
+        // PyPI repo but the path is not an .html index file
+        assert!(!should_skip_cache_only_artifact(
+            "pypi-remote-cache",
+            ".pypi/wheel-0.46.2-py3-none-any.whl"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_pypi_rejects_html_outside_pypi_prefix() {
+        // .html file but not inside the `.pypi/` cache directory
+        assert!(!should_skip_cache_only_artifact(
+            "pypi-remote-cache",
+            "docs/index.html"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_cargo_rejects_non_config_files() {
+        // Cargo repo but file is not config.json
+        assert!(!should_skip_cache_only_artifact(
+            "cargo-remote-cache",
+            "1/r/registry.crate"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_debian_metadata_requires_known_repo_family() {
+        // Debian-style metadata filename but the repo key does not look like
+        // a debian/apt/ubuntu/bazel repo: must not be skipped.
+        assert!(!should_skip_cache_only_artifact(
+            "generic-remote-cache",
+            "dists/focal/Release"
+        ));
+        assert!(!should_skip_cache_only_artifact(
+            "maven-remote-cache",
+            "dists/focal/Packages.gz"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_debian_metadata_covers_each_variant() {
+        // Walk every debian-metadata file extension the helper recognises so
+        // each branch of the `is_deb_metadata` chain is exercised.
+        let variants = [
+            "dists/focal/Release",
+            "dists/focal/Release.gpg",
+            "dists/focal/InRelease",
+            "dists/focal/main/binary-amd64/Packages.gz",
+            "dists/focal/main/binary-amd64/Packages.bz2",
+            "dists/focal/main/binary-amd64/Packages.xz",
+            "dists/focal/main/binary-amd64/Packages",
+            "dists/focal/main/binary-amd64/Packages.dir",
+            "dists/focal/Contents.gz",
+            "dists/focal/Contents",
+        ];
+        for path in variants {
+            assert!(
+                should_skip_cache_only_artifact("debian-remote-cache", path),
+                "expected debian metadata variant to be skippable: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_unknown_repo_unknown_path_returns_false() {
+        // Exercises the trailing `false` branch: no Docker/OCI, no PyPI,
+        // no Cargo, no debian-family rule applies.
+        assert!(!should_skip_cache_only_artifact(
+            "maven-remote-cache",
+            "com/example/lib/1.0/lib-1.0.jar"
+        ));
+    }
+
+    #[test]
+    fn test_should_skip_cache_only_artifact_is_repo_key_case_insensitive() {
+        // The helper lowercases the repo key, so mixed-case keys still
+        // route into the docker branch.
+        assert!(should_skip_cache_only_artifact(
+            "Docker-Remote-Cache",
+            "library/nginx/sha256__abc/manifest.json"
+        ));
     }
 
     #[test]
@@ -1366,6 +2458,8 @@ mod tests {
         let result = TransferResult {
             target_path: "libs-release/com/example/lib.jar".to_string(),
             calculated_checksum: Some("abc123def456".to_string()),
+            calculated_sha256: Some("abc123def456".to_string()),
+            calculated_sha1: Some("abc1".to_string()),
             metadata: Some(std::collections::HashMap::from([(
                 "key".to_string(),
                 vec!["value1".to_string(), "value2".to_string()],
@@ -1373,6 +2467,8 @@ mod tests {
         };
         assert_eq!(result.target_path, "libs-release/com/example/lib.jar");
         assert!(result.calculated_checksum.is_some());
+        assert!(result.calculated_sha256.is_some());
+        assert!(result.calculated_sha1.is_some());
         assert!(result.metadata.is_some());
     }
 
@@ -1380,10 +2476,11 @@ mod tests {
     fn test_transfer_result_no_metadata() {
         let result = TransferResult {
             target_path: "repo/file.bin".to_string(),
-            calculated_checksum: None,
-            metadata: None,
+            ..TransferResult::default()
         };
         assert!(result.calculated_checksum.is_none());
+        assert!(result.calculated_sha256.is_none());
+        assert!(result.calculated_sha1.is_none());
         assert!(result.metadata.is_none());
     }
 
@@ -1524,10 +2621,14 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_checksums_match_case_sensitive() {
+    fn test_verify_checksums_match_case_insensitive() {
+        // Updated behavior (issue #856): some registries return digests in
+        // uppercase hex, so the single-digest helper now performs a
+        // case-insensitive comparison to stay in sync with
+        // `verify_expected_checksums`.
         let expected = Some("ABC123".to_string());
         let actual = Some("abc123".to_string());
-        assert!(!verify_checksums_match(true, &expected, &actual));
+        assert!(verify_checksums_match(true, &expected, &actual));
     }
 
     // -----------------------------------------------------------------------
@@ -1693,6 +2794,8 @@ mod tests {
         let result = TransferResult {
             target_path: "repo/artifact.jar".to_string(),
             calculated_checksum: Some("deadbeef".to_string()),
+            calculated_sha256: Some("deadbeef".to_string()),
+            calculated_sha1: None,
             metadata: Some(metadata),
         };
 
@@ -1706,8 +2809,8 @@ mod tests {
     fn test_transfer_result_empty_metadata() {
         let result = TransferResult {
             target_path: "repo/file.bin".to_string(),
-            calculated_checksum: None,
             metadata: Some(std::collections::HashMap::new()),
+            ..TransferResult::default()
         };
         assert!(result.metadata.as_ref().unwrap().is_empty());
     }
@@ -1818,5 +2921,771 @@ mod tests {
             ..WorkerConfig::default()
         };
         assert_eq!(config.batch_size, i64::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_dual_checksums (issue #856)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_dual_checksums_empty_payload() {
+        // Known reference values for the empty string.
+        let (sha256, sha1) = compute_dual_checksums(b"");
+        assert_eq!(
+            sha256,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(sha1, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    }
+
+    #[test]
+    fn test_compute_dual_checksums_known_payload() {
+        // Known reference values for the ASCII string "abc".
+        let (sha256, sha1) = compute_dual_checksums(b"abc");
+        assert_eq!(
+            sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(sha1, "a9993e364706816aba3e25717850c26c9cd0d89d");
+    }
+
+    #[test]
+    fn test_compute_dual_checksums_digest_lengths() {
+        // Guard against algorithm swaps: sha256 hex is 64 chars, sha1 is 40.
+        let (sha256, sha1) = compute_dual_checksums(b"the quick brown fox");
+        assert_eq!(sha256.len(), 64);
+        assert_eq!(sha1.len(), 40);
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_expected_checksums (issue #856)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_verify_expected_checksums_disabled_skips_everything() {
+        // When verification is disabled the function must never report a
+        // mismatch, even if the advertised and computed digests differ.
+        let expected = ExpectedChecksums {
+            sha256: Some("deadbeef".into()),
+            sha1: Some("feedface".into()),
+        };
+        assert!(verify_expected_checksums(false, &expected, Some("00"), Some("00")).is_none());
+    }
+
+    #[test]
+    fn test_verify_expected_checksums_no_expected_values() {
+        // With nothing advertised there's nothing to verify against.
+        let expected = ExpectedChecksums::default();
+        assert!(verify_expected_checksums(true, &expected, Some("abc"), Some("def")).is_none());
+    }
+
+    #[test]
+    fn test_verify_expected_checksums_sha256_match() {
+        let (sha256, sha1) = compute_dual_checksums(b"hello world");
+        let expected = ExpectedChecksums {
+            sha256: Some(sha256.clone()),
+            sha1: None,
+        };
+        assert!(verify_expected_checksums(true, &expected, Some(&sha256), Some(&sha1)).is_none());
+    }
+
+    #[test]
+    fn test_verify_expected_checksums_sha1_only_match() {
+        // Regression test for issue #856: when the source (e.g. Nexus) only
+        // advertises sha1, verification must compare sha1 to sha1. Before
+        // the fix the worker always computed sha256 locally and compared it
+        // against the advertised sha1, guaranteeing a false mismatch.
+        let (_sha256, sha1) = compute_dual_checksums(b"hello world");
+        let expected = ExpectedChecksums {
+            sha256: None,
+            sha1: Some(sha1.clone()),
+        };
+        let result = verify_expected_checksums(
+            true,
+            &expected,
+            Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+            Some(&sha1),
+        );
+        assert!(
+            result.is_none(),
+            "sha1-only match should pass, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_verify_expected_checksums_sha1_only_mismatch_reports_sha1_not_sha256() {
+        // The reporter's log showed "expected <sha1>, got <sha256>". After
+        // the fix, a genuine sha1 mismatch must report algorithms that
+        // actually disagreed, and sha256 must never be compared against an
+        // advertised sha1.
+        let expected = ExpectedChecksums {
+            sha256: None,
+            sha1: Some("0692b094dbd155ac5885d8369b32d4cb8dadf74d".into()),
+        };
+        let (actual_sha256, actual_sha1) = compute_dual_checksums(b"corrupted");
+        let result =
+            verify_expected_checksums(true, &expected, Some(&actual_sha256), Some(&actual_sha1));
+        let message = result.expect("expected a mismatch");
+        assert!(
+            message.contains("sha1"),
+            "expected sha1 mismatch message, got: {}",
+            message
+        );
+        assert!(
+            !message.contains("sha256"),
+            "sha1-only expectation should not mention sha256, got: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn test_verify_expected_checksums_both_advertised_both_match() {
+        let (sha256, sha1) = compute_dual_checksums(b"payload");
+        let expected = ExpectedChecksums {
+            sha256: Some(sha256.clone()),
+            sha1: Some(sha1.clone()),
+        };
+        assert!(verify_expected_checksums(true, &expected, Some(&sha256), Some(&sha1)).is_none());
+    }
+
+    #[test]
+    fn test_verify_expected_checksums_sha256_mismatch_reported_first() {
+        // When both digests are advertised and sha256 is the one that
+        // disagrees, the reported error must call out sha256.
+        let expected = ExpectedChecksums {
+            sha256: Some("00".into()),
+            sha1: Some("11".into()),
+        };
+        let result = verify_expected_checksums(true, &expected, Some("ff"), Some("22"));
+        let msg = result.expect("mismatch");
+        assert!(msg.contains("sha256"), "{}", msg);
+    }
+
+    #[test]
+    fn test_verify_expected_checksums_case_insensitive() {
+        // Nexus and Artifactory have both been observed emitting digests in
+        // uppercase hex on older releases. Comparison must ignore case.
+        let expected = ExpectedChecksums {
+            sha256: None,
+            sha1: Some("DA39A3EE5E6B4B0D3255BFEF95601890AFD80709".into()),
+        };
+        let result = verify_expected_checksums(
+            true,
+            &expected,
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            Some("da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+        );
+        assert!(
+            result.is_none(),
+            "case-insensitive match failed: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_verify_expected_checksums_missing_local_digest_is_mismatch() {
+        // If the source advertises a sha1 but for some reason the worker
+        // has no local sha1, fail loudly instead of silently passing.
+        let expected = ExpectedChecksums {
+            sha256: None,
+            sha1: Some("da39a3ee5e6b4b0d3255bfef95601890afd80709".into()),
+        };
+        let result = verify_expected_checksums(true, &expected, Some("abcd"), None);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_expected_checksums_has_any() {
+        assert!(!ExpectedChecksums::default().has_any());
+        assert!(ExpectedChecksums {
+            sha256: Some("x".into()),
+            sha1: None,
+        }
+        .has_any());
+        assert!(ExpectedChecksums {
+            sha256: None,
+            sha1: Some("y".into()),
+        }
+        .has_any());
+    }
+
+    // -----------------------------------------------------------------------
+    // WorkerConfig.verify_checksums default (issue #856 plumbing)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_worker_config_default_verifies_checksums() {
+        // Verification must be enabled by default so existing users do not
+        // silently accept corrupted artifacts after an upgrade.
+        let config = WorkerConfig::default();
+        assert!(config.verify_checksums);
+    }
+
+    #[test]
+    fn test_worker_config_verify_checksums_can_be_disabled() {
+        let config = WorkerConfig {
+            verify_checksums: false,
+            ..WorkerConfig::default()
+        };
+        assert!(!config.verify_checksums);
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_repos_for_provisioning — pre-pass before create_repository
+    // (the fix for the silent-failure bug: process_job would previously
+    // skip create_repository entirely; now we resolve each requested key
+    // against the source's listing first.)
+    // -----------------------------------------------------------------------
+
+    use crate::services::artifactory_client::RepositoryListItem;
+
+    fn mk_source_repo(key: &str, repo_type: &str, package_type: &str) -> RepositoryListItem {
+        RepositoryListItem {
+            key: key.into(),
+            repo_type: repo_type.into(),
+            package_type: package_type.into(),
+            url: None,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_repos_all_present_and_supported() {
+        let source = vec![
+            mk_source_repo("maven-releases", "LOCAL", "Maven"),
+            mk_source_repo("npm-releases", "LOCAL", "Npm"),
+        ];
+        let requested = vec!["maven-releases".to_string(), "npm-releases".to_string()];
+        let plan = resolve_repos_for_provisioning(&requested, &source);
+        assert_eq!(plan.resolved.len(), 2);
+        assert!(plan.missing.is_empty());
+        assert!(plan.unsupported.is_empty());
+        let resolved_keys: Vec<&str> = plan
+            .resolved
+            .iter()
+            .map(|c| c.target_key.as_str())
+            .collect();
+        assert!(resolved_keys.contains(&"maven-releases"));
+        assert!(resolved_keys.contains(&"npm-releases"));
+    }
+
+    #[test]
+    fn test_resolve_repos_missing_from_source_lands_in_missing_bucket() {
+        let source = vec![mk_source_repo("maven-releases", "LOCAL", "Maven")];
+        let requested = vec!["maven-releases".to_string(), "does-not-exist".to_string()];
+        let plan = resolve_repos_for_provisioning(&requested, &source);
+        assert_eq!(plan.resolved.len(), 1);
+        assert_eq!(plan.missing, vec!["does-not-exist".to_string()]);
+        assert!(plan.unsupported.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_repos_empty_request_yields_empty_plan() {
+        let source = vec![mk_source_repo("maven-releases", "LOCAL", "Maven")];
+        let plan = resolve_repos_for_provisioning(&[], &source);
+        assert!(plan.resolved.is_empty());
+        assert!(plan.missing.is_empty());
+        assert!(plan.unsupported.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_repos_extra_source_repos_are_ignored() {
+        // Source has repos we did NOT request; those should not show up
+        // anywhere in the plan.
+        let source = vec![
+            mk_source_repo("maven-releases", "LOCAL", "Maven"),
+            mk_source_repo("unrequested-repo", "LOCAL", "Generic"),
+        ];
+        let requested = vec!["maven-releases".to_string()];
+        let plan = resolve_repos_for_provisioning(&requested, &source);
+        assert_eq!(plan.resolved.len(), 1);
+        assert_eq!(plan.resolved[0].target_key, "maven-releases");
+        assert!(plan.missing.is_empty());
+        assert!(plan.unsupported.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_repos_unsupported_repo_type_lands_in_unsupported_bucket() {
+        // `prepare_repository_migration` rejects unknown repo types via
+        // RepositoryType::from_artifactory; we surface that here as
+        // `unsupported` rather than panicking or pretending the key is
+        // missing from source.
+        let source = vec![mk_source_repo("weird-repo", "BOGUS_TYPE", "Maven")];
+        let requested = vec!["weird-repo".to_string()];
+        let plan = resolve_repos_for_provisioning(&requested, &source);
+        assert!(plan.resolved.is_empty());
+        assert!(plan.missing.is_empty());
+        assert_eq!(plan.unsupported.len(), 1);
+        assert_eq!(plan.unsupported[0].repo_key, "weird-repo");
+        assert!(!plan.unsupported[0].reason.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_repos_target_key_matches_source_key_by_default() {
+        // We don't currently rename repos; documenting the contract so a
+        // future change that breaks it gets caught here.
+        let source = vec![mk_source_repo("maven-releases", "LOCAL", "Maven")];
+        let requested = vec!["maven-releases".to_string()];
+        let plan = resolve_repos_for_provisioning(&requested, &source);
+        assert_eq!(plan.resolved.len(), 1);
+        let cfg = &plan.resolved[0];
+        assert_eq!(cfg.source_key, "maven-releases");
+        assert_eq!(cfg.target_key, "maven-releases");
+    }
+
+    #[test]
+    fn test_resolve_repos_unsupported_repo_does_not_block_subsequent_repos() {
+        // Mixed batch: 1 valid + 1 unsupported + 1 missing. All three
+        // should reach their respective buckets; the unsupported one
+        // must not short-circuit the loop.
+        let source = vec![
+            mk_source_repo("maven-releases", "LOCAL", "Maven"),
+            mk_source_repo("weird-repo", "BOGUS_TYPE", "Maven"),
+        ];
+        let requested = vec![
+            "maven-releases".to_string(),
+            "weird-repo".to_string(),
+            "missing-repo".to_string(),
+        ];
+        let plan = resolve_repos_for_provisioning(&requested, &source);
+        assert_eq!(plan.resolved.len(), 1);
+        assert_eq!(plan.resolved[0].target_key, "maven-releases");
+        assert_eq!(plan.missing, vec!["missing-repo".to_string()]);
+        assert_eq!(plan.unsupported.len(), 1);
+        assert_eq!(plan.unsupported[0].repo_key, "weird-repo");
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #1512 review fixes -- streaming + verify-before-write
+    // -----------------------------------------------------------------------
+
+    /// Hashing parity: feeding the same bytes through the chunked
+    /// streaming path (one `update` per chunk) must yield the exact same
+    /// hex digest as `compute_dual_checksums` on a single buffer. This is
+    /// the invariant `transfer_artifact` relies on -- if the digests
+    /// diverged between code paths, every checksum verification would
+    /// fail.
+    #[test]
+    fn test_chunked_hashing_matches_buffered_compute_dual_checksums() {
+        // Sample sizes: 1 MiB, 8 MiB, and a non-power-of-two off-by-one
+        // case (1 MiB + 17 bytes) that catches "block boundary" bugs in
+        // chunked hashers.
+        let sizes = [1024 * 1024, 8 * 1024 * 1024, 1024 * 1024 + 17];
+
+        for &size in &sizes {
+            // Deterministic non-zero payload.
+            let mut payload = Vec::with_capacity(size);
+            let mut x: u32 = 0xDEAD_BEEF;
+            for _ in 0..size {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                payload.push((x >> 16) as u8);
+            }
+
+            let (buffered_sha256, buffered_sha1) = compute_dual_checksums(&payload);
+
+            // Now hash the same payload as if it were arriving in
+            // arbitrary-size chunks (mirror what `transfer_artifact` does
+            // on each iteration of its `stream.next()` loop).
+            let mut sha256 = Sha256::new();
+            let mut sha1 = Sha1::new();
+            for chunk in payload.chunks(13 * 1024 + 7) {
+                sha256.update(chunk);
+                sha1.update(chunk);
+            }
+            let chunked_sha256 = hex::encode(sha256.finalize());
+            let chunked_sha1 = hex::encode(sha1.finalize());
+
+            assert_eq!(
+                chunked_sha256, buffered_sha256,
+                "sha256 parity broken at size {}",
+                size
+            );
+            assert_eq!(
+                chunked_sha1, buffered_sha1,
+                "sha1 parity broken at size {}",
+                size
+            );
+        }
+    }
+
+    /// End-to-end-ish test for the verify-before-write ordering fix.
+    /// Runs `transfer_artifact` against a mock source that emits a known
+    /// payload AND advertises a deliberately wrong sha256. The recording
+    /// storage backend must observe ZERO `put_stream` / `put_file` calls
+    /// because the worker should bail out at the checksum-verify step
+    /// BEFORE handing the temp file to storage. Pre-fix, the corrupted
+    /// body was committed to storage and an `artifacts` row was inserted,
+    /// and only THEN was the mismatch detected by `finalize_transfer`.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly when `DATABASE_URL`
+    /// is not set.
+    #[tokio::test]
+    async fn test_transfer_artifact_rejects_mismatch_without_writing_storage() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::artifactory_client::ArtifactoryError;
+        use crate::services::source_registry::ArtifactByteStream;
+        use crate::services::source_registry::SourceRegistry;
+        use async_trait::async_trait;
+        use bytes::Bytes;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        struct ChunkedMockSource;
+
+        #[async_trait]
+        impl SourceRegistry for ChunkedMockSource {
+            async fn ping(&self) -> Result<bool, ArtifactoryError> {
+                Ok(true)
+            }
+            async fn get_version(
+                &self,
+            ) -> Result<crate::services::artifactory_client::SystemVersionResponse, ArtifactoryError>
+            {
+                unimplemented!()
+            }
+            async fn list_repositories(
+                &self,
+            ) -> Result<
+                Vec<crate::services::artifactory_client::RepositoryListItem>,
+                ArtifactoryError,
+            > {
+                Ok(vec![])
+            }
+            async fn list_artifacts(
+                &self,
+                _repo_key: &str,
+                _offset: i64,
+                _limit: i64,
+            ) -> Result<crate::services::artifactory_client::AqlResponse, ArtifactoryError>
+            {
+                unimplemented!()
+            }
+            async fn download_artifact(
+                &self,
+                _repo_key: &str,
+                _path: &str,
+            ) -> Result<Bytes, ArtifactoryError> {
+                Ok(Bytes::from_static(b"some payload here"))
+            }
+            async fn download_artifact_stream(
+                &self,
+                _repo_key: &str,
+                _path: &str,
+            ) -> Result<ArtifactByteStream, ArtifactoryError> {
+                // Emit a known multi-chunk stream so the worker has to
+                // accumulate hashes across iterations.
+                let chunks: Vec<Result<Bytes, ArtifactoryError>> = vec![
+                    Ok(Bytes::from_static(b"hello ")),
+                    Ok(Bytes::from_static(b"world ")),
+                    Ok(Bytes::from_static(b"payload!")),
+                ];
+                Ok(Box::pin(futures::stream::iter(chunks)))
+            }
+            async fn get_properties(
+                &self,
+                _repo_key: &str,
+                _path: &str,
+            ) -> Result<crate::services::artifactory_client::PropertiesResponse, ArtifactoryError>
+            {
+                Ok(crate::services::artifactory_client::PropertiesResponse {
+                    properties: None,
+                    uri: None,
+                })
+            }
+            fn source_type(&self) -> &'static str {
+                "mock"
+            }
+        }
+
+        /// Counts how many times the storage was asked to commit bytes.
+        struct CountingStorage {
+            put_stream_calls: Arc<AtomicUsize>,
+            put_file_calls: Arc<AtomicUsize>,
+            put_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl StorageBackend for CountingStorage {
+            async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+                self.put_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+                Ok(Bytes::new())
+            }
+            async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+                Ok(false)
+            }
+            async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn put_file(
+                &self,
+                _key: &str,
+                _path: &std::path::Path,
+            ) -> crate::error::Result<()> {
+                self.put_file_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn put_stream(
+                &self,
+                _key: &str,
+                _stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+            ) -> crate::error::Result<crate::storage::PutStreamResult> {
+                self.put_stream_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::storage::PutStreamResult {
+                    checksum_sha256: String::new(),
+                    bytes_written: 0,
+                })
+            }
+        }
+
+        let put_stream_calls = Arc::new(AtomicUsize::new(0));
+        let put_file_calls = Arc::new(AtomicUsize::new(0));
+        let put_calls = Arc::new(AtomicUsize::new(0));
+
+        let storage = Arc::new(CountingStorage {
+            put_stream_calls: put_stream_calls.clone(),
+            put_file_calls: put_file_calls.clone(),
+            put_calls: put_calls.clone(),
+        });
+
+        let worker = MigrationWorker::new(
+            pool.clone(),
+            storage,
+            WorkerConfig {
+                verify_checksums: true,
+                dry_run: false,
+                ..WorkerConfig::default()
+            },
+            CancellationToken::new(),
+        );
+
+        // Advertised sha256 deliberately wrong. The real sha256 of
+        // "hello world payload!" is what the worker will compute; we set
+        // expected to something else so verify_expected_checksums returns
+        // Some(mismatch).
+        let expected = ExpectedChecksums {
+            sha256: Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
+            sha1: None,
+        };
+
+        let result = worker
+            .transfer_artifact(
+                Arc::new(ChunkedMockSource),
+                "irrelevant-repo",
+                "generic",
+                "irrelevant/path",
+                false,
+                &expected,
+            )
+            .await;
+
+        // Must fail with ChecksumMismatch, NOT a storage error.
+        match result {
+            Err(MigrationError::ChecksumMismatch { .. }) => {}
+            other => panic!("expected ChecksumMismatch, got {:?}", other),
+        }
+
+        // The critical invariant: storage was never asked to commit the
+        // bytes. Pre-fix, `put_file` would have been called BEFORE
+        // verification.
+        assert_eq!(
+            put_stream_calls.load(Ordering::SeqCst),
+            0,
+            "put_stream must not run when checksum mismatches"
+        );
+        assert_eq!(
+            put_file_calls.load(Ordering::SeqCst),
+            0,
+            "put_file must not run when checksum mismatches"
+        );
+        assert_eq!(
+            put_calls.load(Ordering::SeqCst),
+            0,
+            "put must not run when checksum mismatches"
+        );
+    }
+
+    /// Companion to the above: when checksums match, the worker
+    /// proceeds to call `put_stream` (NOT `put_file`). The PR review
+    /// blocker was that the worker called `put_file`, whose trait
+    /// default loaded the whole file into memory. After the fix the
+    /// migration path must invoke each backend's streaming primitive.
+    #[tokio::test]
+    async fn test_transfer_artifact_uses_put_stream_on_happy_path() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::artifactory_client::ArtifactoryError;
+        use crate::services::source_registry::ArtifactByteStream;
+        use crate::services::source_registry::SourceRegistry;
+        use async_trait::async_trait;
+        use bytes::Bytes;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        struct ChunkedMockSource;
+        #[async_trait]
+        impl SourceRegistry for ChunkedMockSource {
+            async fn ping(&self) -> Result<bool, ArtifactoryError> {
+                Ok(true)
+            }
+            async fn get_version(
+                &self,
+            ) -> Result<crate::services::artifactory_client::SystemVersionResponse, ArtifactoryError>
+            {
+                unimplemented!()
+            }
+            async fn list_repositories(
+                &self,
+            ) -> Result<
+                Vec<crate::services::artifactory_client::RepositoryListItem>,
+                ArtifactoryError,
+            > {
+                Ok(vec![])
+            }
+            async fn list_artifacts(
+                &self,
+                _r: &str,
+                _o: i64,
+                _l: i64,
+            ) -> Result<crate::services::artifactory_client::AqlResponse, ArtifactoryError>
+            {
+                unimplemented!()
+            }
+            async fn download_artifact(
+                &self,
+                _r: &str,
+                _p: &str,
+            ) -> Result<Bytes, ArtifactoryError> {
+                Ok(Bytes::from_static(b"x"))
+            }
+            async fn download_artifact_stream(
+                &self,
+                _r: &str,
+                _p: &str,
+            ) -> Result<ArtifactByteStream, ArtifactoryError> {
+                let chunks: Vec<Result<Bytes, ArtifactoryError>> =
+                    vec![Ok(Bytes::from_static(b"abc"))];
+                Ok(Box::pin(futures::stream::iter(chunks)))
+            }
+            async fn get_properties(
+                &self,
+                _r: &str,
+                _p: &str,
+            ) -> Result<crate::services::artifactory_client::PropertiesResponse, ArtifactoryError>
+            {
+                Ok(crate::services::artifactory_client::PropertiesResponse {
+                    properties: None,
+                    uri: None,
+                })
+            }
+            fn source_type(&self) -> &'static str {
+                "mock"
+            }
+        }
+
+        struct CountingStorage {
+            put_stream_calls: Arc<AtomicUsize>,
+            put_file_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl StorageBackend for CountingStorage {
+            async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+                Ok(Bytes::new())
+            }
+            async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+                Ok(false)
+            }
+            async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn put_file(
+                &self,
+                _key: &str,
+                _path: &std::path::Path,
+            ) -> crate::error::Result<()> {
+                self.put_file_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn put_stream(
+                &self,
+                _key: &str,
+                mut stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+            ) -> crate::error::Result<crate::storage::PutStreamResult> {
+                use futures::StreamExt;
+                self.put_stream_calls.fetch_add(1, Ordering::SeqCst);
+                let mut total = 0u64;
+                while let Some(c) = stream.next().await {
+                    total += c?.len() as u64;
+                }
+                Ok(crate::storage::PutStreamResult {
+                    checksum_sha256: String::new(),
+                    bytes_written: total,
+                })
+            }
+        }
+
+        let put_stream_calls = Arc::new(AtomicUsize::new(0));
+        let put_file_calls = Arc::new(AtomicUsize::new(0));
+        let storage = Arc::new(CountingStorage {
+            put_stream_calls: put_stream_calls.clone(),
+            put_file_calls: put_file_calls.clone(),
+        });
+
+        let worker = MigrationWorker::new(
+            pool.clone(),
+            storage,
+            WorkerConfig {
+                verify_checksums: true,
+                dry_run: false,
+                ..WorkerConfig::default()
+            },
+            CancellationToken::new(),
+        );
+
+        // No expected checksums -> verification passes; worker proceeds
+        // through the storage write path.
+        let expected = ExpectedChecksums {
+            sha256: None,
+            sha1: None,
+        };
+
+        let _ = worker
+            .transfer_artifact(
+                Arc::new(ChunkedMockSource),
+                "irrelevant-repo",
+                "generic",
+                "irrelevant/path",
+                false,
+                &expected,
+            )
+            .await;
+
+        // The migration path must use put_stream (the streaming upload
+        // primitive on each backend). put_file must NOT be invoked, since
+        // its trait default in this mock would buffer the whole body.
+        assert_eq!(
+            put_stream_calls.load(Ordering::SeqCst),
+            1,
+            "transfer_artifact must call put_stream once on the happy path"
+        );
+        assert_eq!(
+            put_file_calls.load(Ordering::SeqCst),
+            0,
+            "transfer_artifact must NOT call put_file (would buffer on cloud backends)"
+        );
     }
 }

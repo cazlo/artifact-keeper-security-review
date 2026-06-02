@@ -8,7 +8,7 @@ use cron::Schedule;
 use sqlx::PgPool;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, MissedTickBehavior};
 
 use crate::config::Config;
 use crate::services::analytics_service::AnalyticsService;
@@ -16,6 +16,8 @@ use crate::services::backup_service::{BackupService, BackupType, CreateBackupReq
 use crate::services::health_monitor_service::{HealthMonitorService, MonitorConfig};
 use crate::services::lifecycle_service::LifecycleService;
 use crate::services::metrics_service;
+use crate::services::scan_result_service::ScanResultService;
+use crate::services::smtp_service::SmtpService;
 use crate::services::storage_service::StorageService;
 use crate::services::sync_policy_service::SyncPolicyService;
 
@@ -28,6 +30,19 @@ struct GaugeStats {
     pub users: i64,
 }
 
+/// Per-replica startup-delay jitter (PR #1212 audit, M2).
+///
+/// Returns a `Duration` equal to `base_secs + uniform(0, 30)` seconds.
+/// Multiple replicas spawned by the same Helm release start within a
+/// few milliseconds of each other and would otherwise fire their first
+/// tick at the same instant; the jitter spreads them across a 30 s
+/// window so audit-log writes and metric upticks de-synchronize, even
+/// in the legitimate case where the advisory lock briefly contends.
+fn jittered_startup_delay(base_secs: u64) -> Duration {
+    let jitter = rand::random::<u64>() % 30;
+    Duration::from_secs(base_secs.saturating_add(jitter))
+}
+
 /// Spawn all background scheduler tasks.
 /// Returns join handles for graceful shutdown (not currently used, fire-and-forget).
 pub fn spawn_all(
@@ -35,6 +50,7 @@ pub fn spawn_all(
     config: Config,
     _primary_storage: Arc<dyn crate::storage::StorageBackend>,
     storage_registry: Arc<crate::storage::StorageRegistry>,
+    smtp_service: Option<Arc<SmtpService>>,
 ) {
     // Daily metrics snapshot (runs every hour, captures once per day via UPSERT)
     {
@@ -70,6 +86,61 @@ pub fn spawn_all(
                 ticker.tick().await;
                 if let Err(e) = update_gauge_metrics(&db).await {
                     tracing::warn!("Failed to update gauge metrics: {}", e);
+                }
+            }
+        });
+    }
+
+    // API-token cache invalidation map prune (every hour).
+    //
+    // The invalidation map records when each user's API-token cache entries
+    // were marked stale. Entries older than 2 * API_TOKEN_CACHE_TTL_SECS
+    // (10 min) are no longer needed because any cache entry they would
+    // reject has itself expired. Pruning during invalidate_user_token_cache_entries
+    // covers the high-churn case; this periodic task keeps memory bounded
+    // when deactivations are infrequent. Issue #931.
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let mut ticker = interval(Duration::from_secs(3600)); // 1 hour
+
+        loop {
+            ticker.tick().await;
+            let dropped = crate::services::auth_service::prune_stale_user_token_invalidations();
+            if dropped > 0 {
+                tracing::debug!(
+                    "Pruned {} stale API-token cache invalidation entries",
+                    dropped
+                );
+            }
+        }
+    });
+
+    // Refresh-token jti table cleanup (every hour). Drops rows whose
+    // underlying refresh JWT expired more than the grace window ago. The
+    // grace allows admins / forensics to inspect recently-replayed tokens
+    // (their `revoked_at` row would otherwise vanish the moment the JWT
+    // expired). Issue #1174.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            let mut ticker = interval(Duration::from_secs(3600)); // 1 hour
+            let grace = chrono::Duration::hours(24);
+
+            loop {
+                ticker.tick().await;
+                match crate::services::auth_service::AuthService::cleanup_expired_refresh_token_jti(
+                    &db, grace,
+                )
+                .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::debug!("Pruned {} expired refresh_token_jti rows", n);
+                    }
+                    Err(e) => {
+                        tracing::warn!("refresh_token_jti cleanup failed: {}", e);
+                    }
                 }
             }
         });
@@ -136,6 +207,56 @@ pub fn spawn_all(
                     }
                     Err(e) => {
                         tracing::warn!("Lifecycle policy execution failed: {}", e);
+                    }
+                }
+            }
+        });
+    }
+
+    // Stuck-scan janitor (every `stuck_scan_check_interval_secs`, default 10 min).
+    //
+    // Pre-allocated `scan_results` rows can be left wedged in `status='running'`
+    // when the scan worker crashes mid-flight (OOM, pod evicted, panic, deploy
+    // mid-scan). Without this sweep they accumulate forever, polluting
+    // dashboards and the dedup path. Reaps rows whose `started_at` predates
+    // `stuck_scan_threshold_secs` (issue #1015).
+    //
+    // Multi-replica safety (PR #1212 audit, H3): `cleanup_stuck_scans_with_limit`
+    // takes `pg_try_advisory_xact_lock(STUCK_SCAN_LOCK_ID)` inside the
+    // reap transaction so only one replica writes audit rows per tick. The
+    // startup delay is jittered (M2) so replicas do not contend on the
+    // very first tick. `MissedTickBehavior::Delay` keeps the cadence
+    // honest when a tick takes longer than the interval (large backlog).
+    {
+        let db = db.clone();
+        let threshold_secs = config.stuck_scan_threshold_secs;
+        let check_secs = config.stuck_scan_check_interval_secs;
+        let reap_limit = config.stuck_scan_reap_limit;
+        tokio::spawn(async move {
+            tokio::time::sleep(jittered_startup_delay(90)).await;
+            let service = ScanResultService::new(db);
+            let mut ticker = interval(Duration::from_secs(check_secs));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            loop {
+                ticker.tick().await;
+                tracing::debug!("Sweeping for stuck 'running' scan_results rows");
+
+                match service
+                    .cleanup_stuck_scans_with_limit(Duration::from_secs(threshold_secs), reap_limit)
+                    .await
+                {
+                    Ok(reaped) if reaped > 0 => {
+                        tracing::info!(
+                            "Stuck-scan janitor: reaped {} orphaned scan_results rows (threshold: {}s)",
+                            reaped,
+                            threshold_secs,
+                        );
+                        metrics_service::record_cleanup("stuck_scans", reaped);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Stuck-scan janitor sweep failed: {}", e);
                     }
                 }
             }
@@ -256,6 +377,26 @@ pub fn spawn_all(
         });
     }
 
+    // Webhook previous-secret cleanup (every 10 minutes). Clears the
+    // overlap-window ciphertext once the rotation grace period expires.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let mut ticker = interval(Duration::from_secs(600));
+            loop {
+                ticker.tick().await;
+                match crate::api::handlers::webhooks::cleanup_expired_previous_secrets(&db).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::info!("Cleared {} expired webhook previous-secret entries", n)
+                    }
+                    Err(e) => tracing::warn!("Webhook previous-secret cleanup failed: {}", e),
+                }
+            }
+        });
+    }
+
     // Curation upstream metadata sync (checks every 5 minutes for repos due for sync)
     {
         let db = db.clone();
@@ -298,8 +439,84 @@ pub fn spawn_all(
         });
     }
 
+    // Password expiry notifications (configurable interval, default: hourly)
+    if config.password_expiry_days > 0 {
+        if let Some(smtp) = smtp_service {
+            let db = db.clone();
+            let expiry_days = config.password_expiry_days;
+            let warning_tiers = config.password_expiry_warning_days.clone();
+            let check_secs = config.password_expiry_check_interval_secs;
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let mut ticker = interval(Duration::from_secs(check_secs));
+
+                loop {
+                    ticker.tick().await;
+                    tracing::debug!("Checking for password expiry notifications");
+
+                    match crate::services::password_expiry_service::send_expiry_notifications(
+                        &db,
+                        &smtp,
+                        expiry_days,
+                        &warning_tiers,
+                    )
+                    .await
+                    {
+                        Ok(count) if count > 0 => {
+                            tracing::info!("Sent {} password expiry notification(s)", count,);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Password expiry notification check failed: {}", e);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            tracing::info!(
+                "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, password expiry notifications"
+            );
+        } else {
+            tracing::info!(
+                "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup (password expiry notifications skipped: SMTP not configured)"
+            );
+        }
+    } else {
+        tracing::info!(
+            "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup"
+        );
+    }
+    // Download-ticket cleanup (every 10 minutes).
+    //
+    // Tickets self-expire on use via `expires_at > NOW()` in
+    // `validate_download_ticket`, so this is hygiene rather than correctness.
+    // 30-second TTL plus high churn means rows accumulate quickly under load
+    // even though each row is small. A 10-minute cadence keeps the table from
+    // unbounded growth without spamming the database.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let mut ticker = interval(Duration::from_secs(600)); // 10 minutes
+
+            loop {
+                ticker.tick().await;
+                tracing::debug!("Cleaning up expired download tickets");
+
+                match crate::services::auth_config_service::AuthConfigService::cleanup_expired_download_tickets(&db).await {
+                    Ok(count) if count > 0 => {
+                        tracing::debug!("Cleaned up {} expired download tickets", count);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Download ticket cleanup failed: {}", e);
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
     tracing::info!(
-        "Background schedulers started: metrics, health monitor, lifecycle, backup schedules, sync policies, webhook retries, curation sync, upload cleanup"
+        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup"
     );
 }
 

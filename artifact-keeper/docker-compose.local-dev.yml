@@ -17,7 +17,7 @@
 #   Backend gRPC:   9090
 #   Web UI:         3000
 #   Postgres:       30432
-#   Meilisearch:    7700
+#   OpenSearch:     9200
 #   Trivy:          8090
 #   OpenSCAP:       8091
 #   Dependency-Track: 8092
@@ -44,21 +44,24 @@ services:
       retries: 5
     restart: unless-stopped
 
-  meilisearch:
-    image: getmeili/meilisearch:v1.12
-    container_name: artifact-keeper-dev-meilisearch
+  opensearch:
+    image: opensearchproject/opensearch:2.19.1
+    container_name: artifact-keeper-dev-opensearch
     environment:
-      MEILI_MASTER_KEY: artifact-keeper-dev-key
-      MEILI_ENV: development
+      discovery.type: single-node
+      OPENSEARCH_JAVA_OPTS: "-Xms256m -Xmx256m"
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
     volumes:
-      - dev_meilisearch_data:/meili_data
+      - dev_opensearch_data:/usr/share/opensearch/data
     ports:
-      - "7700:7700"
+      - "9200:9200"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
       interval: 10s
-      timeout: 5s
-      retries: 5
+      timeout: 10s
+      retries: 12
+      start_period: 30s
     restart: unless-stopped
 
   trivy:
@@ -87,7 +90,7 @@ services:
     restart: unless-stopped
 
   dependency-track-apiserver:
-    image: dependencytrack/apiserver:4.11.4
+    image: dependencytrack/apiserver:4.14.2
     container_name: artifact-keeper-dev-dtrack-api
     depends_on:
       postgres:
@@ -112,16 +115,10 @@ services:
       - dev_dtrack_data:/data
     ports:
       - "8092:8080"
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/api/version"]
-      interval: 30s
-      timeout: 10s
-      start_period: 60s
-      retries: 5
     restart: unless-stopped
 
   jaeger:
-    image: jaegertracing/all-in-one:1.62
+    image: jaegertracing/all-in-one:1.62.0
     container_name: artifact-keeper-dev-jaeger
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
@@ -144,6 +141,8 @@ services:
       - dev_shared_config:/shared
     entrypoint: ["/bin/sh", "/init-dtrack.sh"]
     restart: "no"
+    healthcheck:
+      disable: true
 
   # Backend with hot-reload using cargo-watch
   backend:
@@ -154,7 +153,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      meilisearch:
+      opensearch:
         condition: service_healthy
     entrypoint:
       - /bin/sh
@@ -177,11 +176,20 @@ services:
       TRIVY_URL: http://trivy:8090
       OPENSCAP_URL: http://openscap:8091
       SCAN_WORKSPACE_PATH: /scan-workspace
-      MEILISEARCH_URL: http://meilisearch:7700
-      MEILISEARCH_API_KEY: artifact-keeper-dev-key
+      OPENSEARCH_URL: http://opensearch:9200
       DEPENDENCY_TRACK_URL: http://dependency-track-apiserver:8080
       DEPENDENCY_TRACK_ENABLED: "true"
       ALLOW_HTTP_INTEGRATIONS: "1"
+      # Webhooks v2 signing-secret encryption key. 32 bytes, base64 encoded.
+      # Generate once for your local stack with: openssl rand -base64 32,
+      # then export AK_WEBHOOK_SECRET_KEY before docker compose up. The
+      # placeholder below is intentionally invalid base64 so the backend
+      # ensure_configured check fails fast with a clear error rather than
+      # silently running with a shared dev key.
+      AK_WEBHOOK_SECRET_KEY: ${AK_WEBHOOK_SECRET_KEY:-REPLACE_ME_WITH_OUTPUT_OF_openssl_rand_base64_32}
+      # Webhooks v2 producer is off by default; enable after rotating
+      # migrated webhook secrets to avoid duplicate delivery from System B.
+      WEBHOOKS_V2_PRODUCER_ENABLED: ${WEBHOOKS_V2_PRODUCER_ENABLED:-false}
       # Forward host proxy settings so the backend can reach external services
       # through a corporate proxy. reqwest honours these natively.
       HTTP_PROXY: ${HTTP_PROXY:-}
@@ -189,7 +197,7 @@ services:
       ALL_PROXY: ${ALL_PROXY:-}
       # Prevent host proxy settings from intercepting container-to-container
       # traffic on the compose network. See docker-compose.yml for details.
-      no_proxy: "${NO_PROXY:-},localhost,127.0.0.1,db,postgres,meilisearch,trivy,openscap,dependency-track-apiserver"
+      no_proxy: "${NO_PROXY:-},localhost,127.0.0.1,db,postgres,opensearch,trivy,openscap,dependency-track-apiserver"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
       OTEL_SERVICE_NAME: artifact-keeper
       HOST: 0.0.0.0
@@ -215,17 +223,24 @@ services:
     ports:
       - "8080:8080"
       - "9090:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
     restart: unless-stopped
 
   # Web frontend with hot-reload using next dev
   # Set WEB_PATH env var if artifact-keeper-web is not at ../artifact-keeper-web
   web:
     build:
-      context: ${WEB_PATH:-/Users/khan/artifact-keeper-web}
+      context: ${WEB_PATH:-../artifact-keeper-web}
       dockerfile: Dockerfile.dev
     container_name: artifact-keeper-dev-web
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8080
       BACKEND_URL: http://backend:8080
@@ -233,13 +248,13 @@ services:
       WATCHPACK_POLLING: "true"
     volumes:
       # Mount source code for hot-reload
-      - ${WEB_PATH:-/Users/khan/artifact-keeper-web}/src:/app/src:cached
-      - ${WEB_PATH:-/Users/khan/artifact-keeper-web}/public:/app/public:cached
-      - ${WEB_PATH:-/Users/khan/artifact-keeper-web}/next.config.ts:/app/next.config.ts:cached
-      - ${WEB_PATH:-/Users/khan/artifact-keeper-web}/tailwind.config.ts:/app/tailwind.config.ts:cached
-      - ${WEB_PATH:-/Users/khan/artifact-keeper-web}/tsconfig.json:/app/tsconfig.json:cached
-      - ${WEB_PATH:-/Users/khan/artifact-keeper-web}/components.json:/app/components.json:cached
-      - ${WEB_PATH:-/Users/khan/artifact-keeper-web}/postcss.config.mjs:/app/postcss.config.mjs:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/src:/app/src:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/public:/app/public:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/next.config.ts:/app/next.config.ts:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/tailwind.config.ts:/app/tailwind.config.ts:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/tsconfig.json:/app/tsconfig.json:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/components.json:/app/components.json:cached
+      - ${WEB_PATH:-../artifact-keeper-web}/postcss.config.mjs:/app/postcss.config.mjs:cached
       # Exclude node_modules (use container's own)
       - dev_web_node_modules:/app/node_modules
     ports:
@@ -248,7 +263,7 @@ services:
 
 volumes:
   dev_postgres_data:
-  dev_meilisearch_data:
+  dev_opensearch_data:
   dev_trivy_cache:
   dev_dtrack_data:
   dev_shared_config:

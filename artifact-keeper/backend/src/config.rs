@@ -11,6 +11,74 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// Minimum reap-threshold for the stuck-scan janitor.
+///
+/// `STUCK_SCAN_THRESHOLD_SECS=0` would match every `running` row on every
+/// tick (the SQL becomes `started_at < NOW() - interval '0'`), reaping
+/// healthy in-flight scans. A 60 s floor still lets operators configure
+/// very aggressive reaping for fast-scan workloads while rejecting the
+/// degenerate-zero misconfiguration.
+const STUCK_SCAN_THRESHOLD_FLOOR_SECS: u64 = 60;
+
+/// Minimum tick interval for the stuck-scan janitor.
+///
+/// `tokio::time::interval(Duration::from_secs(0))` panics, so a zero value
+/// kills the spawned scheduler task at startup with no operator-visible
+/// signal beyond a tokio panic in logs. A 30 s floor is well below the
+/// 600 s default and matches the cadence of the existing lifecycle
+/// scheduler.
+const STUCK_SCAN_INTERVAL_FLOOR_SECS: u64 = 30;
+
+fn clamp_stuck_scan_threshold(value: u64) -> u64 {
+    if value < STUCK_SCAN_THRESHOLD_FLOOR_SECS {
+        tracing::warn!(
+            value,
+            floor = STUCK_SCAN_THRESHOLD_FLOOR_SECS,
+            "STUCK_SCAN_THRESHOLD_SECS below floor; clamping to floor"
+        );
+        STUCK_SCAN_THRESHOLD_FLOOR_SECS
+    } else {
+        value
+    }
+}
+
+fn clamp_stuck_scan_interval(value: u64) -> u64 {
+    if value < STUCK_SCAN_INTERVAL_FLOOR_SECS {
+        tracing::warn!(
+            value,
+            floor = STUCK_SCAN_INTERVAL_FLOOR_SECS,
+            "STUCK_SCAN_CHECK_INTERVAL_SECS below floor; clamping to floor"
+        );
+        STUCK_SCAN_INTERVAL_FLOOR_SECS
+    } else {
+        value
+    }
+}
+
+/// Default cap for concurrent bcrypt-bound auth operations.
+///
+/// bcrypt-cost-12 is CPU-bound and takes roughly 100-300 ms per verify; once
+/// in-flight verifies exceed `8 * cores`, additional requests queue behind a
+/// saturated blocking-thread pool and the rest of the API starves.
+///
+/// The floor of 32 (raised from 8 in #1437/#1442 — see CHANGELOG) keeps
+/// low-core CI runners from shedding modest concurrent basic-auth load:
+/// previously a 2-core CI runner capped at 8 concurrent bcrypts, so a
+/// `cargo publish` job that issued 20 parallel requests would fail 12 of
+/// them with 503 (counted as "5xx" by upstream stress tests). The 8x
+/// multiplier keeps large machines from being capped artificially low.
+///
+/// Combined with the 3 s queue tolerance in
+/// [`acquire_auth_permit_for_bcrypt`](crate::services::auth_service)
+/// requests now *briefly wait* for a slot instead of failing instantly,
+/// so a burst of 50 concurrent verifies at cap=32 settles cleanly.
+fn default_auth_max_concurrency() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    std::cmp::max(32, cores.saturating_mul(8))
+}
+
 /// Application configuration
 #[derive(Clone)]
 pub struct Config {
@@ -77,17 +145,33 @@ pub struct Config {
     /// OpenSCAP SCAP profile to evaluate (default: standard)
     pub openscap_profile: String,
 
-    /// Meilisearch URL for search indexing (optional)
-    pub meilisearch_url: Option<String>,
+    /// OpenSearch URL for search indexing (optional)
+    pub opensearch_url: Option<String>,
 
-    /// Meilisearch API key
-    pub meilisearch_api_key: Option<String>,
+    /// OpenSearch username for authentication (optional)
+    pub opensearch_username: Option<String>,
+
+    /// OpenSearch password for authentication (optional)
+    pub opensearch_password: Option<String>,
+
+    /// Allow invalid TLS certificates when connecting to OpenSearch (default: false)
+    pub opensearch_allow_invalid_certs: bool,
 
     /// Path for scan workspace shared with Trivy
     pub scan_workspace_path: String,
 
     /// Demo mode: blocks all write operations (POST/PUT/DELETE/PATCH) except auth
     pub demo_mode: bool,
+
+    /// When true (default), unauthenticated requests are allowed to reach
+    /// public repositories and other endpoints that explicitly opt in to
+    /// optional auth. When false, every request that hits a route protected
+    /// by `optional_auth_middleware` or `repo_visibility_middleware` must
+    /// resolve a valid `AuthExtension`, otherwise the `guest_access_guard`
+    /// returns 401. A small allowlist (login, refresh, setup status,
+    /// /api/v1/system/config, health probes, OCI /v2/ challenge) is always
+    /// permitted so users can authenticate and clients can negotiate.
+    pub guest_access_enabled: bool,
 
     /// Peer instance name for mesh identification
     pub peer_instance_name: String,
@@ -101,6 +185,18 @@ pub struct Config {
     /// Dependency-Track API URL for vulnerability management (optional)
     pub dependency_track_url: Option<String>,
 
+    /// Whether the Dependency-Track integration is enabled.
+    ///
+    /// This is the single source of truth for "is DT wired up?".
+    /// Controlled by the `DEPENDENCY_TRACK_ENABLED` env var. When `false`
+    /// (the default), no part of the backend will contact Dependency-Track:
+    /// the service is not initialized, the periodic health monitor skips
+    /// its probe, and the `/api/v1/system/config` endpoint reports it as
+    /// disabled so the frontend can render a consistent "disabled" state
+    /// instead of mixing "disabled" with "unavailable" messages
+    /// (issues #1395 and #1480).
+    pub dependency_track_enabled: bool,
+
     /// OpenTelemetry OTLP endpoint (optional, enables OTel when set).
     pub otel_exporter_otlp_endpoint: Option<String>,
 
@@ -112,6 +208,25 @@ pub struct Config {
 
     /// How often (in seconds) the lifecycle scheduler checks for due policies.
     pub lifecycle_check_interval_secs: u64,
+
+    /// Threshold (in seconds) before a `scan_results` row stuck in
+    /// `status='running'` is considered orphaned by the janitor and
+    /// transitioned to `failed`. Default 1800 (30 minutes); raise this above
+    /// the slowest expected scan (issue #1015).
+    pub stuck_scan_threshold_secs: u64,
+
+    /// How often (in seconds) the stuck-scan janitor sweeps for orphaned
+    /// `running` rows. Default 600 (10 minutes).
+    pub stuck_scan_check_interval_secs: u64,
+
+    /// Maximum rows the stuck-scan janitor reaps per tick.
+    ///
+    /// Operators with a large post-outage backlog can tune this up so the
+    /// queue drains faster; environments with a small workload can tune
+    /// it down so a single tick costs less. Clamped to `[1, 10_000]` at
+    /// startup (see [`crate::services::scan_result_service::clamp_stuck_scan_reap_limit`]).
+    /// Env var: `STUCK_SCAN_REAP_LIMIT`. Default: 1000. PR #1212 audit M1.
+    pub stuck_scan_reap_limit: i64,
 
     /// Maximum upload size in bytes for artifact uploads.
     /// Defaults to 10 GB (10737418240 bytes). Set to 0 to disable the limit.
@@ -134,6 +249,168 @@ pub struct Config {
     /// **Security note:** ensure this port is not reachable from untrusted
     /// networks (e.g. restrict via firewall or Kubernetes NetworkPolicy).
     pub metrics_port: Option<u16>,
+
+    /// Maximum number of connections in the PostgreSQL pool.
+    /// Defaults to 20. Increase for higher concurrency, decrease for
+    /// databases with restricted connection budgets (e.g., shared RDS).
+    pub database_max_connections: u32,
+
+    /// Minimum number of idle connections kept in the PostgreSQL pool.
+    /// Defaults to 5. Set to 0 to allow the pool to scale down completely.
+    pub database_min_connections: u32,
+
+    /// Timeout in seconds for acquiring a connection from the pool before
+    /// returning an error. Defaults to 5. Kept short so that callers fail fast
+    /// under sustained pool exhaustion instead of piling up; raise for batch
+    /// workloads where waiting is preferable to retrying.
+    pub database_acquire_timeout_secs: u64,
+
+    /// Maximum number of bcrypt-bound auth operations (login,
+    /// password verification, API-token verification) allowed to run
+    /// concurrently across the process. Acts as a fast-fail load shed:
+    /// when saturated, additional requests receive 503 Service Unavailable
+    /// with `Retry-After` instead of queueing on the blocking-task pool
+    /// and starving the rest of the API.
+    ///
+    /// Defaults to `max(8, 4 * num_cpus)`. Set to 0 to disable the limit
+    /// (legacy behaviour, not recommended in production).
+    pub auth_max_concurrency: usize,
+
+    /// Idle timeout in seconds. Connections idle longer than this will be
+    /// closed. Defaults to 600 (10 minutes).
+    pub database_idle_timeout_secs: u64,
+
+    /// Maximum lifetime in seconds for a pooled connection. Connections
+    /// older than this are recycled even if still healthy. Defaults to
+    /// 1800 (30 minutes). Useful when the database has a connection
+    /// lifetime policy or when running behind a TCP load balancer with an
+    /// idle disconnect.
+    pub database_max_lifetime_secs: u64,
+
+    pub rate_limit_auth_per_window: u32,
+    pub rate_limit_api_per_window: u32,
+    pub rate_limit_search_per_window: u32,
+    /// Per-IP requests-per-window cap on endpoints that mint presigned
+    /// download URLs. Stricter than the API bucket because the presign
+    /// path is O(1) memory per request: an attacker can issue many
+    /// concurrent requests from a single host without backend memory
+    /// pressure, but each minted URL becomes a separate egress out of
+    /// the storage backend the attacker can drive in parallel. See
+    /// #1053. Env var: `RATE_LIMIT_PRESIGN_PER_MIN`. Default: 30.
+    pub rate_limit_presign_per_window: u32,
+    /// Maximum self-password-change attempts per user per
+    /// `rate_limit_password_change_window_secs`. Tighter than the global API
+    /// bucket because `POST /users/:id/password` verifies the current
+    /// password via bcrypt, so an attacker who already holds a victim's JWT
+    /// can otherwise grind 100+ password guesses per minute against the
+    /// account through this endpoint. See #1026. Env var:
+    /// `RATE_LIMIT_PASSWORD_CHANGE_PER_WINDOW`. Default: 5.
+    pub rate_limit_password_change_per_window: u32,
+    /// Window length for the password-change limiter, in seconds. Decoupled
+    /// from `rate_limit_window_secs` (which is typically 60) so the password
+    /// bucket can use a longer, lockout-style window (default 15 minutes).
+    /// Env var: `RATE_LIMIT_PASSWORD_CHANGE_WINDOW_SECS`. Default: 900.
+    pub rate_limit_password_change_window_secs: u64,
+    pub rate_limit_window_secs: u64,
+    pub rate_limit_exempt_usernames: Vec<String>,
+    pub rate_limit_exempt_service_accounts: bool,
+    /// Comma-separated list of CIDR ranges whose source IPs bypass rate
+    /// limiting. Intended for trusted internal callers (sidecar probes,
+    /// service-mesh nodes, in-cluster CI runners). Applies to authed and
+    /// unauthed requests alike. See #969.
+    /// Env var: `RATE_LIMIT_TRUSTED_CIDRS`. Default: empty.
+    /// Example: `10.0.0.0/8,fc00::/7,127.0.0.1/32`.
+    pub rate_limit_trusted_cidrs: Vec<crate::api::middleware::rate_limit::CidrRange>,
+
+    /// Number of consecutive failed login attempts before a local account is
+    /// locked. Set to 0 to disable account lockout. Default: 5.
+    pub account_lockout_threshold: u32,
+
+    /// Duration in minutes that a locked account remains locked before the
+    /// user can try again. Default: 30.
+    pub account_lockout_duration_minutes: i64,
+
+    /// When true, newly uploaded artifacts are held in quarantine until
+    /// security scanning completes or the hold period expires. Repositories
+    /// can override this via repository_config keys. Default: false.
+    pub quarantine_enabled: bool,
+
+    /// Default quarantine hold period in minutes. Repositories can override
+    /// this via repository_config keys. Default: 60.
+    pub quarantine_duration_minutes: i64,
+
+    /// Number of previous passwords to remember per user. When a user changes
+    /// their password, the new password is checked against the last N hashes
+    /// and rejected if it matches any of them. Set to 0 to disable password
+    /// history checking. Default: 0 (disabled).
+    pub password_history_count: u32,
+
+    /// Number of days after which a local user's password expires and must
+    /// be changed. Set to 0 to disable password expiration. Default: 0.
+    pub password_expiry_days: u32,
+
+    /// Comma-separated list of day thresholds at which expiry warning emails
+    /// are sent to local users. Only effective when `password_expiry_days` > 0
+    /// and SMTP is configured. Default: "14,7,1".
+    pub password_expiry_warning_days: Vec<u32>,
+
+    /// How often (in seconds) the password expiry notification job runs.
+    /// Default: 3600 (1 hour).
+    pub password_expiry_check_interval_secs: u64,
+
+    // -- Password policy (local users) --
+    /// Minimum password length (default: 8).
+    pub password_min_length: usize,
+
+    /// Maximum password length (default: 128).
+    pub password_max_length: usize,
+
+    /// Require at least one uppercase letter (default: false).
+    pub password_require_uppercase: bool,
+
+    /// Require at least one lowercase letter (default: false).
+    pub password_require_lowercase: bool,
+
+    /// Require at least one digit (default: false).
+    pub password_require_digit: bool,
+
+    /// Require at least one special character (default: false).
+    pub password_require_special: bool,
+
+    /// Minimum zxcvbn strength score (0 = disabled, 1-4 = increasingly strict).
+    /// When set to a value > 0, passwords are evaluated by the zxcvbn estimator
+    /// and must meet or exceed the given score.
+    pub password_min_strength: u8,
+
+    /// When true, artifact downloads served from storage backends that support
+    /// presigned URLs (S3, GCS, Azure) will return a 302 redirect to a
+    /// presigned URL instead of proxying the bytes through the backend. This
+    /// reduces bandwidth and CPU usage on the backend server. Default: false.
+    pub presigned_downloads_enabled: bool,
+
+    /// Expiry in seconds for presigned download URLs. Only used when
+    /// `presigned_downloads_enabled` is true. Default: 300 (5 minutes).
+    pub presigned_download_expiry_secs: u64,
+
+    // -- SMTP (optional, notifications are disabled when smtp_host is None) --
+    /// SMTP server hostname. When absent, email delivery is disabled and the
+    /// SMTP service operates as a no-op.
+    pub smtp_host: Option<String>,
+
+    /// SMTP server port (default: 587).
+    pub smtp_port: u16,
+
+    /// SMTP username for authentication (optional).
+    pub smtp_username: Option<String>,
+
+    /// SMTP password for authentication (optional).
+    pub smtp_password: Option<String>,
+
+    /// Sender address used in the From header (default: "noreply@artifact-keeper.local").
+    pub smtp_from_address: String,
+
+    /// TLS mode for the SMTP connection: "starttls" (default), "tls", or "none".
+    pub smtp_tls_mode: String,
 }
 
 redacted_debug!(Config {
@@ -158,24 +435,165 @@ redacted_debug!(Config {
     show trivy_url,
     show openscap_url,
     show openscap_profile,
-    show meilisearch_url,
-    redact_option meilisearch_api_key,
+    show opensearch_url,
+    show opensearch_username,
+    redact_option opensearch_password,
+    show opensearch_allow_invalid_certs,
     show scan_workspace_path,
     show demo_mode,
+    show guest_access_enabled,
     show peer_instance_name,
     show peer_public_endpoint,
     redact peer_api_key,
     show dependency_track_url,
+    show dependency_track_enabled,
     show otel_exporter_otlp_endpoint,
     show otel_service_name,
     show gc_schedule,
     show lifecycle_check_interval_secs,
+    show stuck_scan_threshold_secs,
+    show stuck_scan_check_interval_secs,
+    show stuck_scan_reap_limit,
     show max_upload_size_bytes,
     show allow_local_admin_login,
     show metrics_port,
+    show database_max_connections,
+    show database_min_connections,
+    show database_acquire_timeout_secs,
+    show database_idle_timeout_secs,
+    show database_max_lifetime_secs,
+    show auth_max_concurrency,
+    show rate_limit_auth_per_window,
+    show rate_limit_api_per_window,
+    show rate_limit_search_per_window,
+    show rate_limit_password_change_per_window,
+    show rate_limit_password_change_window_secs,
+    show rate_limit_window_secs,
+    show rate_limit_exempt_usernames,
+    show rate_limit_exempt_service_accounts,
+    show account_lockout_threshold,
+    show account_lockout_duration_minutes,
+    show quarantine_enabled,
+    show quarantine_duration_minutes,
+    show password_history_count,
+    show password_expiry_days,
+    show password_expiry_warning_days,
+    show password_expiry_check_interval_secs,
+    show password_min_length,
+    show password_max_length,
+    show password_require_uppercase,
+    show password_require_lowercase,
+    show password_require_digit,
+    show password_require_special,
+    show password_min_strength,
+    show presigned_downloads_enabled,
+    show presigned_download_expiry_secs,
+    show smtp_host,
+    show smtp_port,
+    show smtp_username,
+    redact_option smtp_password,
+    show smtp_from_address,
+    show smtp_tls_mode,
 });
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            database_url: String::new(),
+            bind_address: "0.0.0.0:8080".into(),
+            log_level: "info".into(),
+            storage_backend: "filesystem".into(),
+            storage_path: "/tmp/artifact-keeper-test".into(),
+            s3_bucket: None,
+            gcs_bucket: None,
+            s3_region: None,
+            s3_endpoint: None,
+            jwt_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
+            jwt_expiration_secs: 86400,
+            jwt_access_token_expiry_minutes: 30,
+            jwt_refresh_token_expiry_days: 7,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            oidc_client_secret: None,
+            ldap_url: None,
+            ldap_base_dn: None,
+            trivy_url: None,
+            openscap_url: None,
+            openscap_profile: "xccdf_org.ssgproject.content_profile_standard".into(),
+            opensearch_url: None,
+            opensearch_username: None,
+            opensearch_password: None,
+            opensearch_allow_invalid_certs: false,
+            scan_workspace_path: "/tmp/scan-workspace".into(),
+            demo_mode: false,
+            guest_access_enabled: true,
+            peer_instance_name: "test-instance".into(),
+            peer_public_endpoint: "http://localhost:8080".into(),
+            peer_api_key: "test-peer-api-key".into(),
+            dependency_track_url: None,
+            dependency_track_enabled: false,
+            otel_exporter_otlp_endpoint: None,
+            otel_service_name: "artifact-keeper".into(),
+            gc_schedule: "0 0 * * * *".into(),
+            lifecycle_check_interval_secs: 60,
+            stuck_scan_threshold_secs: 1800,
+            stuck_scan_check_interval_secs: 600,
+            stuck_scan_reap_limit: 1000,
+            max_upload_size_bytes: 10_737_418_240,
+            allow_local_admin_login: false,
+            metrics_port: None,
+            database_max_connections: 50,
+            database_min_connections: 5,
+            database_acquire_timeout_secs: 5,
+            database_idle_timeout_secs: 600,
+            database_max_lifetime_secs: 1800,
+            auth_max_concurrency: default_auth_max_concurrency(),
+            rate_limit_auth_per_window: 120,
+            rate_limit_api_per_window: 10000,
+            rate_limit_search_per_window: 300,
+            rate_limit_presign_per_window: 30,
+            rate_limit_password_change_per_window: 5,
+            rate_limit_password_change_window_secs: 900,
+            rate_limit_window_secs: 60,
+            rate_limit_exempt_usernames: Vec::new(),
+            rate_limit_exempt_service_accounts: false,
+            rate_limit_trusted_cidrs: Vec::new(),
+            account_lockout_threshold: 5,
+            account_lockout_duration_minutes: 30,
+            quarantine_enabled: false,
+            quarantine_duration_minutes: 60,
+            password_history_count: 0,
+            password_expiry_days: 0,
+            password_expiry_warning_days: vec![1, 7, 14],
+            password_expiry_check_interval_secs: 3600,
+            password_min_length: 8,
+            password_max_length: 128,
+            password_require_uppercase: false,
+            password_require_lowercase: false,
+            password_require_digit: false,
+            password_require_special: false,
+            password_min_strength: 0,
+            presigned_downloads_enabled: false,
+            presigned_download_expiry_secs: 300,
+            smtp_host: None,
+            smtp_port: 587,
+            smtp_username: None,
+            smtp_password: None,
+            smtp_from_address: "noreply@artifact-keeper.local".into(),
+            smtp_tls_mode: "starttls".into(),
+        }
+    }
+}
+
 impl Config {
+    /// Return a `Config` with sensible defaults for unit tests. Equivalent to
+    /// `Config::default()` today, but kept as a named constructor so tests read
+    /// clearly and any future test-specific tweaks live in one place.
+    #[cfg(test)]
+    pub fn test_config() -> Self {
+        Self::default()
+    }
+
     /// Load configuration from environment variables
     pub fn from_env() -> Result<Self> {
         let config = Self {
@@ -209,8 +627,13 @@ impl Config {
             openscap_url: env::var("OPENSCAP_URL").ok(),
             openscap_profile: env::var("OPENSCAP_PROFILE")
                 .unwrap_or_else(|_| "xccdf_org.ssgproject.content_profile_standard".into()),
-            meilisearch_url: env::var("MEILISEARCH_URL").ok(),
-            meilisearch_api_key: env::var("MEILISEARCH_API_KEY").ok(),
+            opensearch_url: env::var("OPENSEARCH_URL").ok(),
+            opensearch_username: env::var("OPENSEARCH_USERNAME").ok(),
+            opensearch_password: env::var("OPENSEARCH_PASSWORD").ok(),
+            opensearch_allow_invalid_certs: matches!(
+                env::var("OPENSEARCH_ALLOW_INVALID_CERTS").as_deref(),
+                Ok("true" | "1")
+            ),
             scan_workspace_path: env::var("SCAN_WORKSPACE_PATH").unwrap_or_else(|_| {
                 if cfg!(windows) {
                     r"C:\ProgramData\ArtifactKeeper\scan-workspace".into()
@@ -219,6 +642,12 @@ impl Config {
                 }
             }),
             demo_mode: matches!(env::var("DEMO_MODE").as_deref(), Ok("true" | "1")),
+            // Default to true for zero-impact upgrades; only "false"/"0" disables guests.
+            // Any other value (including unset, garbage, or empty) keeps guests enabled.
+            guest_access_enabled: !matches!(
+                env::var("AK_GUEST_ACCESS_ENABLED").as_deref(),
+                Ok("false" | "0")
+            ),
             peer_instance_name: env::var("PEER_INSTANCE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper-local".into()),
             peer_public_endpoint: env::var("PEER_PUBLIC_ENDPOINT")
@@ -232,11 +661,34 @@ impl Config {
                 key
             }),
             dependency_track_url: env::var("DEPENDENCY_TRACK_URL").ok(),
+            // Single source of truth for "DT is wired in". Defaults to false
+            // when unset, so DT integration must be explicitly opted into.
+            // Accepts "true" / "1" (case-insensitive); anything else (empty,
+            // garbage, unset) keeps DT disabled.
+            dependency_track_enabled: env::var("DEPENDENCY_TRACK_ENABLED")
+                .map(|v| {
+                    let v = v.trim().to_lowercase();
+                    v == "true" || v == "1"
+                })
+                .unwrap_or(false),
             otel_exporter_otlp_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
             otel_service_name: env::var("OTEL_SERVICE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper".into()),
             gc_schedule: env::var("GC_SCHEDULE").unwrap_or_else(|_| "0 0 * * * *".into()),
             lifecycle_check_interval_secs: env_parse("LIFECYCLE_CHECK_INTERVAL_SECS", 60),
+            stuck_scan_threshold_secs: clamp_stuck_scan_threshold(env_parse(
+                "STUCK_SCAN_THRESHOLD_SECS",
+                1800,
+            )),
+            stuck_scan_check_interval_secs: clamp_stuck_scan_interval(env_parse(
+                "STUCK_SCAN_CHECK_INTERVAL_SECS",
+                600,
+            )),
+            stuck_scan_reap_limit:
+                crate::services::scan_result_service::clamp_stuck_scan_reap_limit(env_parse(
+                    "STUCK_SCAN_REAP_LIMIT",
+                    1000,
+                )),
             max_upload_size_bytes: env_parse("MAX_UPLOAD_SIZE", 10_737_418_240_u64),
             allow_local_admin_login: matches!(
                 env::var("ALLOW_LOCAL_ADMIN_LOGIN").as_deref(),
@@ -255,6 +707,132 @@ impl Config {
                     }
                 },
                 Err(_) => None,
+            },
+            database_max_connections: env_parse("DATABASE_MAX_CONNECTIONS", 50),
+            database_min_connections: env_parse("DATABASE_MIN_CONNECTIONS", 5),
+            database_acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 5),
+            database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
+            database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
+            auth_max_concurrency: env_parse("AUTH_MAX_CONCURRENCY", default_auth_max_concurrency()),
+            rate_limit_auth_per_window: env_parse("RATE_LIMIT_AUTH_PER_MIN", 120),
+            rate_limit_api_per_window: env_parse("RATE_LIMIT_API_PER_MIN", 10000),
+            rate_limit_search_per_window: env_parse("RATE_LIMIT_SEARCH_PER_MIN", 300),
+            rate_limit_presign_per_window: env_parse("RATE_LIMIT_PRESIGN_PER_MIN", 30),
+            rate_limit_password_change_per_window: env_parse(
+                "RATE_LIMIT_PASSWORD_CHANGE_PER_WINDOW",
+                5,
+            ),
+            rate_limit_password_change_window_secs: env_parse(
+                "RATE_LIMIT_PASSWORD_CHANGE_WINDOW_SECS",
+                900,
+            ),
+            rate_limit_window_secs: env_parse("RATE_LIMIT_WINDOW_SECS", 60),
+            rate_limit_exempt_usernames: env::var("RATE_LIMIT_EXEMPT_USERNAMES")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .map(|u| u.trim().to_string())
+                        .filter(|u| !u.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            rate_limit_exempt_service_accounts: matches!(
+                env::var("RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS").as_deref(),
+                Ok("true" | "1")
+            ),
+            rate_limit_trusted_cidrs: env::var("RATE_LIMIT_TRUSTED_CIDRS")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|c| !c.is_empty())
+                        .filter_map(
+                            |c| match crate::api::middleware::rate_limit::CidrRange::parse(c) {
+                                Ok(cidr) => Some(cidr),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Ignoring invalid CIDR in RATE_LIMIT_TRUSTED_CIDRS: {}",
+                                        e
+                                    );
+                                    None
+                                }
+                            },
+                        )
+                        .collect()
+                })
+                .unwrap_or_default(),
+            account_lockout_threshold: env_parse("ACCOUNT_LOCKOUT_THRESHOLD", 5),
+            account_lockout_duration_minutes: env_parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 30),
+            quarantine_enabled: matches!(
+                env::var("QUARANTINE_ENABLED").as_deref(),
+                Ok("true" | "1")
+            ),
+            quarantine_duration_minutes: env_parse("QUARANTINE_DURATION_MINUTES", 60).max(1),
+            password_history_count: env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24),
+            password_expiry_days: env_parse("PASSWORD_EXPIRY_DAYS", 0).min(3650),
+            password_expiry_warning_days: {
+                let raw =
+                    env::var("PASSWORD_EXPIRY_WARNING_DAYS").unwrap_or_else(|_| "14,7,1".into());
+                let mut days: Vec<u32> = raw
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<u32>().ok())
+                    .filter(|&d| d > 0)
+                    .collect();
+                days.sort_unstable();
+                days.dedup();
+                days
+            },
+            password_expiry_check_interval_secs: env_parse(
+                "PASSWORD_EXPIRY_CHECK_INTERVAL_SECS",
+                3600,
+            ),
+            password_min_length: env_parse("PASSWORD_MIN_LENGTH", 8),
+            password_max_length: env_parse("PASSWORD_MAX_LENGTH", 128),
+            password_require_uppercase: matches!(
+                env::var("PASSWORD_REQUIRE_UPPERCASE").as_deref(),
+                Ok("true" | "1")
+            ),
+            password_require_lowercase: matches!(
+                env::var("PASSWORD_REQUIRE_LOWERCASE").as_deref(),
+                Ok("true" | "1")
+            ),
+            password_require_digit: matches!(
+                env::var("PASSWORD_REQUIRE_DIGIT").as_deref(),
+                Ok("true" | "1")
+            ),
+            password_require_special: matches!(
+                env::var("PASSWORD_REQUIRE_SPECIAL").as_deref(),
+                Ok("true" | "1")
+            ),
+            password_min_strength: {
+                let raw = env_parse::<u8>("PASSWORD_MIN_STRENGTH", 0);
+                raw.min(4)
+            },
+            presigned_downloads_enabled: matches!(
+                env::var("PRESIGNED_DOWNLOADS_ENABLED").as_deref(),
+                Ok("true" | "1")
+            ),
+            presigned_download_expiry_secs: env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300),
+            smtp_host: env::var("SMTP_HOST").ok().filter(|s| !s.is_empty()),
+            smtp_port: env_parse("SMTP_PORT", 587),
+            smtp_username: env::var("SMTP_USERNAME").ok().filter(|s| !s.is_empty()),
+            smtp_password: env::var("SMTP_PASSWORD").ok().filter(|s| !s.is_empty()),
+            smtp_from_address: env::var("SMTP_FROM_ADDRESS")
+                .unwrap_or_else(|_| "noreply@artifact-keeper.local".into()),
+            smtp_tls_mode: {
+                let mode = env::var("SMTP_TLS_MODE")
+                    .unwrap_or_else(|_| "starttls".into())
+                    .to_lowercase();
+                match mode.as_str() {
+                    "starttls" | "tls" | "none" => mode,
+                    _ => {
+                        tracing::warn!(
+                            value = %mode,
+                            "SMTP_TLS_MODE has an unrecognized value, falling back to \"starttls\""
+                        );
+                        "starttls".into()
+                    }
+                }
             },
         };
 
@@ -302,6 +880,54 @@ mod tests {
     // Environment variable tests must be serialized because env is global state.
     // We use a mutex to prevent parallel test interference.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    // -----------------------------------------------------------------------
+    // Default / test_config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_default_produces_valid_config() {
+        let config = Config::default();
+        assert_eq!(config.bind_address, "0.0.0.0:8080");
+        assert_eq!(config.storage_backend, "filesystem");
+        assert_eq!(config.jwt_expiration_secs, 86400);
+        assert_eq!(config.jwt_access_token_expiry_minutes, 30);
+        assert_eq!(config.jwt_refresh_token_expiry_days, 7);
+        assert!(!config.demo_mode);
+        assert_eq!(config.database_max_connections, 50);
+        assert_eq!(config.database_min_connections, 5);
+        assert!(config.auth_max_concurrency >= 8);
+        assert_eq!(config.rate_limit_api_per_window, 10000);
+        assert_eq!(config.rate_limit_search_per_window, 300);
+        // #1026: password-change limiter defaults must be strictly tighter
+        // than the global API bucket so a victim-JWT bearer cannot grind
+        // 100+ password guesses per minute through the bcrypt verifier.
+        assert_eq!(config.rate_limit_password_change_per_window, 5);
+        assert_eq!(config.rate_limit_password_change_window_secs, 900);
+        assert!(
+            (config.rate_limit_password_change_per_window as u64) * config.rate_limit_window_secs
+                < (config.rate_limit_api_per_window as u64)
+                    * config.rate_limit_password_change_window_secs,
+            "password-change effective rate must be tighter than the API bucket"
+        );
+        assert_eq!(config.max_upload_size_bytes, 10_737_418_240);
+        assert_eq!(config.smtp_port, 587);
+        assert_eq!(config.smtp_tls_mode, "starttls");
+    }
+
+    #[test]
+    fn test_test_config_returns_default() {
+        let from_default = Config::default();
+        let from_helper = Config::test_config();
+        // Spot-check a few fields to confirm they are the same.
+        assert_eq!(from_default.bind_address, from_helper.bind_address);
+        assert_eq!(from_default.jwt_secret, from_helper.jwt_secret);
+        assert_eq!(from_default.storage_backend, from_helper.storage_backend);
+        assert_eq!(
+            from_default.max_upload_size_bytes,
+            from_helper.max_upload_size_bytes
+        );
+    }
 
     // -----------------------------------------------------------------------
     // env_parse
@@ -360,6 +986,52 @@ mod tests {
         let result: u64 = env_parse("__TEST_ENV_PARSE_EMPTY__", 99);
         assert_eq!(result, 99);
         env::remove_var("__TEST_ENV_PARSE_EMPTY__");
+    }
+
+    // -----------------------------------------------------------------------
+    // Stuck-scan clamps (#1015 hardening)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_clamp_stuck_scan_threshold_below_floor_clamps_to_floor() {
+        assert_eq!(
+            clamp_stuck_scan_threshold(0),
+            STUCK_SCAN_THRESHOLD_FLOOR_SECS
+        );
+        assert_eq!(
+            clamp_stuck_scan_threshold(STUCK_SCAN_THRESHOLD_FLOOR_SECS - 1),
+            STUCK_SCAN_THRESHOLD_FLOOR_SECS
+        );
+    }
+
+    #[test]
+    fn test_clamp_stuck_scan_threshold_at_or_above_floor_passes_through() {
+        assert_eq!(
+            clamp_stuck_scan_threshold(STUCK_SCAN_THRESHOLD_FLOOR_SECS),
+            STUCK_SCAN_THRESHOLD_FLOOR_SECS
+        );
+        assert_eq!(clamp_stuck_scan_threshold(1800), 1800);
+        assert_eq!(clamp_stuck_scan_threshold(86400), 86400);
+    }
+
+    #[test]
+    fn test_clamp_stuck_scan_interval_below_floor_clamps_to_floor() {
+        // The headline reason for the floor: tokio::time::interval(Duration::ZERO)
+        // panics, which would silently kill the spawned scheduler task.
+        assert_eq!(clamp_stuck_scan_interval(0), STUCK_SCAN_INTERVAL_FLOOR_SECS);
+        assert_eq!(
+            clamp_stuck_scan_interval(STUCK_SCAN_INTERVAL_FLOOR_SECS - 1),
+            STUCK_SCAN_INTERVAL_FLOOR_SECS
+        );
+    }
+
+    #[test]
+    fn test_clamp_stuck_scan_interval_at_or_above_floor_passes_through() {
+        assert_eq!(
+            clamp_stuck_scan_interval(STUCK_SCAN_INTERVAL_FLOOR_SECS),
+            STUCK_SCAN_INTERVAL_FLOOR_SECS
+        );
+        assert_eq!(clamp_stuck_scan_interval(600), 600);
     }
 
     // -----------------------------------------------------------------------
@@ -435,6 +1107,12 @@ mod tests {
         env::remove_var("LOG_LEVEL");
         env::remove_var("STORAGE_BACKEND");
         env::remove_var("DEMO_MODE");
+        env::remove_var("RATE_LIMIT_AUTH_PER_MIN");
+        env::remove_var("RATE_LIMIT_API_PER_MIN");
+        env::remove_var("RATE_LIMIT_SEARCH_PER_MIN");
+        env::remove_var("RATE_LIMIT_WINDOW_SECS");
+        env::remove_var("PASSWORD_EXPIRY_WARNING_DAYS");
+        env::remove_var("PASSWORD_EXPIRY_CHECK_INTERVAL_SECS");
 
         let config = Config::from_env().expect("Config should load with required vars");
 
@@ -459,6 +1137,25 @@ mod tests {
         assert_eq!(config.peer_public_endpoint, "http://localhost:8080");
         assert_eq!(config.max_upload_size_bytes, 10_737_418_240);
 
+        // Database pool defaults (#678, raised for perf bundle #991/#1088)
+        assert_eq!(config.database_max_connections, 50);
+        assert_eq!(config.database_min_connections, 5);
+        assert_eq!(config.database_acquire_timeout_secs, 5);
+        assert_eq!(config.database_idle_timeout_secs, 600);
+        assert_eq!(config.database_max_lifetime_secs, 1800);
+        assert!(config.auth_max_concurrency >= 8);
+
+        // Password expiration defaults (#679)
+        assert_eq!(config.password_expiry_days, 0);
+        assert_eq!(config.password_expiry_warning_days, vec![1, 7, 14]);
+        assert_eq!(config.password_expiry_check_interval_secs, 3600);
+
+        // Rate limit defaults (#692)
+        assert_eq!(config.rate_limit_auth_per_window, 120);
+        assert_eq!(config.rate_limit_api_per_window, 10000);
+        assert_eq!(config.rate_limit_search_per_window, 300);
+        assert_eq!(config.rate_limit_window_secs, 60);
+
         // Restore
         if let Some(v) = saved_db {
             env::set_var("DATABASE_URL", v);
@@ -481,6 +1178,96 @@ mod tests {
         }
         if let Some(v) = saved_demo {
             env::set_var("DEMO_MODE", v);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Database pool configuration (#678)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_database_pool_env_overrides() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_max = env::var("DATABASE_MAX_CONNECTIONS").ok();
+        let saved_min = env::var("DATABASE_MIN_CONNECTIONS").ok();
+        let saved_acq = env::var("DATABASE_ACQUIRE_TIMEOUT_SECS").ok();
+        let saved_idle = env::var("DATABASE_IDLE_TIMEOUT_SECS").ok();
+        let saved_life = env::var("DATABASE_MAX_LIFETIME_SECS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "super-secret");
+        env::set_var("DATABASE_MAX_CONNECTIONS", "50");
+        env::set_var("DATABASE_MIN_CONNECTIONS", "10");
+        env::set_var("DATABASE_ACQUIRE_TIMEOUT_SECS", "15");
+        env::set_var("DATABASE_IDLE_TIMEOUT_SECS", "300");
+        env::set_var("DATABASE_MAX_LIFETIME_SECS", "900");
+
+        let config = Config::from_env().expect("Config should load");
+
+        assert_eq!(config.database_max_connections, 50);
+        assert_eq!(config.database_min_connections, 10);
+        assert_eq!(config.database_acquire_timeout_secs, 15);
+        assert_eq!(config.database_idle_timeout_secs, 300);
+        assert_eq!(config.database_max_lifetime_secs, 900);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        for (k, v) in [
+            ("DATABASE_MAX_CONNECTIONS", saved_max),
+            ("DATABASE_MIN_CONNECTIONS", saved_min),
+            ("DATABASE_ACQUIRE_TIMEOUT_SECS", saved_acq),
+            ("DATABASE_IDLE_TIMEOUT_SECS", saved_idle),
+            ("DATABASE_MAX_LIFETIME_SECS", saved_life),
+        ] {
+            match v {
+                Some(val) => env::set_var(k, val),
+                None => env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn test_config_database_pool_invalid_value_falls_back_to_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_max = env::var("DATABASE_MAX_CONNECTIONS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "super-secret");
+        env::set_var("DATABASE_MAX_CONNECTIONS", "not-a-number");
+
+        let config = Config::from_env().expect("Config should load even with invalid pool setting");
+
+        // env_parse falls back to the default when the value cannot be parsed
+        assert_eq!(config.database_max_connections, 50);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_max {
+            env::set_var("DATABASE_MAX_CONNECTIONS", v);
+        } else {
+            env::remove_var("DATABASE_MAX_CONNECTIONS");
         }
     }
 
@@ -524,6 +1311,98 @@ mod tests {
         } else {
             env::remove_var("DEMO_MODE");
         }
+    }
+
+    #[test]
+    fn test_config_guest_access_enabled_default_true() {
+        // Issue #850: zero-impact upgrades. When the env var is unset the
+        // server must keep behaving exactly as it did before, which means
+        // anonymous (guest) access stays enabled.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("AK_GUEST_ACCESS_ENABLED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::remove_var("AK_GUEST_ACCESS_ENABLED");
+
+        let config = Config::from_env().unwrap();
+        assert!(config.guest_access_enabled);
+
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_flag {
+            env::set_var("AK_GUEST_ACCESS_ENABLED", v);
+        } else {
+            env::remove_var("AK_GUEST_ACCESS_ENABLED");
+        }
+    }
+
+    #[test]
+    fn test_config_guest_access_enabled_explicit_values() {
+        // Verify that "false" and "0" disable guest access, while anything
+        // else (including "true", "1", garbage, and empty string) keeps it
+        // enabled. The "fail open" behaviour on garbage values is intentional
+        // so a typo in deployment does not lock administrators out without
+        // warning.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("AK_GUEST_ACCESS_ENABLED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+
+        env::set_var("AK_GUEST_ACCESS_ENABLED", "false");
+        assert!(!Config::from_env().unwrap().guest_access_enabled);
+
+        env::set_var("AK_GUEST_ACCESS_ENABLED", "0");
+        assert!(!Config::from_env().unwrap().guest_access_enabled);
+
+        env::set_var("AK_GUEST_ACCESS_ENABLED", "true");
+        assert!(Config::from_env().unwrap().guest_access_enabled);
+
+        env::set_var("AK_GUEST_ACCESS_ENABLED", "1");
+        assert!(Config::from_env().unwrap().guest_access_enabled);
+
+        env::set_var("AK_GUEST_ACCESS_ENABLED", "yes");
+        assert!(Config::from_env().unwrap().guest_access_enabled);
+
+        env::set_var("AK_GUEST_ACCESS_ENABLED", "");
+        assert!(Config::from_env().unwrap().guest_access_enabled);
+
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_flag {
+            env::set_var("AK_GUEST_ACCESS_ENABLED", v);
+        } else {
+            env::remove_var("AK_GUEST_ACCESS_ENABLED");
+        }
+    }
+
+    #[test]
+    fn test_config_default_guest_access_enabled() {
+        // The Config::default() helper returns guest_access_enabled = true,
+        // which is what test_config() relies on.
+        let config = Config::default();
+        assert!(config.guest_access_enabled);
     }
 
     #[test]
@@ -979,6 +1858,541 @@ mod tests {
             env::set_var("MAX_UPLOAD_SIZE", v);
         } else {
             env::remove_var("MAX_UPLOAD_SIZE");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PASSWORD_HISTORY_COUNT
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_password_history_count_default_zero() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+        let result: u32 = env_parse("PASSWORD_HISTORY_COUNT", 0);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_password_history_count_parsed() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "12");
+        let result: u32 = env_parse("PASSWORD_HISTORY_COUNT", 0);
+        assert_eq!(result, 12);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_invalid_falls_back() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "not-a-number");
+        let result: u32 = env_parse("PASSWORD_HISTORY_COUNT", 0);
+        assert_eq!(result, 0);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_clamped_to_max_24() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "100");
+        let result: u32 = env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24);
+        assert_eq!(result, 24);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_at_max_not_clamped() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "24");
+        let result: u32 = env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24);
+        assert_eq!(result, 24);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_below_max_not_clamped() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "10");
+        let result: u32 = env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24);
+        assert_eq!(result, 10);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    // ── presigned downloads config tests ──────────────────────────────
+
+    #[test]
+    fn test_presigned_downloads_disabled_by_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::remove_var("PRESIGNED_DOWNLOADS_ENABLED");
+        let enabled = matches!(
+            env::var("PRESIGNED_DOWNLOADS_ENABLED").as_deref(),
+            Ok("true" | "1")
+        );
+        assert!(!enabled);
+    }
+
+    #[test]
+    fn test_presigned_downloads_enabled_true() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PRESIGNED_DOWNLOADS_ENABLED", "true");
+        let enabled = matches!(
+            env::var("PRESIGNED_DOWNLOADS_ENABLED").as_deref(),
+            Ok("true" | "1")
+        );
+        assert!(enabled);
+        env::remove_var("PRESIGNED_DOWNLOADS_ENABLED");
+    }
+
+    #[test]
+    fn test_presigned_downloads_enabled_one() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PRESIGNED_DOWNLOADS_ENABLED", "1");
+        let enabled = matches!(
+            env::var("PRESIGNED_DOWNLOADS_ENABLED").as_deref(),
+            Ok("true" | "1")
+        );
+        assert!(enabled);
+        env::remove_var("PRESIGNED_DOWNLOADS_ENABLED");
+    }
+
+    #[test]
+    fn test_presigned_download_expiry_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::remove_var("PRESIGNED_DOWNLOAD_EXPIRY_SECS");
+        let expiry: u64 = env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300);
+        assert_eq!(expiry, 300);
+    }
+
+    #[test]
+    fn test_presigned_download_expiry_custom() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PRESIGNED_DOWNLOAD_EXPIRY_SECS", "600");
+        let expiry: u64 = env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300);
+        assert_eq!(expiry, 600);
+        env::remove_var("PRESIGNED_DOWNLOAD_EXPIRY_SECS");
+    }
+
+    // -----------------------------------------------------------------------
+    // Rate limit defaults (#692)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_rate_limit_api_default_is_10000() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_rate = env::var("RATE_LIMIT_API_PER_MIN").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::remove_var("RATE_LIMIT_API_PER_MIN");
+
+        let config = Config::from_env().expect("Config should load");
+        assert_eq!(
+            config.rate_limit_api_per_window, 10000,
+            "Default API rate limit should be 10000 after #692 fix"
+        );
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        match saved_rate {
+            Some(v) => env::set_var("RATE_LIMIT_API_PER_MIN", v),
+            None => env::remove_var("RATE_LIMIT_API_PER_MIN"),
+        }
+    }
+
+    #[test]
+    fn test_config_rate_limit_api_env_override() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_rate = env::var("RATE_LIMIT_API_PER_MIN").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("RATE_LIMIT_API_PER_MIN", "25000");
+
+        let config = Config::from_env().expect("Config should load");
+        assert_eq!(config.rate_limit_api_per_window, 25000);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        match saved_rate {
+            Some(v) => env::set_var("RATE_LIMIT_API_PER_MIN", v),
+            None => env::remove_var("RATE_LIMIT_API_PER_MIN"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Password expiry notification config (#679)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_password_expiry_warning_days_custom() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "30,14,7,3,1");
+
+        let config = Config::from_env().unwrap();
+        // Should be sorted and deduped
+        assert_eq!(config.password_expiry_warning_days, vec![1, 3, 7, 14, 30]);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        match saved_warn {
+            Some(v) => env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", v),
+            None => env::remove_var("PASSWORD_EXPIRY_WARNING_DAYS"),
+        }
+    }
+
+    #[test]
+    fn test_config_password_expiry_warning_days_dedup_and_sort() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "7,7,3,14,3");
+
+        let config = Config::from_env().unwrap();
+        // Duplicates removed and sorted
+        assert_eq!(config.password_expiry_warning_days, vec![3, 7, 14]);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        match saved_warn {
+            Some(v) => env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", v),
+            None => env::remove_var("PASSWORD_EXPIRY_WARNING_DAYS"),
+        }
+    }
+
+    #[test]
+    fn test_config_password_expiry_warning_days_filters_zero() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "0,7,0,1");
+
+        let config = Config::from_env().unwrap();
+        // Zeros filtered out
+        assert_eq!(config.password_expiry_warning_days, vec![1, 7]);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        match saved_warn {
+            Some(v) => env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", v),
+            None => env::remove_var("PASSWORD_EXPIRY_WARNING_DAYS"),
+        }
+    }
+
+    #[test]
+    fn test_config_password_expiry_warning_days_ignores_invalid() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "abc,7,,1,xyz");
+
+        let config = Config::from_env().unwrap();
+        // Non-numeric values filtered by parse, empty strings ignored
+        assert_eq!(config.password_expiry_warning_days, vec![1, 7]);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        match saved_warn {
+            Some(v) => env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", v),
+            None => env::remove_var("PASSWORD_EXPIRY_WARNING_DAYS"),
+        }
+    }
+
+    #[test]
+    fn test_config_password_expiry_check_interval_custom() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_interval = env::var("PASSWORD_EXPIRY_CHECK_INTERVAL_SECS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("PASSWORD_EXPIRY_CHECK_INTERVAL_SECS", "1800");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.password_expiry_check_interval_secs, 1800);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        match saved_interval {
+            Some(v) => env::set_var("PASSWORD_EXPIRY_CHECK_INTERVAL_SECS", v),
+            None => env::remove_var("PASSWORD_EXPIRY_CHECK_INTERVAL_SECS"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // rate_limit_search_per_window env var override (#829)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_rate_limit_search_per_window_env_override() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_search = env::var("RATE_LIMIT_SEARCH_PER_MIN").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("RATE_LIMIT_SEARCH_PER_MIN", "500");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.rate_limit_search_per_window, 500);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        match saved_search {
+            Some(v) => env::set_var("RATE_LIMIT_SEARCH_PER_MIN", v),
+            None => env::remove_var("RATE_LIMIT_SEARCH_PER_MIN"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // dependency_track_enabled (issues #1395, #1480)
+    //
+    // Disabling Dependency-Track must be a single, authoritative kill
+    // switch read from `DEPENDENCY_TRACK_ENABLED`. These tests pin the
+    // parse behaviour: any value other than `true`/`1` (case-insensitive,
+    // whitespace trimmed) keeps the integration off, regardless of
+    // whether a stale `DEPENDENCY_TRACK_URL` is configured.
+    // -----------------------------------------------------------------------
+
+    /// Helper to set env, run a closure, and restore prior state. Keeps
+    /// the env-mutated tests below from leaking state into other tests.
+    fn with_dt_env<F: FnOnce()>(value: Option<&str>, f: F) {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_dt = env::var("DEPENDENCY_TRACK_ENABLED").ok();
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        match value {
+            Some(v) => env::set_var("DEPENDENCY_TRACK_ENABLED", v),
+            None => env::remove_var("DEPENDENCY_TRACK_ENABLED"),
+        }
+        f();
+        match saved_db {
+            Some(v) => env::set_var("DATABASE_URL", v),
+            None => env::remove_var("DATABASE_URL"),
+        }
+        match saved_jwt {
+            Some(v) => env::set_var("JWT_SECRET", v),
+            None => env::remove_var("JWT_SECRET"),
+        }
+        match saved_dt {
+            Some(v) => env::set_var("DEPENDENCY_TRACK_ENABLED", v),
+            None => env::remove_var("DEPENDENCY_TRACK_ENABLED"),
+        }
+    }
+
+    #[test]
+    fn test_dt_enabled_defaults_false_when_unset() {
+        with_dt_env(None, || {
+            let cfg = Config::from_env().unwrap();
+            assert!(!cfg.dependency_track_enabled);
+        });
+    }
+
+    #[test]
+    fn test_dt_enabled_default_in_struct_default_is_false() {
+        let cfg = Config::default();
+        assert!(!cfg.dependency_track_enabled);
+    }
+
+    #[test]
+    fn test_dt_enabled_explicit_true() {
+        with_dt_env(Some("true"), || {
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.dependency_track_enabled);
+        });
+    }
+
+    #[test]
+    fn test_dt_enabled_explicit_one() {
+        with_dt_env(Some("1"), || {
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.dependency_track_enabled);
+        });
+    }
+
+    #[test]
+    fn test_dt_enabled_case_insensitive_true() {
+        with_dt_env(Some("TRUE"), || {
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.dependency_track_enabled);
+        });
+    }
+
+    #[test]
+    fn test_dt_enabled_with_whitespace() {
+        with_dt_env(Some("  true  "), || {
+            let cfg = Config::from_env().unwrap();
+            assert!(cfg.dependency_track_enabled);
+        });
+    }
+
+    #[test]
+    fn test_dt_enabled_explicit_false() {
+        with_dt_env(Some("false"), || {
+            let cfg = Config::from_env().unwrap();
+            assert!(!cfg.dependency_track_enabled);
+        });
+    }
+
+    #[test]
+    fn test_dt_enabled_empty_string_is_disabled() {
+        with_dt_env(Some(""), || {
+            let cfg = Config::from_env().unwrap();
+            assert!(!cfg.dependency_track_enabled);
+        });
+    }
+
+    #[test]
+    fn test_dt_enabled_garbage_is_disabled() {
+        with_dt_env(Some("yes"), || {
+            let cfg = Config::from_env().unwrap();
+            assert!(!cfg.dependency_track_enabled);
+        });
+        with_dt_env(Some("on"), || {
+            let cfg = Config::from_env().unwrap();
+            assert!(!cfg.dependency_track_enabled);
+        });
+    }
+
+    /// Regression for #1395: a stale `DEPENDENCY_TRACK_URL` must not flip
+    /// the enabled flag on its own. The flag is independent of URL
+    /// presence.
+    #[test]
+    fn test_dt_enabled_independent_of_url() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_dt = env::var("DEPENDENCY_TRACK_ENABLED").ok();
+        let saved_url = env::var("DEPENDENCY_TRACK_URL").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("DEPENDENCY_TRACK_URL", "http://dt.example.com:8081");
+        env::remove_var("DEPENDENCY_TRACK_ENABLED");
+
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(
+            cfg.dependency_track_url.as_deref(),
+            Some("http://dt.example.com:8081")
+        );
+        assert!(
+            !cfg.dependency_track_enabled,
+            "URL set without ENABLED=true must leave integration disabled (issue #1395)"
+        );
+
+        // Restore
+        match saved_db {
+            Some(v) => env::set_var("DATABASE_URL", v),
+            None => env::remove_var("DATABASE_URL"),
+        }
+        match saved_jwt {
+            Some(v) => env::set_var("JWT_SECRET", v),
+            None => env::remove_var("JWT_SECRET"),
+        }
+        match saved_dt {
+            Some(v) => env::set_var("DEPENDENCY_TRACK_ENABLED", v),
+            None => env::remove_var("DEPENDENCY_TRACK_ENABLED"),
+        }
+        match saved_url {
+            Some(v) => env::set_var("DEPENDENCY_TRACK_URL", v),
+            None => env::remove_var("DEPENDENCY_TRACK_URL"),
         }
     }
 }

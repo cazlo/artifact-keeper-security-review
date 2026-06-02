@@ -46,9 +46,11 @@ use utoipa::{Modify, OpenApi};
         (name = "telemetry", description = "Crash reporting and telemetry"),
         (name = "sso", description = "Single sign-on configuration"),
         (name = "migration", description = "Data migration and import"),
+        (name = "quarantine", description = "Artifact quarantine period management"),
         (name = "quality", description = "Artifact health scoring and quality gates"),
         (name = "service_accounts", description = "Service account management"),
         (name = "health", description = "Health and readiness checks"),
+        (name = "system", description = "Public system configuration"),
     ),
     components(schemas(ErrorResponse))
 )]
@@ -100,6 +102,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::health::HealthApiDoc::openapi());
     doc.merge(super::handlers::plugins::PluginsApiDoc::openapi());
     doc.merge(super::handlers::webhooks::WebhooksApiDoc::openapi());
+    doc.merge(super::handlers::email_subscriptions::EmailSubscriptionsApiDoc::openapi());
     doc.merge(super::handlers::signing::SigningApiDoc::openapi());
     doc.merge(super::handlers::security::SecurityApiDoc::openapi());
     doc.merge(super::handlers::sbom::SbomApiDoc::openapi());
@@ -129,7 +132,11 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::service_accounts::ServiceAccountsApiDoc::openapi());
     doc.merge(super::handlers::artifact_labels::ArtifactLabelsApiDoc::openapi());
     doc.merge(super::handlers::curation::CurationApiDoc::openapi());
+    doc.merge(super::handlers::quarantine::QuarantineApiDoc::openapi());
     doc.merge(super::handlers::upload::UploadApiDoc::openapi());
+    doc.merge(super::handlers::system_config::SystemConfigApiDoc::openapi());
+    doc.merge(super::handlers::repo_tokens::RepoTokensApiDoc::openapi());
+    doc.merge(super::handlers::smtp::SmtpApiDoc::openapi());
 
     doc
 }
@@ -388,6 +395,7 @@ mod tests {
                     include_str!("handlers/repositories.rs"),
                     include_str!("handlers/repository_labels.rs"),
                     include_str!("handlers/security.rs"),
+                    include_str!("handlers/repo_tokens.rs"),
                 ],
             ),
             (
@@ -466,6 +474,10 @@ mod tests {
                 vec![include_str!("handlers/approval.rs")],
             ),
             (
+                "/api/v1/quarantine/",
+                vec![include_str!("handlers/quarantine.rs")],
+            ),
+            (
                 "/api/v1/quality/",
                 vec![include_str!("handlers/quality_gates.rs")],
             ),
@@ -490,10 +502,17 @@ mod tests {
                 vec![include_str!("handlers/curation.rs")],
             ),
             ("/api/v1/uploads/", vec![include_str!("handlers/upload.rs")]),
+            (
+                "/api/v1/system/",
+                vec![
+                    include_str!("handlers/system_config.rs"),
+                    include_str!("routes.rs"),
+                ],
+            ),
         ];
 
         // Sort by prefix length descending so longest match wins
-        handler_sources.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        handler_sources.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
 
         let mut missing = Vec::new();
 

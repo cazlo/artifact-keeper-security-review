@@ -170,6 +170,12 @@ pub async fn login(
         tracing::warn!("Local admin login allowed via ALLOW_LOCAL_ADMIN_LOGIN while SSO is active");
     }
 
+    // The bcrypt-bound auth-concurrency cap (#991, #1088) is enforced
+    // inside `AuthService::verify_password` itself, so every entry point
+    // that runs bcrypt (local login, API-token verify, basic-auth
+    // fallback, SSO post-auth) shares the same shed boundary. Acquiring
+    // a permit here as well would double-count slots and cause spurious
+    // 503s under moderate load.
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
     let (user, tokens) = match auth_service
@@ -356,12 +362,13 @@ pub async fn create_api_token(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<CreateApiTokenRequest>,
 ) -> Result<Json<CreateApiTokenResponse>> {
-    // Non-admin users cannot request the "admin" scope
-    if !auth.is_admin && payload.scopes.iter().any(|s| s == "admin") {
-        return Err(AppError::Authorization(
-            "Only administrators can create tokens with the 'admin' scope".to_string(),
-        ));
-    }
+    // Refuse admin-class scopes from non-admin callers. The legacy check
+    // only blocked the literal "admin" scope, leaving non-admins able to
+    // mint `*`, `delete:artifacts`, `delete:repositories`, and
+    // `write:users` via this endpoint. See
+    // `token_service::ADMIN_ONLY_SCOPES` for the policy list and rationale.
+    crate::services::token_service::enforce_admin_only_scopes(&payload.scopes, auth.is_admin)
+        .map_err(AppError::Authorization)?;
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
@@ -486,9 +493,135 @@ pub struct TicketResponse {
     pub expires_in: u64,
 }
 
+/// Validate and normalize a ticket-bound `resource_path` at mint time.
+///
+/// The consumer middleware compares `bound_path == request.uri().path()` by
+/// byte equality, which means the minter is responsible for picking the exact
+/// form the consumer will see. Format handlers normalize incoming paths
+/// (PyPI/NuGet/Go lowercase the package-name segment, see
+/// `backend/src/formats/pypi.rs` and `backend/src/formats/nuget.rs`), so a
+/// minter who passes `/pypi/foo/simple/Django/` would produce a ticket that
+/// no real client request can match — and the first attempt would silently
+/// burn the ticket.
+///
+/// Policy enforced here:
+///   1. Path must be absolute (starts with `/`).
+///   2. No `..` segments (no path traversal).
+///   3. No percent-encoded slashes or backslashes (`%2F`, `%2f`, `%5C`, `%5c`)
+///      and no `%25` (double-encoding) — these would change semantics after
+///      URL-decode and are common bypass vectors.
+///   4. No control characters (`\0`..`\x1f`, `\x7f`) or whitespace.
+///   5. Collapse repeated `/` to a single `/`.
+///   6. Strip a trailing `/` (except for root `/`).
+///   7. Lowercase the package-name segment for paths whose first component is
+///      a known case-folding format (`/pypi/...`, `/nuget/...`, `/go/...`).
+///      The package name lives at the third segment for these formats
+///      (`/{format}/{repo_key}/{name}/...`).
+///
+/// What is NOT enforced here (deliberate):
+///   - Authz reach: this function does not verify that the minting user can
+///     actually access the requested path. The consumer middleware re-runs
+///     `repo_visibility_middleware` / `can_access_repo` at consume time, so a
+///     ticket bound to a path the minter cannot reach is harmless. A defense-
+///     in-depth check is tracked for v1.2.0 hardening.
+fn validate_and_normalize_resource_path(input: &str) -> std::result::Result<String, AppError> {
+    if input.is_empty() {
+        return Err(AppError::Validation(
+            "resource_path must not be empty".into(),
+        ));
+    }
+    if !input.starts_with('/') {
+        return Err(AppError::Validation(
+            "resource_path must start with '/'".into(),
+        ));
+    }
+
+    // Reject control chars, whitespace, embedded NUL.
+    for b in input.as_bytes() {
+        if *b < 0x20 || *b == 0x7f || *b == b' ' {
+            return Err(AppError::Validation(
+                "resource_path must not contain whitespace or control characters".into(),
+            ));
+        }
+    }
+
+    // Reject percent-encoded slashes / backslashes / percent itself. These
+    // forms decode to characters that change path semantics after axum/hyper
+    // serve them as raw paths, so allowing them would let a minter bind to
+    // `/foo%2F..%2Fbar` and rely on a future decoder normalizing it.
+    let lower = input.to_ascii_lowercase();
+    for needle in ["%2f", "%5c", "%25", "%00"] {
+        if lower.contains(needle) {
+            return Err(AppError::Validation(format!(
+                "resource_path must not contain encoded sequence '{}'",
+                needle
+            )));
+        }
+    }
+
+    // Split, reject `..` and `.` segments, collapse repeated `/`.
+    let mut segments: Vec<&str> = Vec::new();
+    for seg in input.split('/') {
+        if seg.is_empty() {
+            // collapses `//` into single `/` and skips leading/trailing empty segs
+            continue;
+        }
+        if seg == ".." {
+            return Err(AppError::Validation(
+                "resource_path must not contain '..' segments".into(),
+            ));
+        }
+        if seg == "." {
+            return Err(AppError::Validation(
+                "resource_path must not contain '.' segments".into(),
+            ));
+        }
+        segments.push(seg);
+    }
+
+    if segments.is_empty() {
+        // input was just `/` or `///` — bind to the root literal `/`.
+        return Ok("/".to_string());
+    }
+
+    // For known case-folding format prefixes, lowercase the package-name
+    // segment so the bound path matches what the format handler will see
+    // after its own normalization. We deliberately do NOT lowercase the
+    // repository key (segment 1) — repo keys are validated as lowercase
+    // already at creation time.
+    //
+    // Layout: segments[0] = format, segments[1] = repo_key,
+    // segments[2..] = format-specific (package name, version, file).
+    const CASE_FOLDED_FORMATS: &[&str] = &["pypi", "nuget", "go"];
+    if segments.len() >= 3 {
+        let format = segments[0].to_ascii_lowercase();
+        if CASE_FOLDED_FORMATS.contains(&format.as_str()) {
+            // Build owned strings for the segments we need to mutate.
+            let mut owned: Vec<String> = segments.iter().map(|s| s.to_string()).collect();
+            owned[0] = format;
+            // PyPI's PEP-503 normalize is more aggressive than just lowercase
+            // (it collapses non-alphanumeric runs to '-'), but applying that
+            // here would mask legitimate user intent; the simpler and safer
+            // choice is to lowercase only. A client that depends on PEP-503
+            // normalization can pre-normalize before minting.
+            owned[2] = owned[2].to_ascii_lowercase();
+            let normalized = format!("/{}", owned.join("/"));
+            return Ok(normalized);
+        }
+    }
+
+    Ok(format!("/{}", segments.join("/")))
+}
+
 /// Create a short-lived, single-use download/stream ticket for the current user.
 /// The ticket can be passed as a `?ticket=` query parameter on endpoints that
 /// cannot use `Authorization` headers (e.g. `<a>` downloads, `EventSource` SSE).
+///
+/// Security note: the resulting ticket value will appear in webserver access
+/// logs, browser history, and `Referer` headers if it is embedded in a URL.
+/// The mitigation is single-use consumption plus a 30-second TTL plus 256-bit
+/// entropy. Clients should consume the ticket immediately and never share or
+/// log the URL that contains it.
 #[utoipa::path(
     post,
     path = "/ticket",
@@ -498,6 +631,7 @@ pub struct TicketResponse {
     request_body = CreateTicketRequest,
     responses(
         (status = 200, description = "Download ticket created", body = TicketResponse),
+        (status = 400, description = "Invalid resource_path", body = super::super::openapi::ErrorResponse),
         (status = 401, description = "Not authenticated", body = super::super::openapi::ErrorResponse),
     )
 )]
@@ -506,11 +640,18 @@ pub async fn create_download_ticket(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<CreateTicketRequest>,
 ) -> Result<Json<TicketResponse>> {
+    // Validate and canonicalize the bound path before storage. See
+    // `validate_and_normalize_resource_path` for the full policy.
+    let normalized_path = match payload.resource_path.as_deref() {
+        Some(p) => Some(validate_and_normalize_resource_path(p)?),
+        None => None,
+    };
+
     let ticket = AuthConfigService::create_download_ticket(
         &state.db,
         auth.user_id,
         &payload.purpose,
-        payload.resource_path.as_deref(),
+        normalized_path.as_deref(),
     )
     .await?;
 
@@ -959,5 +1100,295 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["ticket"], "ticket_abc123");
         assert_eq!(json["expires_in"], 30);
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_and_normalize_resource_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_path_rejects_empty() {
+        assert!(validate_and_normalize_resource_path("").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_rejects_relative() {
+        assert!(validate_and_normalize_resource_path("foo/bar").is_err());
+        assert!(validate_and_normalize_resource_path("./foo").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_rejects_traversal() {
+        assert!(validate_and_normalize_resource_path("/foo/../bar").is_err());
+        assert!(validate_and_normalize_resource_path("/..").is_err());
+        assert!(validate_and_normalize_resource_path("/a/b/..").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_rejects_dot_segments() {
+        assert!(validate_and_normalize_resource_path("/a/./b").is_err());
+        assert!(validate_and_normalize_resource_path("/.").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_rejects_encoded_slash() {
+        assert!(validate_and_normalize_resource_path("/foo%2Fbar").is_err());
+        assert!(validate_and_normalize_resource_path("/foo%2fbar").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_rejects_encoded_backslash() {
+        assert!(validate_and_normalize_resource_path("/foo%5Cbar").is_err());
+        assert!(validate_and_normalize_resource_path("/foo%5cbar").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_rejects_double_encoding() {
+        // %25 is encoded `%`, blocking double-encoded sequences like %252F.
+        assert!(validate_and_normalize_resource_path("/foo%252Fbar").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_rejects_null_byte() {
+        assert!(validate_and_normalize_resource_path("/foo%00bar").is_err());
+        assert!(validate_and_normalize_resource_path("/foo\0bar").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_rejects_whitespace_and_control() {
+        assert!(validate_and_normalize_resource_path("/foo bar").is_err());
+        assert!(validate_and_normalize_resource_path("/foo\tbar").is_err());
+        assert!(validate_and_normalize_resource_path("/foo\nbar").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_collapses_repeated_slashes() {
+        let got = validate_and_normalize_resource_path("/foo//bar///baz").unwrap();
+        assert_eq!(got, "/foo/bar/baz");
+    }
+
+    #[test]
+    fn test_validate_path_strips_trailing_slash() {
+        let got = validate_and_normalize_resource_path("/api/v1/repositories/foo/").unwrap();
+        assert_eq!(got, "/api/v1/repositories/foo");
+    }
+
+    #[test]
+    fn test_validate_path_root_is_preserved() {
+        // Bare `/` is unusual but harmless: it normalizes to `/` and the
+        // consumer's exact-equality check will require an actual root request.
+        let got = validate_and_normalize_resource_path("/").unwrap();
+        assert_eq!(got, "/");
+    }
+
+    #[test]
+    fn test_validate_path_passthrough_simple_case() {
+        let got =
+            validate_and_normalize_resource_path("/api/v1/repositories/foo/blob.tar.gz").unwrap();
+        assert_eq!(got, "/api/v1/repositories/foo/blob.tar.gz");
+    }
+
+    #[test]
+    fn test_validate_path_lowercases_pypi_package() {
+        // PyPI handler lowercases the package name segment, so the bound path
+        // must be lowercased at mint time or no client request will match.
+        let got = validate_and_normalize_resource_path("/pypi/myrepo/Django/").unwrap();
+        assert_eq!(got, "/pypi/myrepo/django");
+    }
+
+    #[test]
+    fn test_validate_path_lowercases_nuget_package() {
+        let got = validate_and_normalize_resource_path("/nuget/myrepo/Newtonsoft.Json/").unwrap();
+        assert_eq!(got, "/nuget/myrepo/newtonsoft.json");
+    }
+
+    #[test]
+    fn test_validate_path_lowercases_go_module() {
+        let got =
+            validate_and_normalize_resource_path("/go/myrepo/Github.com/Foo/Bar/@v/list").unwrap();
+        // segments[2] is lowercased; deeper path retained verbatim.
+        assert_eq!(got, "/go/myrepo/github.com/Foo/Bar/@v/list");
+    }
+
+    #[test]
+    fn test_validate_path_does_not_lowercase_non_case_folding_format() {
+        // Maven and npm preserve case (Java packages and scoped npm names).
+        let got = validate_and_normalize_resource_path("/maven/myrepo/Com/Acme/Foo").unwrap();
+        assert_eq!(got, "/maven/myrepo/Com/Acme/Foo");
+    }
+
+    #[test]
+    fn test_validate_path_does_not_lowercase_when_too_short() {
+        // Without a package-name segment (segments < 3), the lowercase rule
+        // does not apply.
+        let got = validate_and_normalize_resource_path("/pypi/Mixed-Case-Repo").unwrap();
+        // Leaves repo segment alone; pypi-format check needs len >= 3.
+        assert_eq!(got, "/pypi/Mixed-Case-Repo");
+    }
+
+    #[test]
+    fn test_validate_path_does_not_lowercase_repo_key() {
+        // Repo keys are validated as lowercase at creation, but a minter
+        // could still pass uppercase. We deliberately do NOT lowercase here:
+        // the repo key segment is segment 1 and the format-specific rule
+        // touches only segment 2 (the package name).
+        let got = validate_and_normalize_resource_path("/pypi/MyRepo/Django").unwrap();
+        assert_eq!(got, "/pypi/MyRepo/django");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Admin-only token-scope enforcement tests (auth::create_api_token)
+//
+// Sibling of `users::admin_scope_policy_tests` and the repo-tokens
+// endpoint tests. The same policy must apply to
+// `POST /api/v1/auth/tokens`, otherwise any logged-in user can pivot
+// here to mint a token with `*` / `admin` / `delete:artifacts` /
+// `delete:repositories` / `write:users` and bypass every scope-only
+// authorization gate.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod admin_scope_policy_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use axum::Extension as AxumExtension;
+    use serde_json::json;
+
+    /// Build the auth router with a bare `Extension<AuthExtension>` layer
+    /// (the shape this handler's extractor expects).
+    fn build_app(state: SharedState, auth: AuthExtension) -> axum::Router {
+        protected_router()
+            .with_state(state)
+            .layer(AxumExtension::<AuthExtension>(auth))
+    }
+
+    async fn setup() -> Option<(sqlx::PgPool, SharedState, Uuid, String)> {
+        let pool = tdh::try_pool().await?;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        Some((pool, state, user_id, username))
+    }
+
+    async fn cleanup(pool: &sqlx::PgPool, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// Each ADMIN_ONLY_SCOPES entry submitted alone by a non-admin must
+    /// be refused at the handler. Iterates so a future addition to the
+    /// policy list is automatically covered.
+    #[tokio::test]
+    async fn non_admin_cannot_mint_admin_only_scopes_on_auth_tokens_endpoint() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username); // is_admin: false
+
+        for admin_scope in crate::services::token_service::ADMIN_ONLY_SCOPES {
+            let app = build_app(state.clone(), auth.clone());
+            let body = json!({
+                "name": format!("probe-{}", admin_scope),
+                "scopes": [admin_scope],
+                "expires_in_days": 30_i64,
+            })
+            .to_string();
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/tokens")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let (status, body_bytes) = tdh::send(app, req).await;
+
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "non-admin minting auth token with admin-class scope {:?} MUST 403; got {} body: {}",
+                admin_scope,
+                status,
+                String::from_utf8_lossy(&body_bytes),
+            );
+        }
+
+        cleanup(&pool, user_id).await;
+    }
+
+    /// A non-admin must not smuggle an admin-only scope through this
+    /// endpoint by burying it in a list of otherwise-safe scopes.
+    #[tokio::test]
+    async fn non_admin_cannot_smuggle_admin_scope_in_a_mixed_list_auth_endpoint() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let auth = tdh::make_auth(user_id, &username);
+        let app = build_app(state, auth);
+
+        let body = json!({
+            "name": "smuggle-attempt",
+            "scopes": ["read:artifacts", "write:artifacts", "delete:repositories"],
+            "expires_in_days": 30_i64,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin smuggling 'delete:repositories' on /auth/tokens MUST 403"
+        );
+
+        cleanup(&pool, user_id).await;
+    }
+
+    /// Admin callers retain the ability to grant the entire policy
+    /// surface via this endpoint. Pinning this prevents the policy from
+    /// accidentally locking out legitimate admin token issuance.
+    #[tokio::test]
+    async fn admin_can_mint_admin_only_scopes_on_auth_tokens_endpoint() {
+        let Some((pool, state, user_id, username)) = setup().await else {
+            return;
+        };
+        let mut auth = tdh::make_auth(user_id, &username);
+        auth.is_admin = true;
+        let app = build_app(state, auth);
+
+        let body = json!({
+            "name": "admin-token",
+            "scopes": ["*"],
+            "expires_in_days": 30_i64,
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (status, body_bytes) = tdh::send(app, req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin minting a wildcard auth token MUST succeed; got {} body: {}",
+            status,
+            String::from_utf8_lossy(&body_bytes),
+        );
+
+        cleanup(&pool, user_id).await;
     }
 }

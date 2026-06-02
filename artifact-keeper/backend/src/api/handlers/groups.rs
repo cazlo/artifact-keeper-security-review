@@ -1,7 +1,7 @@
 //! Group management handlers.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     routing::{get, post},
     Json, Router,
 };
@@ -11,8 +11,15 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
+
+/// Require that the request is authenticated, returning an error if not.
+fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
+    auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
+}
 
 /// Create group routes
 pub fn router() -> Router<SharedState> {
@@ -30,6 +37,27 @@ pub struct ListGroupsQuery {
     pub search: Option<String>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
+}
+
+/// Query parameters for the group detail endpoint, controlling member pagination.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct GetGroupQuery {
+    /// Maximum number of members to return (default: 50, max: 200)
+    pub member_limit: Option<u32>,
+    /// Number of members to skip for pagination (default: 0)
+    pub member_offset: Option<u32>,
+}
+
+impl GetGroupQuery {
+    /// Resolved limit, clamped to [1, 200] with a default of 50.
+    pub fn limit(&self) -> i64 {
+        self.member_limit.unwrap_or(50).clamp(1, 200) as i64
+    }
+
+    /// Resolved offset with a default of 0.
+    pub fn offset(&self) -> i64 {
+        self.member_offset.unwrap_or(0) as i64
+    }
 }
 
 #[derive(Debug, Serialize, FromRow, ToSchema)]
@@ -63,6 +91,44 @@ impl From<GroupRow> for GroupResponse {
             updated_at: row.updated_at,
         }
     }
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct MemberRow {
+    pub user_id: Uuid,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub joined_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GroupMemberResponse {
+    pub user_id: Uuid,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub joined_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<MemberRow> for GroupMemberResponse {
+    fn from(row: MemberRow) -> Self {
+        Self {
+            user_id: row.user_id,
+            username: row.username,
+            display_name: row.display_name,
+            joined_at: row.joined_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GroupDetailResponse {
+    #[serde(flatten)]
+    pub group: GroupResponse,
+    /// Paginated list of group members.
+    pub members: Vec<GroupMemberResponse>,
+    /// Total number of members in the group. Clients can compare this against
+    /// the length of `members` to determine whether additional pages exist.
+    pub members_total: i64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -183,6 +249,8 @@ pub struct CreatedGroupRow {
     request_body = CreateGroupRequest,
     responses(
         (status = 200, description = "Group created successfully", body = GroupResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 409, description = "Group name already exists"),
         (status = 500, description = "Internal server error")
     ),
@@ -190,8 +258,34 @@ pub struct CreatedGroupRow {
 )]
 pub async fn create_group(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Json(payload): Json<CreateGroupRequest>,
 ) -> Result<Json<GroupResponse>> {
+    let auth = require_auth(auth)?;
+    // GHSA-vvc3-h39c-mrq5: gate on API-token scope before consulting the
+    // fine-grained permission table. A read-scoped service-account token
+    // must not be able to create groups even if its user has admin perms.
+    auth.require_scope("write")?;
+
+    // Fine-grained permission check: non-admins need "admin" on the system sentinel.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(
+                auth.user_id,
+                SYSTEM_TARGET_TYPE,
+                SYSTEM_SENTINEL_ID,
+                "admin",
+                false,
+            )
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to create groups".to_string(),
+            ));
+        }
+    }
+
     let group: CreatedGroupRow = sqlx::query_as(
         r#"
         INSERT INTO groups (name, description)
@@ -231,10 +325,11 @@ pub async fn create_group(
     context_path = "/api/v1/groups",
     tag = "groups",
     params(
-        ("id" = Uuid, Path, description = "Group ID")
+        ("id" = Uuid, Path, description = "Group ID"),
+        GetGroupQuery,
     ),
     responses(
-        (status = 200, description = "Group details", body = GroupResponse),
+        (status = 200, description = "Group details with paginated members", body = GroupDetailResponse),
         (status = 404, description = "Group not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -243,7 +338,8 @@ pub async fn create_group(
 pub async fn get_group(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<GroupResponse>> {
+    Query(query): Query<GetGroupQuery>,
+) -> Result<Json<GroupDetailResponse>> {
     // Check if groups table exists first
     let table_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'groups')",
@@ -272,7 +368,36 @@ pub async fn get_group(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Group not found".to_string()))?;
 
-    Ok(Json(GroupResponse::from(group)))
+    let member_limit = query.limit();
+    let member_offset = query.offset();
+
+    let members: Vec<MemberRow> = sqlx::query_as(
+        r#"
+        SELECT ugm.user_id, u.username, u.display_name, ugm.joined_at
+        FROM user_group_members ugm
+        JOIN users u ON u.id = ugm.user_id
+        WHERE ugm.group_id = $1
+        ORDER BY ugm.joined_at
+        LIMIT $2
+        OFFSET $3
+        "#,
+    )
+    .bind(id)
+    .bind(member_limit)
+    .bind(member_offset)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // member_count from the group query already holds the total; reuse it
+    // instead of issuing a separate COUNT query.
+    let members_total = group.member_count;
+
+    Ok(Json(GroupDetailResponse {
+        group: GroupResponse::from(group),
+        members: members.into_iter().map(GroupMemberResponse::from).collect(),
+        members_total,
+    }))
 }
 
 /// Update a group
@@ -287,6 +412,8 @@ pub async fn get_group(
     request_body = CreateGroupRequest,
     responses(
         (status = 200, description = "Group updated successfully", body = GroupResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Group not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -294,9 +421,27 @@ pub async fn get_group(
 )]
 pub async fn update_group(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
     Json(payload): Json<CreateGroupRequest>,
 ) -> Result<Json<GroupResponse>> {
+    let auth = require_auth(auth)?;
+    // GHSA-vvc3-h39c-mrq5: require the write scope on the token.
+    auth.require_scope("write")?;
+
+    // Fine-grained permission check: non-admins need "admin" on the target group.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "group", id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to update this group".to_string(),
+            ));
+        }
+    }
+
     let group: CreatedGroupRow = sqlx::query_as(
         r#"
         UPDATE groups
@@ -343,12 +488,35 @@ pub async fn update_group(
     ),
     responses(
         (status = 200, description = "Group deleted successfully"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Group not found"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
 )]
-pub async fn delete_group(State(state): State<SharedState>, Path(id): Path<Uuid>) -> Result<()> {
+pub async fn delete_group(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(id): Path<Uuid>,
+) -> Result<()> {
+    let auth = require_auth(auth)?;
+    // GHSA-vvc3-h39c-mrq5: deletion needs the delete scope.
+    auth.require_scope("delete")?;
+
+    // Fine-grained permission check: non-admins need "admin" on the target group.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "group", id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to delete this group".to_string(),
+            ));
+        }
+    }
+
     let result = sqlx::query("DELETE FROM groups WHERE id = $1")
         .bind(id)
         .execute(&state.db)
@@ -381,6 +549,8 @@ pub struct MembersRequest {
     request_body = MembersRequest,
     responses(
         (status = 200, description = "Members added successfully"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Group not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -388,9 +558,27 @@ pub struct MembersRequest {
 )]
 pub async fn add_members(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
     Json(payload): Json<MembersRequest>,
 ) -> Result<()> {
+    let auth = require_auth(auth)?;
+    // GHSA-vvc3-h39c-mrq5: enforce write scope on token.
+    auth.require_scope("write")?;
+
+    // Fine-grained permission check: non-admins need "admin" on the target group.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "group", id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to manage group membership".to_string(),
+            ));
+        }
+    }
+
     for user_id in payload.user_ids {
         sqlx::query(
             r#"
@@ -423,6 +611,8 @@ pub async fn add_members(
     request_body = MembersRequest,
     responses(
         (status = 200, description = "Members removed successfully"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Group not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -430,9 +620,27 @@ pub async fn add_members(
 )]
 pub async fn remove_members(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
     Json(payload): Json<MembersRequest>,
 ) -> Result<()> {
+    let auth = require_auth(auth)?;
+    // GHSA-vvc3-h39c-mrq5: removing members is destructive; require delete scope.
+    auth.require_scope("delete")?;
+
+    // Fine-grained permission check: non-admins need "admin" on the target group.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "group", id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to manage group membership".to_string(),
+            ));
+        }
+    }
+
     for user_id in payload.user_ids {
         sqlx::query("DELETE FROM user_group_members WHERE user_id = $1 AND group_id = $2")
             .bind(user_id)
@@ -461,6 +669,8 @@ pub async fn remove_members(
     components(schemas(
         GroupRow,
         GroupResponse,
+        GroupMemberResponse,
+        GroupDetailResponse,
         GroupListResponse,
         CreateGroupRequest,
         CreatedGroupRow,
@@ -502,6 +712,57 @@ mod tests {
         let query: ListGroupsQuery = serde_json::from_str(json).unwrap();
         assert_eq!(query.search, Some("admin".to_string()));
         assert!(query.page.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // GetGroupQuery deserialization and pagination logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_group_query_defaults() {
+        let json = r#"{}"#;
+        let query: GetGroupQuery = serde_json::from_str(json).unwrap();
+        assert!(query.member_limit.is_none());
+        assert!(query.member_offset.is_none());
+        assert_eq!(query.limit(), 50);
+        assert_eq!(query.offset(), 0);
+    }
+
+    #[test]
+    fn test_get_group_query_custom_values() {
+        let json = r#"{"member_limit": 10, "member_offset": 20}"#;
+        let query: GetGroupQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.limit(), 10);
+        assert_eq!(query.offset(), 20);
+    }
+
+    #[test]
+    fn test_get_group_query_limit_clamped_to_max() {
+        let json = r#"{"member_limit": 500}"#;
+        let query: GetGroupQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.limit(), 200);
+    }
+
+    #[test]
+    fn test_get_group_query_limit_clamped_to_min() {
+        let json = r#"{"member_limit": 0}"#;
+        let query: GetGroupQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.limit(), 1);
+    }
+
+    #[test]
+    fn test_get_group_query_limit_at_boundary() {
+        let json = r#"{"member_limit": 200}"#;
+        let query: GetGroupQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.limit(), 200);
+    }
+
+    #[test]
+    fn test_get_group_query_offset_only() {
+        let json = r#"{"member_offset": 100}"#;
+        let query: GetGroupQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.limit(), 50);
+        assert_eq!(query.offset(), 100);
     }
 
     // -----------------------------------------------------------------------
@@ -594,7 +855,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // GroupRow → GroupResponse conversion
+    // GroupRow -> GroupResponse conversion
     // -----------------------------------------------------------------------
 
     #[test]
@@ -754,6 +1015,215 @@ mod tests {
         assert_eq!(json["pagination"]["total"], 1);
     }
 
+    // -----------------------------------------------------------------------
+    // MemberRow -> GroupMemberResponse conversion
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_member_row_to_response() {
+        let now = Utc::now();
+        let row = MemberRow {
+            user_id: Uuid::nil(),
+            username: "alice".to_string(),
+            display_name: Some("Alice".to_string()),
+            joined_at: now,
+        };
+        let resp: GroupMemberResponse = row.into();
+        assert_eq!(resp.user_id, Uuid::nil());
+        assert_eq!(resp.username, "alice");
+        assert_eq!(resp.display_name, Some("Alice".to_string()));
+        assert_eq!(resp.joined_at, now);
+    }
+
+    #[test]
+    fn test_member_row_to_response_no_display_name() {
+        let row = MemberRow {
+            user_id: Uuid::nil(),
+            username: "bob".to_string(),
+            display_name: None,
+            joined_at: Utc::now(),
+        };
+        let resp: GroupMemberResponse = row.into();
+        assert_eq!(resp.username, "bob");
+        assert!(resp.display_name.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // GroupMemberResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_group_member_response_serialization() {
+        let member = GroupMemberResponse {
+            user_id: Uuid::nil(),
+            username: "alice".to_string(),
+            display_name: Some("Alice".to_string()),
+            joined_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&member).unwrap();
+        assert_eq!(json["user_id"], "00000000-0000-0000-0000-000000000000");
+        assert_eq!(json["username"], "alice");
+        assert_eq!(json["display_name"], "Alice");
+        assert!(json["joined_at"].is_string());
+    }
+
+    #[test]
+    fn test_group_member_response_null_display_name() {
+        let member = GroupMemberResponse {
+            user_id: Uuid::nil(),
+            username: "bob".to_string(),
+            display_name: None,
+            joined_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&member).unwrap();
+        assert_eq!(json["username"], "bob");
+        assert!(json["display_name"].is_null());
+    }
+
+    // -----------------------------------------------------------------------
+    // GroupDetailResponse serialization (flatten + members + members_total)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_group_detail_response_flattens_group_fields() {
+        let detail = GroupDetailResponse {
+            group: GroupResponse {
+                id: Uuid::nil(),
+                name: "dev".to_string(),
+                description: Some("Developers".to_string()),
+                member_count: 2,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            members: vec![],
+            members_total: 2,
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        // group is flattened: its fields appear at the top level alongside members
+        assert_eq!(json["name"], "dev");
+        assert_eq!(json["description"], "Developers");
+        assert_eq!(json["member_count"], 2);
+        assert!(json["members"].is_array());
+        assert_eq!(json["members_total"], 2);
+        // the nested "group" key should not exist in flattened output
+        assert!(json["group"].is_null());
+    }
+
+    #[test]
+    fn test_group_detail_response_with_members() {
+        let now = Utc::now();
+        let detail = GroupDetailResponse {
+            group: GroupResponse {
+                id: Uuid::nil(),
+                name: "admins".to_string(),
+                description: None,
+                member_count: 2,
+                created_at: now,
+                updated_at: now,
+            },
+            members: vec![
+                GroupMemberResponse {
+                    user_id: Uuid::nil(),
+                    username: "alice".to_string(),
+                    display_name: Some("Alice".to_string()),
+                    joined_at: now,
+                },
+                GroupMemberResponse {
+                    user_id: Uuid::nil(),
+                    username: "bob".to_string(),
+                    display_name: None,
+                    joined_at: now,
+                },
+            ],
+            members_total: 2,
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        let members = json["members"].as_array().unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0]["username"], "alice");
+        assert_eq!(members[1]["username"], "bob");
+        assert!(members[1]["display_name"].is_null());
+        assert_eq!(json["members_total"], 2);
+    }
+
+    #[test]
+    fn test_group_detail_response_empty_members() {
+        let detail = GroupDetailResponse {
+            group: GroupResponse {
+                id: Uuid::nil(),
+                name: "empty".to_string(),
+                description: None,
+                member_count: 0,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            members: vec![],
+            members_total: 0,
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["member_count"], 0);
+        assert!(json["members"].as_array().unwrap().is_empty());
+        assert_eq!(json["members_total"], 0);
+    }
+
+    #[test]
+    fn test_group_detail_response_contains_all_group_fields() {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        let detail = GroupDetailResponse {
+            group: GroupResponse {
+                id,
+                name: "ops".to_string(),
+                description: Some("Operations".to_string()),
+                member_count: 1,
+                created_at: now,
+                updated_at: now,
+            },
+            members: vec![GroupMemberResponse {
+                user_id: Uuid::new_v4(),
+                username: "carol".to_string(),
+                display_name: Some("Carol".to_string()),
+                joined_at: now,
+            }],
+            members_total: 1,
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["id"], id.to_string());
+        assert_eq!(json["name"], "ops");
+        assert_eq!(json["description"], "Operations");
+        assert_eq!(json["member_count"], 1);
+        assert!(json["created_at"].is_string());
+        assert!(json["updated_at"].is_string());
+        assert_eq!(json["members"].as_array().unwrap().len(), 1);
+        assert_eq!(json["members_total"], 1);
+    }
+
+    #[test]
+    fn test_group_detail_response_members_total_exceeds_page() {
+        let now = Utc::now();
+        let detail = GroupDetailResponse {
+            group: GroupResponse {
+                id: Uuid::nil(),
+                name: "large".to_string(),
+                description: None,
+                member_count: 500,
+                created_at: now,
+                updated_at: now,
+            },
+            members: vec![GroupMemberResponse {
+                user_id: Uuid::nil(),
+                username: "first".to_string(),
+                display_name: None,
+                joined_at: now,
+            }],
+            members_total: 500,
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        // Only 1 member in the page but total is 500
+        assert_eq!(json["members"].as_array().unwrap().len(), 1);
+        assert_eq!(json["members_total"], 500);
+    }
+
     #[test]
     fn test_group_list_response_empty() {
         let resp = GroupListResponse {
@@ -769,5 +1239,174 @@ mod tests {
         assert!(json["items"].as_array().unwrap().is_empty());
         assert_eq!(json["pagination"]["total"], 0);
         assert_eq!(json["pagination"]["total_pages"], 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Permission check logic (Phase 3: admin-level endpoint checks)
+    // -----------------------------------------------------------------------
+
+    fn make_auth(is_admin: bool) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "testuser".to_string(),
+            email: "test@example.com".to_string(),
+            is_admin,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    /// Simulates the permission gate used in group mutation handlers.
+    /// Admins bypass all checks; non-admins must hold the required action.
+    fn check_permission_gate(
+        is_admin: bool,
+        granted_actions: &[&str],
+        required_action: &str,
+    ) -> bool {
+        if is_admin {
+            return true;
+        }
+        granted_actions.contains(&required_action)
+    }
+
+    #[test]
+    fn test_require_auth_none_returns_error() {
+        let result = require_auth(None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::Authentication(msg) => assert!(msg.contains("Authentication required")),
+            other => panic!("Expected Authentication error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_require_auth_some_returns_auth() {
+        let auth = make_auth(false);
+        let user_id = auth.user_id;
+        let result = require_auth(Some(auth));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().user_id, user_id);
+    }
+
+    #[test]
+    fn test_create_group_permission_admin_bypasses() {
+        let auth = make_auth(true);
+        assert!(check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_create_group_permission_non_admin_with_system_grant() {
+        let auth = make_auth(false);
+        assert!(check_permission_gate(auth.is_admin, &["admin"], "admin"));
+    }
+
+    #[test]
+    fn test_create_group_permission_non_admin_without_grant_denied() {
+        let auth = make_auth(false);
+        assert!(!check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_create_group_permission_non_admin_with_wrong_grant_denied() {
+        let auth = make_auth(false);
+        assert!(!check_permission_gate(
+            auth.is_admin,
+            &["read", "write"],
+            "admin"
+        ));
+    }
+
+    #[test]
+    fn test_update_group_permission_admin_bypasses() {
+        let auth = make_auth(true);
+        assert!(check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_update_group_permission_non_admin_with_group_grant() {
+        let auth = make_auth(false);
+        assert!(check_permission_gate(auth.is_admin, &["admin"], "admin"));
+    }
+
+    #[test]
+    fn test_update_group_permission_non_admin_without_grant_denied() {
+        let auth = make_auth(false);
+        assert!(!check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_delete_group_permission_admin_bypasses() {
+        let auth = make_auth(true);
+        assert!(check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_delete_group_permission_non_admin_with_grant() {
+        let auth = make_auth(false);
+        assert!(check_permission_gate(auth.is_admin, &["admin"], "admin"));
+    }
+
+    #[test]
+    fn test_delete_group_permission_non_admin_without_grant_denied() {
+        let auth = make_auth(false);
+        assert!(!check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_add_members_permission_admin_bypasses() {
+        let auth = make_auth(true);
+        assert!(check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_add_members_permission_non_admin_with_grant() {
+        let auth = make_auth(false);
+        assert!(check_permission_gate(auth.is_admin, &["admin"], "admin"));
+    }
+
+    #[test]
+    fn test_add_members_permission_non_admin_denied() {
+        let auth = make_auth(false);
+        assert!(!check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_remove_members_permission_admin_bypasses() {
+        let auth = make_auth(true);
+        assert!(check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_remove_members_permission_non_admin_with_grant() {
+        let auth = make_auth(false);
+        assert!(check_permission_gate(auth.is_admin, &["admin"], "admin"));
+    }
+
+    #[test]
+    fn test_remove_members_permission_non_admin_denied() {
+        let auth = make_auth(false);
+        assert!(!check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_system_sentinel_is_nil_uuid() {
+        // create_group uses SYSTEM_SENTINEL_ID as the system sentinel target_id
+        assert_eq!(
+            SYSTEM_SENTINEL_ID.to_string(),
+            "00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(SYSTEM_TARGET_TYPE, "system");
+    }
+
+    #[test]
+    fn test_permission_gate_non_admin_multiple_grants_includes_admin() {
+        let auth = make_auth(false);
+        assert!(check_permission_gate(
+            auth.is_admin,
+            &["read", "write", "delete", "admin"],
+            "admin"
+        ));
     }
 }

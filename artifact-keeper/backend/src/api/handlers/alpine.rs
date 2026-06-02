@@ -24,7 +24,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
 use crate::services::signing_service::SigningService;
@@ -114,7 +114,7 @@ async fn list_alpine_artifacts(
     repository: &str,
     arch: &str,
 ) -> Result<Vec<AlpineArtifact>, Response> {
-    let path_prefix = format!("{}/{}/{}/", branch, repository, arch);
+    let path_prefix = super::escape_path_prefix(&[branch, repository, arch]);
     let rows = sqlx::query!(
         r#"
         SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
@@ -123,7 +123,7 @@ async fn list_alpine_artifacts(
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND a.path LIKE $2 || '%'
+          AND a.path LIKE $2 || '%' ESCAPE '\'
         ORDER BY a.name, a.created_at DESC
         "#,
         repo_id,
@@ -601,9 +601,45 @@ async fn download_package(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
+    // Check quarantine status before serving
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
+        .await
+        .map_err(|e| e.into_response())?;
+
     match storage.get(&artifact.storage_key).await {
         Ok(content) => {
             // Record download
+            let _ = sqlx::query!(
+                "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
+                artifact.id
+            )
+            .execute(&state.db)
+            .await;
+
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/vnd.alpine.package")
+                .header(
+                    "Content-Disposition",
+                    format!("attachment; filename=\"{}\"", filename),
+                )
+                .header(CONTENT_LENGTH, content.len().to_string())
+                .header("X-Checksum-SHA256", &artifact.checksum_sha256)
+                .body(Body::from(content))
+                .unwrap())
+        }
+        Err(crate::error::AppError::NotFound(_)) if repo.repo_type != RepositoryType::Remote => {
+            // Hosted artifact: file absent from storage. Serialise concurrent
+            // readers with local hydration coordination and retry once.
+            // Returns 507 if the file is still missing after the retry window.
+            let content = proxy_helpers::coordinated_retry_get(
+                &state.db,
+                artifact.id,
+                &artifact.storage_key,
+                &*storage,
+            )
+            .await?;
+
             let _ = sqlx::query!(
                 "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
                 artifact.id
@@ -675,18 +711,19 @@ async fn try_proxy_apk(
         _ => return Ok(None),
     };
     let upstream_path = format!("{}/{}/{}/{}", branch, repository, arch, filename);
-    let (content, content_type) =
-        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &upstream_path).await?;
-    Ok(Some(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                "Content-Type",
-                content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-            )
-            .body(Body::from(content))
-            .unwrap(),
-    ))
+    // #895: stream large .apk bodies (a few MiB to ~100 MiB for LLVM-class
+    // packages). Default Content-Type matches the buffered handler's
+    // prior fallback.
+    proxy_helpers::proxy_fetch_streaming(
+        proxy,
+        repo.id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        "application/octet-stream",
+    )
+    .await
+    .map(Some)
 }
 
 // ---------------------------------------------------------------------------
@@ -705,7 +742,8 @@ async fn upload_package_put(
     )>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "alpine")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "alpine", "write")?.user_id;
     let repo = resolve_alpine_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
@@ -737,7 +775,8 @@ async fn upload_package_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "alpine")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "alpine", "write")?.user_id;
     let repo = resolve_alpine_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 

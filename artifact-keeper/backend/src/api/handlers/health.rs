@@ -1,10 +1,13 @@
 //! Health check endpoints.
 //!
 //! Provides Kubernetes-style probes:
-//! - `/livez`   — lightweight liveness (process alive, no external deps)
-//! - `/readyz`  — readiness gate (DB + migrations + setup complete)
-//! - `/health`  — rich status page for dashboards (all services + pool stats)
-//! - `/healthz` — alias for `/health`
+//! - `/livez`   - lightweight liveness (process alive, no external deps)
+//! - `/readyz`  - readiness gate (DB + migrations reachable). Initial-setup
+//!   state (admin password change required) is reported as an informational
+//!   field but does NOT cause a 503. A 503 here would make Kubernetes restart
+//!   the pod and prevent operators from completing setup via `kubectl exec`.
+//! - `/health`  - rich status page for dashboards (all services + pool stats)
+//! - `/healthz` - alias for `/health`
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Serialize;
@@ -14,6 +17,25 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::api::SharedState;
 use crate::storage::StorageBackend;
+
+/// Canonical status string for a healthy db / migrations / storage check.
+/// Held as a module-private constant so the readiness gate (`is_ready`) and
+/// the call sites that build `CheckStatus` agree on one spelling. If a future
+/// cleanup ever renames this vocabulary, both ends move together rather than
+/// drifting silently and making the gate return false for everything.
+const STATUS_HEALTHY: &str = "healthy";
+
+/// Canonical status string for an unhealthy db / migrations / storage check.
+const STATUS_UNHEALTHY: &str = "unhealthy";
+
+/// Status string for a setup_complete check that has finished (admin
+/// password was changed). Distinct from STATUS_HEALTHY because setup is
+/// informational, not a readiness gate (see #889) - the vocabulary
+/// difference signals that to readers and to anything diffing the JSON.
+const SETUP_COMPLETE: &str = "complete";
+
+/// Status string for a setup_complete check that has NOT yet finished.
+const SETUP_INCOMPLETE: &str = "incomplete";
 
 #[derive(Serialize, ToSchema)]
 pub struct HealthResponse {
@@ -36,7 +58,7 @@ pub struct HealthChecks {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security_scanner: Option<CheckStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub meilisearch: Option<CheckStatus>,
+    pub opensearch: Option<CheckStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ldap: Option<CheckStatus>,
 }
@@ -90,11 +112,11 @@ async fn check_service_health(
     let url = format!("{}{}", base_url.trim_end_matches('/'), health_path);
     match client.get(&url).send().await {
         Ok(resp) if resp.status().is_success() => CheckStatus {
-            status: "healthy".to_string(),
+            status: STATUS_HEALTHY.to_string(),
             message: None,
         },
         Ok(resp) => CheckStatus {
-            status: "unhealthy".to_string(),
+            status: STATUS_UNHEALTHY.to_string(),
             message: Some(format!(
                 "{} returned status {}",
                 service_name,
@@ -108,10 +130,10 @@ async fn check_service_health(
     }
 }
 
-/// Health check endpoint — rich status page for dashboards.
+/// Health check endpoint -- rich status page for dashboards.
 ///
 /// Checks database, storage (real write/read probe), optional services (Trivy,
-/// Meilisearch), and exposes DB connection pool statistics.
+/// OpenSearch), and exposes DB connection pool statistics.
 #[utoipa::path(
     get,
     path = "/health",
@@ -125,11 +147,11 @@ async fn check_service_health(
 pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse {
     let db_check = match sqlx::query("SELECT 1").fetch_one(&state.db).await {
         Ok(_) => CheckStatus {
-            status: "healthy".to_string(),
+            status: STATUS_HEALTHY.to_string(),
             message: None,
         },
         Err(e) => CheckStatus {
-            status: "unhealthy".to_string(),
+            status: STATUS_UNHEALTHY.to_string(),
             message: Some(format!("Database connection failed: {}", e)),
         },
     };
@@ -141,8 +163,23 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         None => None,
     };
 
-    let meili_check = match &state.config.meilisearch_url {
-        Some(url) => Some(check_service_health(url, "/health", "Meilisearch").await),
+    let opensearch_check = match &state.search_service {
+        Some(ref svc) => match svc.cluster_health().await {
+            Ok(status) => match status.as_str() {
+                "green" | "yellow" => Some(CheckStatus {
+                    status: STATUS_HEALTHY.to_string(),
+                    message: None,
+                }),
+                other => Some(CheckStatus {
+                    status: STATUS_UNHEALTHY.to_string(),
+                    message: Some(format!("OpenSearch cluster status: {}", other)),
+                }),
+            },
+            Err(e) => Some(CheckStatus {
+                status: "unavailable".to_string(),
+                message: Some(format!("OpenSearch unreachable: {}", e)),
+            }),
+        },
         None => None,
     };
 
@@ -153,13 +190,13 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         ) {
             Ok(svc) => match svc.check_health().await {
                 Ok(()) => Some(CheckStatus {
-                    status: "healthy".to_string(),
+                    status: STATUS_HEALTHY.to_string(),
                     message: None,
                 }),
                 Err(e) => {
                     tracing::warn!(error = %e, "LDAP health check failed");
                     Some(CheckStatus {
-                        status: "unhealthy".to_string(),
+                        status: STATUS_UNHEALTHY.to_string(),
                         message: Some("LDAP server unreachable".to_string()),
                     })
                 }
@@ -167,7 +204,7 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
             Err(e) => {
                 tracing::warn!(error = %e, "LDAP configuration error");
                 Some(CheckStatus {
-                    status: "unhealthy".to_string(),
+                    status: STATUS_UNHEALTHY.to_string(),
                     message: Some("LDAP configuration error".to_string()),
                 })
             }
@@ -176,14 +213,17 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         None
     };
 
-    let storage_healthy = storage_check.status == "healthy";
-    let meilisearch_healthy = meili_check.as_ref().map_or(true, |m| m.status == "healthy");
+    let storage_healthy = storage_check.status == STATUS_HEALTHY;
+    let opensearch_healthy = opensearch_check
+        .as_ref()
+        .map_or(true, |c| c.status == STATUS_HEALTHY);
 
-    let overall_status = if db_check.status == "healthy" && storage_healthy && meilisearch_healthy {
-        "healthy"
-    } else {
-        "unhealthy"
-    };
+    let overall_status =
+        if db_check.status == STATUS_HEALTHY && storage_healthy && opensearch_healthy {
+            STATUS_HEALTHY
+        } else {
+            STATUS_UNHEALTHY
+        };
 
     let pool_stats = DbPoolStats {
         max_connections: state.db.options().get_max_connections(),
@@ -208,7 +248,7 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
             database: db_check,
             storage: storage_check,
             security_scanner: scanner_check,
-            meilisearch: meili_check,
+            opensearch: opensearch_check,
             ldap: ldap_check,
         },
         db_pool: Some(pool_stats),
@@ -216,7 +256,7 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         dirty,
     };
 
-    let status_code = if overall_status == "healthy" {
+    let status_code = if overall_status == STATUS_HEALTHY {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -225,10 +265,18 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
     (status_code, Json(response))
 }
 
-/// Readiness probe — is the service ready to accept traffic?
+/// Readiness probe - is the service ready to accept traffic?
 ///
-/// Checks database connectivity, that migrations have run successfully,
-/// and that initial setup (admin password) is complete.
+/// Returns 200 once the database is reachable and migrations have applied
+/// successfully. Initial-setup state (whether the default admin password has
+/// been changed) is reported as an informational field on the response but
+/// does NOT influence the status code: a 503 here would make Kubernetes
+/// restart the pod, terminating any `kubectl exec` session an operator is
+/// using to complete setup. See issue #889.
+///
+/// API mutations are separately gated by the setup middleware
+/// (`api::middleware::setup`) until setup is complete, so a 200 from this
+/// endpoint does not imply that write traffic will be accepted.
 #[utoipa::path(
     get,
     path = "/readyz",
@@ -242,11 +290,11 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
 pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoResponse {
     let db_check = match sqlx::query("SELECT 1").fetch_one(&state.db).await {
         Ok(_) => CheckStatus {
-            status: "healthy".to_string(),
+            status: STATUS_HEALTHY.to_string(),
             message: None,
         },
         Err(e) => CheckStatus {
-            status: "unhealthy".to_string(),
+            status: STATUS_UNHEALTHY.to_string(),
             message: Some(format!("Database unreachable: {}", e)),
         },
     };
@@ -258,15 +306,15 @@ pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoRespo
     .await
     {
         Ok(true) => CheckStatus {
-            status: "healthy".to_string(),
+            status: STATUS_HEALTHY.to_string(),
             message: None,
         },
         Ok(false) => CheckStatus {
-            status: "unhealthy".to_string(),
+            status: STATUS_UNHEALTHY.to_string(),
             message: Some("No successful migrations found".to_string()),
         },
         Err(e) => CheckStatus {
-            status: "unhealthy".to_string(),
+            status: STATUS_UNHEALTHY.to_string(),
             message: Some(format!("Migration check failed: {}", e)),
         },
     };
@@ -274,24 +322,49 @@ pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoRespo
     let setup_required = state
         .setup_required
         .load(std::sync::atomic::Ordering::Relaxed);
-    let setup_check = if !setup_required {
+    let (status_code, response) = build_readyz_response(db_check, migrations_check, setup_required);
+
+    if setup_required {
+        tracing::debug!("/readyz: setup incomplete (informational, not blocking readiness)");
+    }
+
+    (status_code, Json(response))
+}
+
+/// Pure response-builder for the readiness probe.
+///
+/// Splits "what the response says" from "how we discovered it" so the
+/// readiness logic is unit-testable without spinning up a `SharedState` or
+/// a database pool. The handler is now a thin DB-binding wrapper around
+/// this function. Any future regression in the readiness gate (#889) can
+/// be caught by exercising this function directly with the three input
+/// values, since it is the same logic the handler runs.
+///
+/// Setup state is informational only. It surfaces "admin password not yet
+/// changed" so dashboards and operators can see the condition, but it is
+/// intentionally excluded from the readiness gate (see #889 - restarting
+/// the pod here makes setup impossible via `kubectl exec`).
+fn build_readyz_response(
+    db_check: CheckStatus,
+    migrations_check: CheckStatus,
+    setup_required: bool,
+) -> (StatusCode, ReadyzResponse) {
+    let setup_check = if setup_required {
         CheckStatus {
-            status: "healthy".to_string(),
-            message: None,
+            status: SETUP_INCOMPLETE.to_string(),
+            message: Some("Admin password change required".to_string()),
         }
     } else {
         CheckStatus {
-            status: "unhealthy".to_string(),
-            message: Some("Admin password change required".to_string()),
+            status: SETUP_COMPLETE.to_string(),
+            message: None,
         }
     };
 
-    let all_healthy = db_check.status == "healthy"
-        && migrations_check.status == "healthy"
-        && setup_check.status == "healthy";
+    let ready = is_ready(&db_check, &migrations_check);
 
     let response = ReadyzResponse {
-        status: if all_healthy {
+        status: if ready {
             "ready".to_string()
         } else {
             "not_ready".to_string()
@@ -303,16 +376,29 @@ pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoRespo
         },
     };
 
-    let status_code = if all_healthy {
+    let status_code = if ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
 
-    (status_code, Json(response))
+    (status_code, response)
 }
 
-/// Liveness probe — confirms the process is alive and can serve HTTP.
+/// Compute whether the service should be reported as ready.
+///
+/// Only the database and migrations checks gate readiness. Setup state is
+/// informational and intentionally excluded - see the docstring on
+/// [`readiness_check`] and issue #889.
+///
+/// Uses the [`STATUS_HEALTHY`] constant rather than a string literal so that
+/// the gate cannot silently start returning `false` if the vocabulary used
+/// by upstream check builders is ever changed without updating this site.
+fn is_ready(db_check: &CheckStatus, migrations_check: &CheckStatus) -> bool {
+    db_check.status == STATUS_HEALTHY && migrations_check.status == STATUS_HEALTHY
+}
+
+/// Liveness probe - confirms the process is alive and can serve HTTP.
 ///
 /// Takes no State parameter. If Axum can route the request and execute this
 /// function, the process is alive. External service failures cannot trigger
@@ -350,7 +436,7 @@ async fn check_storage_health(
                 Ok(p) => p,
                 Err(e) => {
                     return CheckStatus {
-                        status: "unhealthy".to_string(),
+                        status: STATUS_UNHEALTHY.to_string(),
                         message: Some(format!("Storage path not accessible: {}", e)),
                     };
                 }
@@ -358,7 +444,7 @@ async fn check_storage_health(
             let probe_path = storage_base.join(".health-probe");
             if !probe_path.starts_with(&storage_base) {
                 return CheckStatus {
-                    status: "unhealthy".to_string(),
+                    status: STATUS_UNHEALTHY.to_string(),
                     message: Some("Storage probe path escaped base directory".to_string()),
                 };
             }
@@ -367,21 +453,21 @@ async fn check_storage_health(
                     Ok(data) if data == b"ok" => {
                         let _ = tokio::fs::remove_file(&probe_path).await;
                         CheckStatus {
-                            status: "healthy".to_string(),
+                            status: STATUS_HEALTHY.to_string(),
                             message: None,
                         }
                     }
                     Ok(_) => CheckStatus {
-                        status: "unhealthy".to_string(),
+                        status: STATUS_UNHEALTHY.to_string(),
                         message: Some("Storage read-back mismatch".to_string()),
                     },
                     Err(e) => CheckStatus {
-                        status: "unhealthy".to_string(),
+                        status: STATUS_UNHEALTHY.to_string(),
                         message: Some(format!("Storage read failed: {}", e)),
                     },
                 },
                 Err(e) => CheckStatus {
-                    status: "unhealthy".to_string(),
+                    status: STATUS_UNHEALTHY.to_string(),
                     message: Some(format!("Storage write failed: {}", e)),
                 },
             }
@@ -392,18 +478,18 @@ async fn check_storage_health(
             let probe = storage.health_check();
             match tokio::time::timeout(Duration::from_secs(5), probe).await {
                 Ok(Ok(())) => CheckStatus {
-                    status: "healthy".to_string(),
+                    status: STATUS_HEALTHY.to_string(),
                     message: None,
                 },
                 Ok(Err(e)) => CheckStatus {
-                    status: "unhealthy".to_string(),
+                    status: STATUS_UNHEALTHY.to_string(),
                     message: Some(format!(
                         "{} storage probe failed: {}",
                         config.storage_backend, e
                     )),
                 },
                 Err(_) => CheckStatus {
-                    status: "unhealthy".to_string(),
+                    status: STATUS_UNHEALTHY.to_string(),
                     message: Some(format!(
                         "{} storage probe timed out (5s)",
                         config.storage_backend
@@ -443,6 +529,130 @@ pub async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Jemalloc heap profiling (only available with `--features profiling`)
+// ---------------------------------------------------------------------------
+
+/// Dump a jemalloc heap profile.
+///
+/// Requires the binary to be started with `_RJEM_MALLOC_CONF=prof:true` (or
+/// the equivalent `MALLOC_CONF`). Returns a pprof-compatible heap profile
+/// that can be analyzed with `jeprof` / `pprof`.
+///
+/// Query parameters:
+/// - `activate` - if `"true"`, activate profiling at runtime (prof.active).
+/// - `deactivate` - if `"true"`, deactivate profiling (prof.active = false).
+/// - `dump` (default) - dump current profile to a temp file and return it.
+#[cfg(feature = "profiling")]
+pub async fn heap_profile(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    use tikv_jemalloc_ctl::raw;
+
+    // Activate profiling at runtime.
+    if params.get("activate").map(|v| v == "true").unwrap_or(false) {
+        let name = b"prof.active\0";
+        let activated: bool = true;
+        if let Err(e) = unsafe { raw::write(name, activated) } {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                format!("Failed to activate profiling: {e}"),
+            )
+                .into_response();
+        }
+        return (StatusCode::OK, "profiling activated\n").into_response();
+    }
+
+    // Deactivate profiling.
+    if params
+        .get("deactivate")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    {
+        let name = b"prof.active\0";
+        let deactivated: bool = false;
+        if let Err(e) = unsafe { raw::write(name, deactivated) } {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                format!("Failed to deactivate profiling: {e}"),
+            )
+                .into_response();
+        }
+        return (StatusCode::OK, "profiling deactivated\n").into_response();
+    }
+
+    // Dump heap profile.
+    let path = format!("/tmp/ak_heap_{}.prof", std::process::id());
+    let c_path = match std::ffi::CString::new(path.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("bad path: {e}")).into_response()
+        }
+    };
+
+    let name = b"prof.dump\0";
+    if let Err(e) = unsafe { raw::write(name, c_path.as_ptr() as *const std::ffi::c_char) } {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(axum::http::header::CONTENT_TYPE, "text/plain")],
+            format!("Failed to dump profile: {e}\n\nHint: start with _RJEM_MALLOC_CONF=prof:true"),
+        )
+            .into_response();
+    }
+
+    match tokio::fs::read(&path).await {
+        Ok(data) => {
+            let _ = tokio::fs::remove_file(&path).await;
+            (
+                StatusCode::OK,
+                [
+                    (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+                    (
+                        axum::http::header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"heap.prof\"",
+                    ),
+                ],
+                data,
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read profile: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Memory statistics from jemalloc (available with `--features profiling`).
+///
+/// Returns a JSON object with allocated, active, resident, mapped, and
+/// retained bytes.
+#[cfg(feature = "profiling")]
+pub async fn memory_stats() -> impl IntoResponse {
+    use tikv_jemalloc_ctl::{epoch, stats};
+
+    // Advance the jemalloc epoch to get fresh stats.
+    let _ = epoch::advance();
+
+    let allocated = stats::allocated::read().unwrap_or(0);
+    let active = stats::active::read().unwrap_or(0);
+    let resident = stats::resident::read().unwrap_or(0);
+    let mapped = stats::mapped::read().unwrap_or(0);
+    let retained = stats::retained::read().unwrap_or(0);
+
+    axum::Json(serde_json::json!({
+        "allocator": "jemalloc",
+        "allocated_bytes": allocated,
+        "active_bytes": active,
+        "resident_bytes": resident,
+        "mapped_bytes": mapped,
+        "retained_bytes": retained,
+    }))
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(health_check, readiness_check, liveness_check, metrics),
@@ -462,9 +672,25 @@ pub struct HealthApiDoc;
 mod tests {
     use super::*;
 
+    // The test helpers below intentionally use TWO distinct status-string
+    // vocabularies, matching what the production code emits:
+    //
+    //   * `healthy` / `unhealthy` for db / migrations / storage checks
+    //     (anything that gates readiness or overall health)
+    //   * `complete` / `incomplete` for setup_complete (informational only,
+    //     intentionally NOT a readiness driver - see #889)
+    //
+    // The two vocabularies coexist on purpose. If you write a new test that
+    // mixes them up (e.g. uses `unhealthy_check` for the setup_complete
+    // field), the test passes for the wrong reason. The readyz tests below
+    // drive `build_readyz_response` with `setup_required: bool` directly
+    // rather than constructing a setup CheckStatus by hand, which avoids
+    // the issue inside this module; the comment is here to warn anyone
+    // adding new tests that bypass `build_readyz_response`.
+
     fn healthy_check() -> CheckStatus {
         CheckStatus {
-            status: "healthy".to_string(),
+            status: STATUS_HEALTHY.to_string(),
             message: None,
         }
     }
@@ -481,17 +707,17 @@ mod tests {
     #[test]
     fn test_health_response_serialization() {
         let response = HealthResponse {
-            status: "healthy".to_string(),
+            status: STATUS_HEALTHY.to_string(),
             version: "1.0.0".to_string(),
             demo_mode: false,
             checks: HealthChecks {
                 database: healthy_check(),
                 storage: CheckStatus {
-                    status: "healthy".to_string(),
+                    status: STATUS_HEALTHY.to_string(),
                     message: Some("Connected".to_string()),
                 },
                 security_scanner: None,
-                meilisearch: None,
+                opensearch: None,
                 ldap: None,
             },
             db_pool: Some(sample_pool_stats()),
@@ -516,14 +742,14 @@ mod tests {
     #[test]
     fn test_health_response_without_pool_stats() {
         let response = HealthResponse {
-            status: "healthy".to_string(),
+            status: STATUS_HEALTHY.to_string(),
             version: "1.0.0".to_string(),
             demo_mode: false,
             checks: HealthChecks {
                 database: healthy_check(),
                 storage: healthy_check(),
                 security_scanner: None,
-                meilisearch: None,
+                opensearch: None,
                 ldap: None,
             },
             db_pool: None,
@@ -538,14 +764,14 @@ mod tests {
     #[test]
     fn test_health_response_with_scanner() {
         let response = HealthResponse {
-            status: "healthy".to_string(),
+            status: STATUS_HEALTHY.to_string(),
             version: "1.0.0".to_string(),
             demo_mode: false,
             checks: HealthChecks {
                 database: healthy_check(),
                 storage: healthy_check(),
                 security_scanner: Some(healthy_check()),
-                meilisearch: None,
+                opensearch: None,
                 ldap: None,
             },
             db_pool: None,
@@ -567,7 +793,7 @@ mod tests {
     #[test]
     fn test_check_status_with_message() {
         let status = CheckStatus {
-            status: "unhealthy".to_string(),
+            status: STATUS_UNHEALTHY.to_string(),
             message: Some("Connection refused".to_string()),
         };
         let json = serde_json::to_string(&status).unwrap();
@@ -577,17 +803,17 @@ mod tests {
     #[test]
     fn test_unhealthy_response_serialization() {
         let response = HealthResponse {
-            status: "unhealthy".to_string(),
+            status: STATUS_UNHEALTHY.to_string(),
             version: "1.0.0".to_string(),
             demo_mode: false,
             checks: HealthChecks {
                 database: CheckStatus {
-                    status: "unhealthy".to_string(),
+                    status: STATUS_UNHEALTHY.to_string(),
                     message: Some("Database connection failed: timeout".to_string()),
                 },
                 storage: healthy_check(),
                 security_scanner: None,
-                meilisearch: None,
+                opensearch: None,
                 ldap: None,
             },
             db_pool: None,
@@ -609,6 +835,20 @@ mod tests {
         assert_eq!(json, r#"{"status":"ok"}"#);
     }
 
+    fn unhealthy_check(message: &str) -> CheckStatus {
+        CheckStatus {
+            status: STATUS_UNHEALTHY.to_string(),
+            message: Some(message.to_string()),
+        }
+    }
+
+    fn setup_complete_check() -> CheckStatus {
+        CheckStatus {
+            status: SETUP_COMPLETE.to_string(),
+            message: None,
+        }
+    }
+
     #[test]
     fn test_readyz_response_serialization() {
         let response = ReadyzResponse {
@@ -616,31 +856,127 @@ mod tests {
             checks: ReadyzChecks {
                 database: healthy_check(),
                 migrations: healthy_check(),
-                setup_complete: healthy_check(),
+                setup_complete: setup_complete_check(),
             },
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"status\":\"ready\""));
         assert!(json.contains("\"migrations\""));
         assert!(json.contains("\"setup_complete\""));
+        assert!(json.contains("\"complete\""));
     }
 
     #[test]
     fn test_readyz_not_ready() {
+        // Migrations failing should drive the response to not_ready / 503.
         let response = ReadyzResponse {
             status: "not_ready".to_string(),
             checks: ReadyzChecks {
                 database: healthy_check(),
-                migrations: healthy_check(),
-                setup_complete: CheckStatus {
-                    status: "unhealthy".to_string(),
-                    message: Some("Admin password change required".to_string()),
-                },
+                migrations: unhealthy_check("No successful migrations found"),
+                setup_complete: setup_complete_check(),
             },
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"not_ready\""));
-        assert!(json.contains("Admin password change required"));
+        assert!(json.contains("No successful migrations found"));
+    }
+
+    /// Regression for #889: when only `setup_required` is true, the readiness
+    /// decision must remain "ready" so Kubernetes does not restart the pod
+    /// and kick the operator out of `kubectl exec` while they change the
+    /// default admin password.
+    ///
+    /// Drives `build_readyz_response` directly - the same pure function the
+    /// handler runs after performing its DB queries - so a future regression
+    /// that re-adds setup_complete to the all-healthy gate will fail this
+    /// test, not just a copy of the response shape.
+    #[test]
+    fn test_build_readyz_response_ready_when_only_setup_incomplete() {
+        let (status_code, response) = build_readyz_response(
+            healthy_check(),
+            healthy_check(),
+            true, // setup_required
+        );
+
+        // The actual handler decision: 200 OK, status="ready".
+        assert_eq!(
+            status_code,
+            StatusCode::OK,
+            "setup_required must NOT drive 503 (#889)"
+        );
+        assert_eq!(response.status, "ready");
+
+        // The informational setup field still surfaces the condition.
+        assert_eq!(response.checks.setup_complete.status, SETUP_INCOMPLETE);
+        assert_eq!(
+            response.checks.setup_complete.message.as_deref(),
+            Some("Admin password change required"),
+        );
+    }
+
+    /// Symmetric: when setup is complete and everything is healthy, the
+    /// handler returns 200 with status="ready" and `setup_complete=complete`.
+    #[test]
+    fn test_build_readyz_response_ready_when_all_complete() {
+        let (status_code, response) = build_readyz_response(
+            healthy_check(),
+            healthy_check(),
+            false, // setup_required
+        );
+
+        assert_eq!(status_code, StatusCode::OK);
+        assert_eq!(response.status, "ready");
+        assert_eq!(response.checks.setup_complete.status, SETUP_COMPLETE);
+        assert!(response.checks.setup_complete.message.is_none());
+    }
+
+    /// An unhealthy database must always drive a not-ready response,
+    /// regardless of whether setup is complete or incomplete. Exercises
+    /// the same `build_readyz_response` the handler runs.
+    #[test]
+    fn test_build_readyz_response_not_ready_when_db_unhealthy_regardless_of_setup() {
+        for setup_required in [false, true] {
+            let (status_code, response) = build_readyz_response(
+                unhealthy_check("Database unreachable: timeout"),
+                healthy_check(),
+                setup_required,
+            );
+            assert_eq!(
+                status_code,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unhealthy db must drive 503 (setup_required={})",
+                setup_required,
+            );
+            assert_eq!(response.status, "not_ready");
+            assert_eq!(response.checks.database.status, STATUS_UNHEALTHY);
+        }
+    }
+
+    /// Migrations failures also drive 503, regardless of setup state.
+    #[test]
+    fn test_build_readyz_response_not_ready_when_migrations_unhealthy() {
+        for setup_required in [false, true] {
+            let (status_code, response) = build_readyz_response(
+                healthy_check(),
+                unhealthy_check("No successful migrations found"),
+                setup_required,
+            );
+            assert_eq!(status_code, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.status, "not_ready");
+            assert_eq!(response.checks.migrations.status, STATUS_UNHEALTHY);
+        }
+    }
+
+    #[test]
+    fn test_is_ready_truth_table() {
+        let healthy = healthy_check();
+        let bad = unhealthy_check("nope");
+
+        assert!(is_ready(&healthy, &healthy));
+        assert!(!is_ready(&bad, &healthy));
+        assert!(!is_ready(&healthy, &bad));
+        assert!(!is_ready(&bad, &bad));
     }
 
     use async_trait::async_trait;
@@ -694,42 +1030,9 @@ mod tests {
 
     fn test_config(backend: &str) -> crate::config::Config {
         crate::config::Config {
-            database_url: "postgresql://test/test".to_string(),
-            bind_address: "0.0.0.0:8080".to_string(),
-            log_level: "info".to_string(),
             storage_backend: backend.to_string(),
-            storage_path: "/tmp".to_string(),
-            s3_bucket: None,
             gcs_bucket: Some("my-bucket".to_string()),
-            s3_region: None,
-            s3_endpoint: None,
-            jwt_secret: "test".to_string(),
-            jwt_expiration_secs: 86400,
-            jwt_access_token_expiry_minutes: 30,
-            jwt_refresh_token_expiry_days: 7,
-            oidc_issuer: None,
-            oidc_client_id: None,
-            oidc_client_secret: None,
-            ldap_url: None,
-            ldap_base_dn: None,
-            trivy_url: None,
-            openscap_url: None,
-            openscap_profile: "standard".to_string(),
-            meilisearch_url: None,
-            meilisearch_api_key: None,
-            scan_workspace_path: "/scan-workspace".to_string(),
-            demo_mode: false,
-            peer_instance_name: "test".to_string(),
-            peer_public_endpoint: "http://localhost:8080".to_string(),
-            peer_api_key: "test-key".to_string(),
-            dependency_track_url: None,
-            otel_exporter_otlp_endpoint: None,
-            otel_service_name: "artifact-keeper".to_string(),
-            gc_schedule: "0 0 * * * *".to_string(),
-            lifecycle_check_interval_secs: 60,
-            max_upload_size_bytes: 10_737_418_240,
-            allow_local_admin_login: false,
-            metrics_port: None,
+            ..crate::config::Config::test_config()
         }
     }
 
@@ -797,14 +1100,14 @@ mod tests {
     #[test]
     fn test_health_response_with_commit_and_dirty() {
         let response = HealthResponse {
-            status: "healthy".to_string(),
+            status: STATUS_HEALTHY.to_string(),
             version: "1.1.0-rc.5".to_string(),
             demo_mode: false,
             checks: HealthChecks {
                 database: healthy_check(),
                 storage: healthy_check(),
                 security_scanner: None,
-                meilisearch: None,
+                opensearch: None,
                 ldap: None,
             },
             db_pool: None,
@@ -820,14 +1123,14 @@ mod tests {
     #[test]
     fn test_health_response_commit_omitted_when_none() {
         let response = HealthResponse {
-            status: "healthy".to_string(),
+            status: STATUS_HEALTHY.to_string(),
             version: "1.1.0".to_string(),
             demo_mode: false,
             checks: HealthChecks {
                 database: healthy_check(),
                 storage: healthy_check(),
                 security_scanner: None,
-                meilisearch: None,
+                opensearch: None,
                 ldap: None,
             },
             db_pool: None,

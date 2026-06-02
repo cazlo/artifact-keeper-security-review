@@ -23,11 +23,12 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use tracing::{debug, info};
+use std::future::Future;
+use tracing::{debug, info, warn};
 
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::error::AppError;
@@ -53,6 +54,85 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/simple/:project/:filename",
             get(download_or_metadata),
         )
+}
+
+// ---------------------------------------------------------------------------
+// PEP 503 name normalization
+// ---------------------------------------------------------------------------
+
+/// Normalize a package name per PEP 503: lowercase, and replace any run of
+/// `[-_.]` characters with a single hyphen.
+///
+/// PEP 503 restricts canonical project names to the alphabet
+/// `[A-Za-z0-9._-]`. Any character outside that set is *malformed* and must
+/// be **dropped** rather than preserved. Preserving arbitrary characters
+/// (the previous behaviour) created a stored-XSS sink when this function
+/// was fed names parsed out of upstream HTML: an upstream serving an
+/// `<a>` element containing `<script>alert(1)</script>` would round-trip
+/// through `decode_html_entities_minimal` and land in our own simple-index
+/// HTML response (#1377 review, defense-in-depth layer 1). See also the
+/// HTML-escape applied at render time in `build_simple_root_response`.
+fn normalize_pep503(name: &str) -> String {
+    let mut result = String::with_capacity(name.len());
+    let mut last_was_sep = true;
+
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            result.push(c.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if (c == '-' || c == '_' || c == '.') && !last_was_sep {
+            result.push('-');
+            last_was_sep = true;
+        }
+        // All other characters are NOT valid in a PEP 503 canonical name
+        // and are silently dropped. This is the security boundary that
+        // prevents `<`, `>`, `"`, `&`, control chars, etc. from ever
+        // appearing in a normalized package name.
+    }
+
+    if result.ends_with('-') {
+        result.pop();
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Upstream URL normalization for the PEP 503 simple index
+// ---------------------------------------------------------------------------
+
+/// Build the upstream path for a PyPI Simple-API request without duplicating
+/// the `simple/` segment when the configured upstream URL already ends in
+/// `/simple` or `/simple/` (issue #1130).
+///
+/// The PyPI Simple API canonically lives at `https://pypi.org/simple/`. Users
+/// reasonably copy that URL verbatim into the remote-repo "upstream URL"
+/// field. The handler also conventionally prefixes `simple/{project}/` onto
+/// the proxied path, producing requests like
+/// `https://pypi.org/simple/simple/{project}/` which return 404. Detect the
+/// suffix and emit `{project}/` (or `{project}/{filename}`) instead.
+///
+/// `tail` is the relative portion below the `simple/` segment (e.g.
+/// `flask/`, `flask/Flask-3.0.0-py3-none-any.whl`). Callers must NOT include
+/// the leading `simple/` themselves.
+///
+/// Returns `(adjusted_upstream_url, upstream_path)`. The URL has any trailing
+/// `/simple` or `/simple/` stripped so [`crate::services::proxy_service::ProxyService::build_upstream_url`]
+/// (which trims one trailing slash on the base and joins with `/`) produces
+/// a single `simple/` segment in the final outbound URL.
+fn pypi_upstream_url_and_path(upstream_url: &str, tail: &str) -> (String, String) {
+    let trimmed_url = upstream_url.trim_end_matches('/');
+    let tail = tail.trim_start_matches('/');
+    if let Some(base) = trimmed_url.strip_suffix("/simple") {
+        let normalized = if base.is_empty() {
+            "/".to_string()
+        } else {
+            base.to_string()
+        };
+        (normalized, format!("simple/{}", tail))
+    } else {
+        (upstream_url.to_string(), format!("simple/{}", tail))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -86,24 +166,305 @@ async fn simple_root(
 ) -> Result<Response, Response> {
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
 
-    // Get all distinct normalized package names in this repository
-    let packages: Vec<String> = sqlx::query_scalar!(
+    // Get all distinct package names in this repository, then normalize
+    // them in Rust per PEP 503 (the SQL REPLACE chain is only approximate).
+    let raw_names: Vec<String> = sqlx::query_scalar!(
         r#"
-        SELECT DISTINCT
-            LOWER(REPLACE(REPLACE(REPLACE(name, '_', '-'), '.', '-'), '--', '-'))
+        SELECT DISTINCT name
         FROM artifacts
         WHERE repository_id = $1 AND is_deleted = false
-        ORDER BY 1
         "#,
         repo.id
     )
     .fetch_all(&state.db)
     .await
-    .map_err(map_db_err)?
-    .into_iter()
-    .flatten()
-    .collect();
+    .map_err(map_db_err)?;
 
+    let mut merged: std::collections::BTreeSet<String> =
+        raw_names.iter().map(|n| normalize_pep503(n)).collect();
+
+    // Remote repos: proxy the upstream /simple/ root and merge its package
+    // list into the response. Without this, a fresh Remote-only repo
+    // (proxy-cached artifacts no longer land in `artifacts`; see #1278/#1280)
+    // returns an empty root index even when the upstream advertises hundreds
+    // of packages. The fetched index is also cached via the proxy_service
+    // cache so subsequent requests hit the cache. (#1377)
+    if repo.repo_type == RepositoryType::Remote {
+        if let Some(names) =
+            fetch_remote_simple_root(&state, &repo.key, repo.id, &repo.upstream_url).await
+        {
+            merged.extend(names);
+        }
+        // Some upstreams don't serve a browsable root index (or it is too
+        // large to parse), so `fetch_remote_simple_root` returns nothing.
+        // Recover the projects the proxy has already served from the proxy
+        // cache so the root index lists them instead of coming back with
+        // zero anchors (B8 / #1377). Proxy-cached artifacts are not recorded
+        // in `artifacts` (#1278), making the cache the only local record of
+        // which projects exist for a Remote repo.
+        if let Some(proxy) = state.proxy_service.as_ref() {
+            merged.extend(
+                proxy
+                    .list_cached_pypi_packages(&repo.key)
+                    .await
+                    .into_iter()
+                    .map(|n| normalize_pep503(&n)),
+            );
+        }
+    }
+
+    // Virtual repos have no artifacts of their own. Aggregate package names
+    // from all member repos so that the root index lists every package
+    // available through the virtual endpoint.
+    if merged.is_empty() && repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+
+        for member in &members {
+            if member.repo_type == RepositoryType::Local
+                || member.repo_type == RepositoryType::Staging
+            {
+                let member_raw: Vec<String> = sqlx::query_scalar!(
+                    r#"
+        SELECT DISTINCT name
+        FROM artifacts
+        WHERE repository_id = $1 AND is_deleted = false
+        "#,
+                    member.id
+                )
+                .fetch_all(&state.db)
+                .await
+                .map_err(map_db_err)?;
+
+                merged.extend(member_raw.iter().map(|n| normalize_pep503(n)));
+            } else if member.repo_type == RepositoryType::Remote {
+                if let Some(names) =
+                    fetch_remote_simple_root(&state, &member.key, member.id, &member.upstream_url)
+                        .await
+                {
+                    merged.extend(names);
+                }
+                if let Some(proxy) = state.proxy_service.as_ref() {
+                    merged.extend(
+                        proxy
+                            .list_cached_pypi_packages(&member.key)
+                            .await
+                            .into_iter()
+                            .map(|n| normalize_pep503(&n)),
+                    );
+                }
+            }
+        }
+    }
+
+    let packages: Vec<String> = merged.into_iter().collect();
+    build_simple_root_response(&headers, &repo_key, &packages)
+}
+
+/// Maximum size of an upstream PEP 503 root simple-index body we will parse.
+///
+/// PyPI's own root index is ~30 MB compressed but our typical Remote repos
+/// front a private/curated mirror with at most a few thousand packages
+/// (well under 1 MB). A 10 MB ceiling keeps us comfortably above any
+/// legitimate index while preventing a hostile or misconfigured upstream
+/// from feeding us a multi-hundred-megabyte HTML blob that would block the
+/// request handler synchronously inside the regex engine (#1377 review).
+const MAX_SIMPLE_ROOT_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// Fetch the PEP 503 root index from a Remote repo's upstream URL and parse
+/// out the project names. Returns `None` when the proxy service is not
+/// configured, the upstream URL is missing, the fetch fails, the response
+/// exceeds [`MAX_SIMPLE_ROOT_BODY_BYTES`], or the response is not HTML the
+/// parser recognises.
+///
+/// The fetched bytes are cached by the proxy_service under cache_path
+/// `simple/`. Subsequent calls within the cache TTL return the cached body
+/// without re-hitting upstream, which keeps the root index responsive even
+/// when the upstream registry is slow or transiently down (#1377).
+async fn fetch_remote_simple_root(
+    state: &SharedState,
+    repo_key: &str,
+    repo_id: uuid::Uuid,
+    upstream_url: &Option<String>,
+) -> Option<Vec<String>> {
+    let upstream = upstream_url.as_ref()?;
+    let proxy = state.proxy_service.as_ref()?;
+
+    let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(upstream, "");
+    let (content, _content_type) = match proxy_helpers::proxy_fetch(
+        proxy,
+        repo_id,
+        repo_key,
+        &effective_upstream,
+        &upstream_path,
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(_) => return None,
+    };
+
+    if content.len() > MAX_SIMPLE_ROOT_BODY_BYTES {
+        warn!(
+            repo_key = %repo_key,
+            upstream = %effective_upstream,
+            body_bytes = content.len(),
+            cap_bytes = MAX_SIMPLE_ROOT_BODY_BYTES,
+            "upstream PEP 503 root index exceeds size cap; skipping parse. \
+             A future release will allow operators to opt into a higher cap \
+             for full-mirror Remote repos that front pypi.org directly."
+        );
+        return None;
+    }
+
+    // The regex pass over up to ~10 MiB of HTML is CPU-bound and blocks
+    // the async runtime worker. Offload to a blocking thread so the
+    // request handler does not stall other tasks on a slow parse
+    // (#1377 review).
+    let parsed = tokio::task::spawn_blocking(move || {
+        let html = String::from_utf8_lossy(&content);
+        parse_simple_root_projects(&html)
+    })
+    .await
+    .ok()?;
+    Some(parsed)
+}
+
+/// Decode the minimal set of HTML entities that legally appear inside an
+/// `<a>` text or `href` value in a PEP 503 simple-index page: `&amp;`,
+/// `&lt;`, `&gt;`, `&quot;`, `&apos;`, and the numeric `&#39;` apostrophe.
+///
+/// PEP 503 project names are restricted to `[A-Za-z0-9._-]` after
+/// normalisation, so a real project name will not contain entities; but a
+/// raw upstream index served by Warehouse/Nexus/Artifactory may HTML-escape
+/// ampersands in non-conforming legacy names (e.g. `foo&amp;bar`) or in
+/// hrefs that include query strings. Decoding here ensures the value fed
+/// into [`normalize_pep503`] is the real character, not the literal
+/// entity reference.
+fn decode_html_entities_minimal(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+    // Single-pass scan so chained `.replace()` cannot double-decode.
+    // Naive `.replace("&amp;", "&").replace("&lt;", "<")` would convert
+    // `&amp;lt;` into `<`, which can re-introduce script-like sequences
+    // from a malicious upstream. A single left-to-right scan only
+    // recognises an entity at its original position and copies the
+    // resulting character verbatim, so further entity sequences are not
+    // re-evaluated (#1377 review).
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            // Longest-match-first on the supported entities. The list is
+            // intentionally fixed and small; arbitrary `&xyz;` references
+            // are left untouched (and ultimately get dropped by
+            // `normalize_pep503`).
+            let rest = &input[i..];
+            if rest.starts_with("&amp;") {
+                out.push('&');
+                i += "&amp;".len();
+                continue;
+            }
+            if rest.starts_with("&lt;") {
+                out.push('<');
+                i += "&lt;".len();
+                continue;
+            }
+            if rest.starts_with("&gt;") {
+                out.push('>');
+                i += "&gt;".len();
+                continue;
+            }
+            if rest.starts_with("&quot;") {
+                out.push('"');
+                i += "&quot;".len();
+                continue;
+            }
+            if rest.starts_with("&apos;") {
+                out.push('\'');
+                i += "&apos;".len();
+                continue;
+            }
+            if rest.starts_with("&#39;") {
+                out.push('\'');
+                i += "&#39;".len();
+                continue;
+            }
+        }
+        // Push one UTF-8 codepoint and advance past it.
+        let ch = input[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Extract project names from an upstream PEP 503 root simple index.
+///
+/// The root index is a flat HTML list of `<a href="...">project-name</a>`
+/// entries. We prefer the link text (canonical project name) but fall back
+/// to the last non-empty segment of the href when the text is empty. All
+/// names are PEP 503 normalised so duplicates collapse before merging into
+/// the response.
+///
+/// The regex accepts both double- and single-quoted href attributes (both
+/// are legal HTML) and the captured text/href is HTML-entity-decoded for a
+/// small set of common entities before normalisation, so a project like
+/// `foo&amp;bar` in upstream HTML normalises through the same path as
+/// `foo&bar` would.
+///
+/// Callers are expected to bound the input size before invoking this
+/// helper; see [`MAX_SIMPLE_ROOT_BODY_BYTES`]. This regex-based parser is
+/// intentionally narrow: a full HTML5 parser (e.g. the `scraper` crate)
+/// is tracked as a v1.2.1 follow-up.
+fn parse_simple_root_projects(html: &str) -> Vec<String> {
+    // Match `<a ... href="..." ...>text</a>` or `<a ... href='...' ...>text</a>`.
+    // Two alternations so the two captured pairs always live in fixed group
+    // indices: 1+2 (double-quote) or 3+4 (single-quote). Whichever pair the
+    // alternation matched, the other is `None`.
+    static A_TAG_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r#"(?is)<a\s+[^>]*?(?:href="([^"]*)"[^>]*>([^<]*)|href='([^']*)'[^>]*>([^<]*))</a>"#,
+        )
+        .unwrap()
+    });
+
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for caps in A_TAG_RE.captures_iter(html) {
+        let (href_raw, text_raw) = match (caps.get(1), caps.get(2), caps.get(3), caps.get(4)) {
+            (Some(h), Some(t), _, _) => (h.as_str(), t.as_str()),
+            (_, _, Some(h), Some(t)) => (h.as_str(), t.as_str()),
+            _ => continue,
+        };
+        let href = decode_html_entities_minimal(href_raw);
+        let text = decode_html_entities_minimal(text_raw.trim());
+        let name = if !text.is_empty() {
+            text
+        } else {
+            // Fallback: take the last non-empty path segment from the href.
+            href.trim_end_matches('/')
+                .rsplit('/')
+                .find(|s| !s.is_empty())
+                .unwrap_or("")
+                .to_string()
+        };
+        let normalized = normalize_pep503(&name);
+        if !normalized.is_empty() {
+            out.insert(normalized);
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Render the simple root index (list of all packages) as either HTML (PEP 503)
+/// or JSON (PEP 691) based on the Accept header.
+#[allow(clippy::result_large_err)]
+fn build_simple_root_response(
+    headers: &HeaderMap,
+    repo_key: &str,
+    packages: &[String],
+) -> Result<Response, Response> {
     // Check Accept header for PEP 691 JSON
     let accept = headers
         .get(CONTENT_TYPE.as_str())
@@ -125,24 +486,28 @@ async fn simple_root(
             .unwrap());
     }
 
-    // HTML response (default)
-    let mut html = String::from(
-        "<!DOCTYPE html>\n<html>\n<head><meta name=\"pypi:repository-version\" content=\"1.0\"/>\
-         <title>Simple Index</title></head>\n<body>\n<h1>Simple Index</h1>\n",
-    );
-
-    for package in &packages {
-        let normalized = PypiHandler::normalize_name(package);
-        html.push_str(&format!(
-            "<a href=\"/pypi/{}/simple/{}/\">{}</a><br/>\n",
-            repo_key, normalized, package
-        ));
-    }
-    html.push_str("</body>\n</html>\n");
+    // HTML response (default).
+    //
+    // Defense-in-depth against stored XSS (#1377 review): even though
+    // `normalize_pep503` drops every character outside `[a-z0-9.-]`, the
+    // shared renderer HTML-escapes both the `repo_key` (URL-route input) and
+    // each `package` name (DB- or upstream-derived) before interpolation. The
+    // restrictive CSP header below denies inline script execution even if a
+    // future regression somehow lets a `<` through both layers. The body
+    // construction lives in `PypiHandler::render_simple_root_html` so the
+    // anchor-rendering rules have pure unit coverage (B8).
+    let html = PypiHandler::render_simple_root_html(repo_key, packages);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/html; charset=utf-8")
+        // pip/uv only consume the link list; deny everything else so a
+        // hypothetical injection cannot exfiltrate cookies or load images.
+        .header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'",
+        )
+        .header("X-Content-Type-Options", "nosniff")
         .body(Body::from(html))
         .unwrap())
 }
@@ -157,7 +522,7 @@ async fn simple_project(
     headers: HeaderMap,
 ) -> Result<Response, Response> {
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
-    let normalized = PypiHandler::normalize_name(&project);
+    let normalized = normalize_pep503(&project);
 
     // Find all artifacts that belong to this package.
     // We normalize the name for matching: replace [_.-]+ with - then lowercase.
@@ -196,12 +561,13 @@ async fn simple_project(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                let upstream_path = format!("simple/{}/", normalized);
+                let (effective_upstream, upstream_path) =
+                    pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized));
                 let (content, content_type) = proxy_helpers::proxy_fetch(
                     proxy,
                     repo.id,
                     &repo_key,
-                    upstream_url,
+                    &effective_upstream,
                     &upstream_path,
                 )
                 .await?;
@@ -223,10 +589,11 @@ async fn simple_project(
                     .unwrap());
             }
         }
-        // For virtual repos, iterate through members in priority order.
-        // Local/staging members are queried via DB; remote members use proxy.
+        // For virtual repos, iterate through ALL members and union their
+        // entries — both local DB rows and remote proxy responses — so a
+        // package that exists partially in a local member doesn't shadow
+        // the rest of upstream. See #1230.
         if repo.repo_type == RepositoryType::Virtual {
-            let upstream_path = format!("simple/{}/", normalized);
             let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
 
             if members.is_empty() {
@@ -236,9 +603,10 @@ async fn simple_project(
                 );
             }
 
+            let mut local_artifacts: Vec<SimpleProjectArtifact> = Vec::new();
+            let mut remote_response: Option<(Bytes, Option<String>)> = None;
+
             for member in &members {
-                // For local and staging repos, query the DB for matching
-                // artifacts, the same way we do for the top-level repo.
                 if member.repo_type == RepositoryType::Local
                     || member.repo_type == RepositoryType::Staging
                 {
@@ -260,29 +628,26 @@ async fn simple_project(
                     .await
                     .map_err(map_db_err)?;
 
-                    if !member_rows.is_empty() {
-                        let member_artifacts: Vec<SimpleProjectArtifact> = member_rows
-                            .into_iter()
-                            .map(|a| SimpleProjectArtifact {
-                                path: a.path,
-                                version: a.version,
-                                size_bytes: a.size_bytes,
-                                checksum_sha256: a.checksum_sha256,
-                                metadata: a.metadata,
-                            })
-                            .collect();
-                        return build_simple_project_response(
-                            &headers,
-                            &repo_key,
-                            &normalized,
-                            &member_artifacts,
-                        );
-                    }
+                    local_artifacts.extend(member_rows.into_iter().map(|a| {
+                        SimpleProjectArtifact {
+                            path: a.path,
+                            version: a.version,
+                            size_bytes: a.size_bytes,
+                            checksum_sha256: a.checksum_sha256,
+                            metadata: a.metadata,
+                        }
+                    }));
                     continue;
                 }
 
-                // For remote repos, proxy the simple index from upstream.
                 if member.repo_type != RepositoryType::Remote {
+                    continue;
+                }
+                // Only take the first remote response; multiple remote
+                // members in one virtual is rare, and merging two upstream
+                // /simple/<pkg>/ listings deterministically is out of scope
+                // for this fix.
+                if remote_response.is_some() {
                     continue;
                 }
                 let Some(ref upstream_url) = member.upstream_url else {
@@ -292,32 +657,20 @@ async fn simple_project(
                     continue;
                 };
 
+                let (effective_upstream, upstream_path) =
+                    pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized));
                 let result = proxy_helpers::proxy_fetch(
                     proxy,
                     member.id,
                     &member.key,
-                    upstream_url,
+                    &effective_upstream,
                     &upstream_path,
                 )
                 .await;
 
                 match result {
                     Ok((content, content_type)) => {
-                        let ct =
-                            content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
-                        let body = if ct.contains("text/html") {
-                            let html = String::from_utf8_lossy(&content);
-                            let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
-                            Body::from(rewritten)
-                        } else {
-                            Body::from(content)
-                        };
-
-                        return Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, ct)
-                            .body(body)
-                            .unwrap());
+                        remote_response = Some((content, content_type));
                     }
                     Err(_e) => {
                         debug!(
@@ -328,10 +681,45 @@ async fn simple_project(
                 }
             }
 
-            return Err(AppError::NotFound(
-                "Package not found in any member repository".to_string(),
-            )
-            .into_response());
+            // Render the union.
+            match (local_artifacts.is_empty(), remote_response) {
+                (true, None) => {
+                    return Err(AppError::NotFound(
+                        "Package not found in any member repository".to_string(),
+                    )
+                    .into_response());
+                }
+                (false, None) => {
+                    return build_simple_project_response(
+                        &headers,
+                        &repo_key,
+                        &normalized,
+                        &local_artifacts,
+                    );
+                }
+                (_, Some((content, content_type))) => {
+                    let ct = content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
+                    let body = if ct.contains("text/html") {
+                        let html = String::from_utf8_lossy(&content);
+                        let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
+                        let merged = merge_local_into_remote_simple_html(
+                            &rewritten,
+                            &repo_key,
+                            &normalized,
+                            &local_artifacts,
+                        );
+                        Body::from(merged)
+                    } else {
+                        Body::from(content)
+                    };
+
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, ct)
+                        .body(body)
+                        .unwrap());
+                }
+            }
         }
 
         return Err(AppError::NotFound("Package not found".to_string()).into_response());
@@ -448,6 +836,68 @@ fn build_simple_project_response(
         .unwrap())
 }
 
+/// Splice local-member entries into a remote-member PEP 503 HTML response so
+/// the union is visible through the virtual repo. Entries already present in
+/// the remote response (matched by filename, the anchor's inner text per
+/// PEP 503) are skipped to preserve idempotence when the same file exists in
+/// both members.
+fn merge_local_into_remote_simple_html(
+    remote_html: &str,
+    repo_key: &str,
+    normalized: &str,
+    local: &[SimpleProjectArtifact],
+) -> String {
+    if local.is_empty() {
+        return remote_html.to_string();
+    }
+
+    static ANCHOR_FILENAME: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?s)<a\s[^>]*>([^<]+)</a>").unwrap());
+    let existing: std::collections::HashSet<&str> = ANCHOR_FILENAME
+        .captures_iter(remote_html)
+        .map(|c| c.get(1).unwrap().as_str().trim())
+        .collect();
+
+    let mut local_lines = String::new();
+    for a in local {
+        let filename = a.path.rsplit('/').next().unwrap_or(&a.path);
+        if existing.contains(filename) {
+            continue;
+        }
+        let url = format!(
+            "/pypi/{}/simple/{}/{}#sha256={}",
+            repo_key, normalized, filename, a.checksum_sha256
+        );
+        let requires_python = a
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("pkg_info"))
+            .and_then(|pi| pi.get("requires_python"))
+            .and_then(|v| v.as_str());
+        let rp_attr = requires_python
+            .map(|rp| format!(" data-requires-python=\"{}\"", html_escape(rp)))
+            .unwrap_or_default();
+        local_lines.push_str(&format!(
+            "<a href=\"{}\"{}>{}</a><br/>\n",
+            url, rp_attr, filename
+        ));
+    }
+
+    if local_lines.is_empty() {
+        return remote_html.to_string();
+    }
+
+    if let Some(idx) = remote_html.rfind("</body>") {
+        let mut out = String::with_capacity(remote_html.len() + local_lines.len());
+        out.push_str(&remote_html[..idx]);
+        out.push_str(&local_lines);
+        out.push_str(&remote_html[idx..]);
+        out
+    } else {
+        format!("{}{}", remote_html, local_lines)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GET /pypi/{repo_key}/simple/{project}/{filename} — Download or metadata
 // ---------------------------------------------------------------------------
@@ -489,11 +939,11 @@ async fn serve_file(
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND path LIKE '%/' || $2
+          AND path LIKE '%/' || $2 ESCAPE '\'
         LIMIT 1
         "#,
         repo.id,
-        filename
+        super::escape_filename_for_like(filename)
     )
     .fetch_optional(&state.db)
     .await
@@ -550,6 +1000,25 @@ async fn serve_file(
                     .into_response());
                 }
 
+                // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
+                // PEP 503 normalizes project names (lowercase, runs of
+                // non-alphanumeric collapsed to `-`), so the canonical
+                // identity we compare against `artifacts.name` is the
+                // normalized form. If any non-Remote member already owns
+                // the normalized name, refuse to fan out to Remote
+                // members. This mirrors the hex / cargo / npm /
+                // rubygems behavior; for PyPI specifically, this defeats
+                // the "operator publishes `mycompany-utils` to a Local
+                // member; attacker publishes the same name on pypi.org"
+                // dependency-confusion attack.
+                let normalized_project = PypiHandler::normalize_name(project);
+                let suppress_remote_members = proxy_helpers::virtual_non_remote_owns_name(
+                    &state.db,
+                    repo.id,
+                    &normalized_project,
+                )
+                .await?;
+
                 for member in &members {
                     // Try local storage first (works for hosted repos and
                     // cached remote artifacts)
@@ -578,7 +1047,15 @@ async fn serve_file(
                     // the direct Remote path: check the proxy cache first using
                     // a stable key, then fall back to the format-specific fetch
                     // that resolves the real download URL via the simple index.
-                    if member.repo_type == RepositoryType::Remote {
+                    //
+                    // Shadowing guard (#1217 follow-up, ak-hv3s): when
+                    // `suppress_remote_members` is set, skip every Remote
+                    // member so an upstream cannot serve a project whose
+                    // normalized PEP 503 name a local member already
+                    // owns. Pair with `order_members_local_first`-style
+                    // ordering at the top of this loop: locals run
+                    // first so they win even when the guard doesn't fire.
+                    if member.repo_type == RepositoryType::Remote && !suppress_remote_members {
                         if let (Some(ref upstream_url), Some(ref proxy)) =
                             (&member.upstream_url, &state.proxy_service)
                         {
@@ -633,14 +1110,49 @@ async fn serve_file(
         }
     };
 
+    // Check quarantine status before serving
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
+        .await
+        .map_err(|e| e.into_response())?;
+
     // Read from storage
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage
-        .get(&artifact.storage_key)
-        .await
-        .map_err(map_storage_err)?;
+    let content = if repo.repo_type == RepositoryType::Remote {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            get_remote_cached_or_refetch(
+                &state.db,
+                artifact.id,
+                storage.as_ref(),
+                &artifact.storage_key,
+                || async move {
+                    fetch_from_pypi_remote(
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        project,
+                        filename,
+                    )
+                    .await
+                },
+            )
+            .await?
+        } else {
+            storage
+                .get(&artifact.storage_key)
+                .await
+                .map_err(map_storage_err)?
+        }
+    } else {
+        storage
+            .get(&artifact.storage_key)
+            .await
+            .map_err(map_storage_err)?
+    };
 
     // Record download statistics for locally-stored artifacts only.
     // Proxied and virtual-repo fetches go through build_file_response()
@@ -665,6 +1177,20 @@ async fn serve_file(
         .unwrap())
 }
 
+async fn get_remote_cached_or_refetch<F, Fut>(
+    db: &PgPool,
+    artifact_id: uuid::Uuid,
+    storage: &dyn crate::storage::StorageBackend,
+    storage_key: &str,
+    refetch: F,
+) -> Result<Bytes, Response>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Bytes, Response>>,
+{
+    proxy_helpers::get_cached_or_refetch(db, artifact_id, storage, storage_key, refetch).await
+}
+
 /// Fetch a file from a remote PyPI upstream using the format-specific URL
 /// resolution logic. External PyPI registries (e.g. pypi.org) host files on a
 /// different domain (files.pythonhosted.org), so we cannot just append the
@@ -681,10 +1207,20 @@ async fn fetch_from_pypi_remote(
 ) -> Result<Bytes, Response> {
     let normalized = PypiHandler::normalize_name(project);
 
-    let index_path = format!("simple/{}/", normalized);
-    let (index_bytes, _ct, effective_url) =
-        proxy_helpers::proxy_fetch_uncached(proxy, repo_id, repo_key, upstream_url, &index_path)
-            .await?;
+    // Strip a trailing `/simple` from the configured upstream URL so we do
+    // not produce `https://pypi.org/simple/simple/{project}/` when the user
+    // copies the canonical Simple-API base verbatim into the repo config
+    // (issue #1130).
+    let (effective_upstream, index_path) =
+        pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized));
+    let (index_bytes, _ct, effective_url) = proxy_helpers::proxy_fetch_uncached(
+        proxy,
+        repo_id,
+        repo_key,
+        &effective_upstream,
+        &index_path,
+    )
+    .await?;
 
     let index_html = String::from_utf8_lossy(&index_bytes);
 
@@ -696,10 +1232,9 @@ async fn fetch_from_pypi_remote(
     let file_url = find_upstream_url_for_file(&index_html, filename, Some(&full_index_url));
 
     let fallback = || {
-        (
-            upstream_url.to_string(),
-            format!("simple/{}/{}", normalized, filename),
-        )
+        let (base, path) =
+            pypi_upstream_url_and_path(upstream_url, &format!("{}/{}", normalized, filename));
+        (base, path)
     };
 
     // Validate resolved URL against SSRF before making the outbound request.
@@ -781,11 +1316,11 @@ async fn serve_metadata(
         FROM artifacts a
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND a.path LIKE '%/' || $2
+          AND a.path LIKE '%/' || $2 ESCAPE '\'
         LIMIT 1
         "#,
         repo_id,
-        filename
+        super::escape_filename_for_like(filename)
     )
     .fetch_optional(db)
     .await
@@ -858,7 +1393,8 @@ async fn upload(
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
     // Authenticate
-    let user_id = require_auth_basic(auth, "pypi")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "pypi", "write")?.user_id;
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos
@@ -1276,6 +1812,159 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn try_pool() -> Option<sqlx::PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .acquire_timeout(std::time::Duration::from_secs(3))
+            .connect(&url)
+            .await
+            .ok()
+    }
+
+    // -----------------------------------------------------------------------
+    // pypi_upstream_url_and_path (#1130)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pypi_upstream_strips_trailing_simple() {
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org/simple/", "flask/");
+        assert_eq!(url, "https://pypi.org");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_strips_trailing_simple_no_slash() {
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org/simple", "flask/");
+        assert_eq!(url, "https://pypi.org");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_keeps_non_simple_url() {
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org", "flask/");
+        assert_eq!(url, "https://pypi.org");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_keeps_devpi_path() {
+        let (url, path) =
+            pypi_upstream_url_and_path("https://devpi.example.com/root/pypi", "numpy/");
+        assert_eq!(url, "https://devpi.example.com/root/pypi");
+        assert_eq!(path, "simple/numpy/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_trailing_simple_with_file() {
+        let (url, path) =
+            pypi_upstream_url_and_path("https://pypi.org/simple/", "flask/Flask-3.0.0.tar.gz");
+        assert_eq!(url, "https://pypi.org");
+        assert_eq!(path, "simple/flask/Flask-3.0.0.tar.gz");
+    }
+
+    #[test]
+    fn test_pypi_upstream_bare_simple_collapses_to_root() {
+        // Edge case: configured upstream is literally "/simple" — strip the
+        // suffix and substitute "/" so build_upstream_url has a non-empty
+        // base to operate on. Exercises the `if base.is_empty()` branch.
+        let (url, path) = pypi_upstream_url_and_path("/simple", "flask/");
+        assert_eq!(url, "/");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_bare_simple_with_trailing_slash_collapses_to_root() {
+        let (url, path) = pypi_upstream_url_and_path("/simple/", "flask/");
+        assert_eq!(url, "/");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_strips_leading_slash_from_tail() {
+        // Tail with a stray leading slash should not produce `simple//flask/`.
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org", "/flask/");
+        assert_eq!(url, "https://pypi.org");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_simple_substring_not_stripped() {
+        // `simple-index` ends with `simple` substring but NOT the `/simple`
+        // path segment, so it must not be stripped.
+        let (url, path) =
+            pypi_upstream_url_and_path("https://mirror.example.com/pypi-simple-index", "flask/");
+        assert_eq!(url, "https://mirror.example.com/pypi-simple-index");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_multiple_trailing_slashes_handled() {
+        // trim_end_matches('/') strips all trailing slashes; the resulting
+        // URL must still strip the `/simple` segment correctly.
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org/simple///", "flask/");
+        assert_eq!(url, "https://pypi.org");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_pep503
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_pep503_lowercase() {
+        assert_eq!(normalize_pep503("MyPackage"), "mypackage");
+    }
+
+    #[test]
+    fn test_normalize_pep503_underscores_to_hyphen() {
+        assert_eq!(normalize_pep503("my_package"), "my-package");
+    }
+
+    #[test]
+    fn test_normalize_pep503_dots_to_hyphen() {
+        assert_eq!(normalize_pep503("my.package"), "my-package");
+    }
+
+    #[test]
+    fn test_normalize_pep503_mixed_separators() {
+        assert_eq!(normalize_pep503("My_Package.Name"), "my-package-name");
+    }
+
+    #[test]
+    fn test_normalize_pep503_consecutive_separators() {
+        assert_eq!(normalize_pep503("my__package"), "my-package");
+        assert_eq!(normalize_pep503("my_._package"), "my-package");
+        assert_eq!(normalize_pep503("my--package"), "my-package");
+    }
+
+    #[test]
+    fn test_normalize_pep503_already_normalized() {
+        assert_eq!(normalize_pep503("my-package"), "my-package");
+    }
+
+    #[test]
+    fn test_normalize_pep503_trailing_separator() {
+        assert_eq!(normalize_pep503("my-package_"), "my-package");
+    }
+
+    #[test]
+    fn test_normalize_pep503_leading_separator() {
+        // Leading separators are collapsed and skipped
+        assert_eq!(normalize_pep503("_mypackage"), "mypackage");
+    }
+
+    #[test]
+    fn test_normalize_pep503_real_world_names() {
+        assert_eq!(normalize_pep503("Jinja2"), "jinja2");
+        assert_eq!(normalize_pep503("zope.interface"), "zope-interface");
+        assert_eq!(normalize_pep503("ruamel.yaml"), "ruamel-yaml");
+        assert_eq!(
+            normalize_pep503("backports.ssl_match_hostname"),
+            "backports-ssl-match-hostname"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // html_escape
@@ -2098,6 +2787,476 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // get_remote_cached_or_refetch
+    // -----------------------------------------------------------------------
+
+    /// Storage double that reports the entry as missing on every `get`, and
+    /// records every `put` so tests can assert the write-back path persists
+    /// refetched payloads (PR #1283 follow-up: thundering-herd fix).
+    struct MissingStorage {
+        puts: std::sync::Mutex<Vec<(String, Bytes)>>,
+    }
+
+    impl MissingStorage {
+        fn new() -> Self {
+            Self {
+                puts: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for MissingStorage {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.puts
+                .lock()
+                .expect("puts mutex")
+                .push((key.to_string(), content));
+            Ok(())
+        }
+
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Err(AppError::NotFound("missing cache entry".to_string()))
+        }
+
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Returns the configured bytes for any `get` call, simulating a healthy
+    /// proxy-cache hit on disk.
+    struct PresentStorage {
+        bytes: Bytes,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for PresentStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Ok(self.bytes.clone())
+        }
+
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(true)
+        }
+
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Returns a non-`NotFound` storage error for every `get`, simulating an
+    /// underlying backend failure (permissions, I/O, etc.) that should NOT be
+    /// silently swallowed as a stale-cache miss.
+    struct BrokenStorage;
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for BrokenStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Err(AppError::Storage("permission denied".to_string()))
+        }
+
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_refetches_on_missing_storage() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let storage = MissingStorage::new();
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let storage_key =
+            "proxy-cache/pypi-remote/simple/fastapi/fastapi-0.136.1-py3-none-any.whl/__content__";
+        let content = super::get_remote_cached_or_refetch(
+            &pool,
+            uuid::Uuid::new_v4(),
+            &storage,
+            storage_key,
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Bytes::from_static(b"refetched-bytes"))
+                }
+            },
+        )
+        .await
+        .expect("refetch should succeed");
+
+        assert_eq!(content, Bytes::from_static(b"refetched-bytes"));
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "missing proxy-cache entry should trigger exactly one upstream refetch"
+        );
+
+        // PR #1283 thundering-herd fix: the refetched payload MUST be written
+        // back to storage under the same key, so the next caller hits the
+        // cache instead of re-traversing the simple index and re-downloading
+        // from upstream.
+        let puts = storage.puts.lock().expect("puts mutex");
+        assert_eq!(
+            puts.len(),
+            1,
+            "refetched payload must be persisted exactly once for the next request"
+        );
+        assert_eq!(puts[0].0, storage_key);
+        assert_eq!(puts[0].1, Bytes::from_static(b"refetched-bytes"));
+    }
+
+    /// Storage double whose `put` always fails. The handler must still
+    /// successfully serve the refetched bytes to the current caller; a
+    /// broken write-back is observability noise, not a fatal error for
+    /// this request.
+    struct WriteFailingStorage;
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for WriteFailingStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Err(AppError::Storage("disk full".to_string()))
+        }
+
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Err(AppError::NotFound("missing cache entry".to_string()))
+        }
+
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_serves_payload_even_if_writeback_fails() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        // A best-effort write-back must NOT fail the current request. If the
+        // disk is full or read-only the user still gets their wheel; the
+        // next request will simply re-fetch from upstream until the backend
+        // recovers.
+        let storage = WriteFailingStorage;
+        let content = super::get_remote_cached_or_refetch(
+            &pool,
+            uuid::Uuid::new_v4(),
+            &storage,
+            "proxy-cache/pypi-remote/simple/urllib3/urllib3-2.2.0-py3-none-any.whl/__content__",
+            move || async move { Ok(Bytes::from_static(b"refetched-when-disk-full")) },
+        )
+        .await
+        .expect("write-back failures must not fail the current request");
+
+        assert_eq!(content, Bytes::from_static(b"refetched-when-disk-full"));
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_returns_cached_without_refetch() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        // Happy path: cache hits should return the stored bytes verbatim and
+        // must NEVER invoke the upstream refetch closure.
+        let storage = PresentStorage {
+            bytes: Bytes::from_static(b"cached-wheel-bytes"),
+        };
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let content = super::get_remote_cached_or_refetch(
+            &pool,
+            uuid::Uuid::new_v4(),
+            &storage,
+            "proxy-cache/pypi-remote/simple/numpy/numpy-2.0.0-cp312-cp312-manylinux.whl/__content__",
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Bytes::from_static(b"should-not-be-used"))
+                }
+            },
+        )
+        .await
+        .expect("cached read should succeed");
+
+        assert_eq!(content, Bytes::from_static(b"cached-wheel-bytes"));
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a healthy cache hit must not trigger an upstream refetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_propagates_non_notfound_storage_error() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        // A storage backend error that is NOT `NotFound` (e.g. permission
+        // denied, I/O error) must be surfaced as a 500 instead of silently
+        // re-fetching, otherwise we mask infra issues from operators.
+        let storage = BrokenStorage;
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let result = super::get_remote_cached_or_refetch(
+            &pool,
+            uuid::Uuid::new_v4(),
+            &storage,
+            "proxy-cache/pypi-remote/simple/six/six-1.16.0.tar.gz/__content__",
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Bytes::from_static(b"never-reached"))
+                }
+            },
+        )
+        .await;
+
+        let response = result.expect_err("non-NotFound storage errors must propagate");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "non-NotFound storage errors must not trigger a refetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_surfaces_refetch_failure() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        // When the cache is stale AND the upstream refetch also fails, the
+        // upstream error response must reach the caller untouched so the
+        // client sees the correct upstream status (e.g. 502).
+        let storage = MissingStorage::new();
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let result = super::get_remote_cached_or_refetch(
+            &pool,
+            uuid::Uuid::new_v4(),
+            &storage,
+            "proxy-cache/pypi-remote/simple/requests/requests-2.32.0-py3-none-any.whl/__content__",
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(AppError::BadGateway("upstream timed out".to_string()).into_response())
+                }
+            },
+        )
+        .await;
+
+        let response = result.expect_err("refetch failures must propagate to caller");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "stale-cache miss must attempt exactly one refetch even if it fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_remote_cached_or_refetch_preserves_empty_cached_payload() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        // Edge case: a legitimately empty cached payload (zero bytes) is
+        // still a cache hit and must be returned without triggering a
+        // refetch. This guards against accidentally treating empty bodies
+        // as "missing".
+        let storage = PresentStorage {
+            bytes: Bytes::new(),
+        };
+        let refetch_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refetch_calls_clone = refetch_calls.clone();
+
+        let content = super::get_remote_cached_or_refetch(
+            &pool,
+            uuid::Uuid::new_v4(),
+            &storage,
+            "proxy-cache/pypi-remote/simple/empty/empty-0.0.0.tar.gz/__content__",
+            move || {
+                let refetch_calls_clone = refetch_calls_clone.clone();
+                async move {
+                    refetch_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Bytes::from_static(b"unexpected"))
+                }
+            },
+        )
+        .await
+        .expect("empty cached payload should still be a hit");
+
+        assert!(content.is_empty());
+        assert_eq!(
+            refetch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "empty cached payload is a cache hit, not a stale miss"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // serve_file Remote-arm wiring (PR #1283: stale-cache refetch)
+    //
+    // The unit tests above exercise `get_remote_cached_or_refetch` in
+    // isolation. This DB-backed test pins the wiring at lines ~796-810 of
+    // serve_file: when the artifact row's `repo_type` is Remote and a
+    // proxy service is present, the handler must route the storage read
+    // through `get_remote_cached_or_refetch` (not a bare `storage.get`).
+    //
+    // We cover the cache-hit branch end-to-end: artifact row + on-disk
+    // payload both present. The refetch closure must not run; the bytes
+    // returned must come from storage; the response must be a well-formed
+    // PyPI download (correct content-type, content-disposition, length).
+    // The stale-cache branch is covered by the four `get_remote_cached_or_refetch`
+    // unit tests above (including writeback assertions); it cannot be
+    // driven end-to-end here because the SSRF guard at line 928 hard-blocks
+    // loopback as a resolved upstream file URL.
+    //
+    // Skips cleanly when DATABASE_URL is unset.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_serve_file_remote_arm_routes_through_cached_or_refetch_helper() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+
+        let wheel_bytes: &[u8] = b"PK\x03\x04 cached-wheel-from-disk";
+        let filename = "wired-1.2.3-py3-none-any.whl";
+        let project = "wired";
+
+        // The wiring branch under test requires (a) a remote repo with an
+        // upstream_url AND (b) a proxy service on the state. We do NOT
+        // exercise upstream I/O in this test, so the upstream URL only
+        // needs to parse and pass SSRF (any public host works because
+        // nothing dials it).
+        let upstream = "https://upstream.example.test".to_string();
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        // Seed an artifact row + matching payload on disk. With the file
+        // present, `get_remote_cached_or_refetch` must short-circuit on
+        // the cache hit and return the bytes without invoking the refetch
+        // closure (the unit tests above pin that contract).
+        let storage_key = format!(
+            "proxy-cache/{}/simple/{}/{}",
+            fx.repo_key, project, filename
+        );
+        let artifact_path = format!("simple/{}/{}", project, filename);
+        let repo_info = fx.repo_info("remote", Some(&upstream));
+        crate::api::handlers::proxy_helpers::put_artifact_bytes(
+            &state,
+            &repo_info,
+            &storage_key,
+            Bytes::from_static(wheel_bytes),
+        )
+        .await
+        .expect("seed payload on disk");
+        let _artifact_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             RETURNING id",
+        )
+        .bind(fx.repo_id)
+        .bind(&artifact_path)
+        .bind(project)
+        .bind("1.2.3")
+        .bind(wheel_bytes.len() as i64)
+        .bind("test-wired")
+        .bind("application/zip")
+        .bind(&storage_key)
+        .bind(fx.user_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("seed cached artifact row");
+
+        // Invoke serve_file directly. The Remote arm at lines ~796-810
+        // must construct a `get_remote_cached_or_refetch` call against
+        // the storage backend; the helper hits the cache and returns the
+        // wheel bytes; the handler wraps them in a PyPI download response.
+        let result = super::serve_file(&state, &repo_info, &fx.repo_key, project, filename).await;
+
+        // Clean up BEFORE asserting so a panic still leaves the DB clean.
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        let response = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                cleanup().await;
+                panic!("serve_file Remote arm must serve cached payload, got {status}");
+            }
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .expect("Content-Type")
+                .to_str()
+                .unwrap(),
+            "application/zip",
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_LENGTH)
+                .expect("Content-Length")
+                .to_str()
+                .unwrap(),
+            wheel_bytes.len().to_string(),
+        );
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read response body");
+        assert_eq!(
+            &body_bytes[..],
+            wheel_bytes,
+            "wired Remote arm must serve the bytes returned by get_remote_cached_or_refetch"
+        );
+
+        cleanup().await;
+    }
+
+    // -----------------------------------------------------------------------
     // pypi_content_type
     // -----------------------------------------------------------------------
 
@@ -2421,5 +3580,727 @@ mod tests {
 
         let files = json["files"].as_array().unwrap();
         assert_eq!(files[0]["requires-python"], ">=3.9,<4.0");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_simple_root_response (PEP 503 / PEP 691 root index)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_simple_root_response_html() {
+        let packages = vec![
+            "flask".to_string(),
+            "numpy".to_string(),
+            "requests".to_string(),
+        ];
+        let headers = HeaderMap::new();
+
+        let result = build_simple_root_response(&headers, "pypi-virtual", &packages);
+        let response = result.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/html; charset=utf-8");
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(html.contains("<h1>Simple Index</h1>"));
+        assert!(html.contains("/pypi/pypi-virtual/simple/flask/"));
+        assert!(html.contains("/pypi/pypi-virtual/simple/numpy/"));
+        assert!(html.contains("/pypi/pypi-virtual/simple/requests/"));
+    }
+
+    #[test]
+    fn test_build_simple_root_response_json() {
+        let packages = vec!["flask".to_string(), "numpy".to_string()];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/vnd.pypi.simple.v1+json".parse().unwrap(),
+        );
+
+        let result = build_simple_root_response(&headers, "pypi-virtual", &packages);
+        let response = result.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "application/vnd.pypi.simple.v1+json");
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["meta"]["api-version"], "1.1");
+        let projects = json["projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0]["name"], "flask");
+        assert_eq!(projects[1]["name"], "numpy");
+    }
+
+    #[test]
+    fn test_build_simple_root_response_empty_packages() {
+        let packages: Vec<String> = vec![];
+        let headers = HeaderMap::new();
+
+        let result = build_simple_root_response(&headers, "pypi-local", &packages);
+        let response = result.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(html.contains("<h1>Simple Index</h1>"));
+        // No package links should appear
+        assert!(!html.contains("<a href="));
+    }
+
+    #[test]
+    fn test_build_simple_root_response_deduplicates_via_btreeset() {
+        // Verify that duplicate package names (which would come from
+        // multiple member repos in a virtual) are already deduplicated
+        // by the BTreeSet in simple_root before reaching the response
+        // builder. The response builder itself renders whatever it gets.
+        let packages = vec!["flask".to_string(), "flask".to_string()];
+        let headers = HeaderMap::new();
+
+        let result = build_simple_root_response(&headers, "pypi-virtual", &packages);
+        let response = result.unwrap();
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        // Two entries appear because deduplication is the caller's job
+        // (simple_root uses BTreeSet). This test documents the contract.
+        let count = html.matches("/pypi/pypi-virtual/simple/flask/").count();
+        assert_eq!(count, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Stored-XSS regression tests (#1377 review)
+    //
+    // These tests pin the defense-in-depth contract for the proxied
+    // PEP 503 root index:
+    //   1. `normalize_pep503` MUST drop every char outside `[a-z0-9.-]`.
+    //   2. `build_simple_root_response` MUST HTML-escape everything it
+    //      interpolates.
+    //   3. The response MUST emit a restrictive Content-Security-Policy
+    //      so a hypothetical future regression cannot execute script.
+    //   4. `decode_html_entities_minimal` MUST NOT double-decode (so
+    //      `&amp;lt;` survives as the literal string `&lt;`, not `<`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_pep503_drops_script_chars() {
+        // Layer 1: the security boundary at the name-normalisation step.
+        // A name parsed out of malicious upstream HTML must lose every
+        // character that could break out of an HTML attribute or text
+        // node before it ever reaches the response builder.
+        assert_eq!(
+            normalize_pep503("<script>alert(1)</script>"),
+            "scriptalert1script"
+        );
+        assert_eq!(
+            normalize_pep503("foo\"onerror=alert(1)"),
+            "fooonerroralert1"
+        );
+        assert_eq!(normalize_pep503("foo&bar"), "foobar");
+        assert_eq!(normalize_pep503("foo>bar"), "foobar");
+        assert_eq!(normalize_pep503("foo'bar"), "foobar");
+        // Backslash, tab, newline — all dropped.
+        assert_eq!(normalize_pep503("a\\b\tc\nd"), "abcd");
+        // Real-world: a valid name surrounded by junk loses only the junk.
+        assert_eq!(normalize_pep503("<a>flask</a>"), "aflaska");
+    }
+
+    #[test]
+    fn test_build_simple_root_response_escapes_html_in_package_name() {
+        // Layer 2: even if a malformed name with HTML metacharacters did
+        // somehow reach the response builder (e.g. a future code path
+        // that bypasses `normalize_pep503`), the rendered HTML must
+        // never interpret it as markup.
+        let packages = vec![
+            "<script>alert('xss')</script>".to_string(),
+            "foo\"onerror=alert(1)\"".to_string(),
+            "ampersand&here".to_string(),
+        ];
+        let headers = HeaderMap::new();
+
+        let response = build_simple_root_response(&headers, "pypi-virtual", &packages).unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        // Raw `<script>` must NEVER appear in the body. The literal
+        // string `alert` is fine to appear escaped, but the surrounding
+        // tag must be entity-encoded.
+        assert!(
+            !html.contains("<script>"),
+            "raw <script> tag MUST NOT appear in rendered HTML: {}",
+            html
+        );
+        assert!(
+            !html.contains("</script>"),
+            "raw </script> tag MUST NOT appear in rendered HTML: {}",
+            html
+        );
+        // The escaped form must be present, proving the escape ran.
+        assert!(html.contains("&lt;script&gt;"));
+        // Quote-injection inside the href attribute is neutralised.
+        assert!(!html.contains("\"onerror="));
+        assert!(html.contains("&quot;onerror"));
+        // Ampersand becomes &amp; (so the entity itself is safely encoded).
+        assert!(html.contains("ampersand&amp;here"));
+    }
+
+    #[test]
+    fn test_build_simple_root_response_escapes_html_in_repo_key() {
+        // The repo_key arrives from the URL router and should already
+        // be safe in practice, but the response builder treats it as
+        // untrusted on principle.
+        let packages = vec!["flask".to_string()];
+        let headers = HeaderMap::new();
+
+        let response =
+            build_simple_root_response(&headers, "repo\"><script>x</script>", &packages).unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(!html.contains("<script>x</script>"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn test_build_simple_root_response_sets_csp_header() {
+        // Layer 3: even if both upstream layers somehow regress, the
+        // browser refuses to execute inline script under this policy.
+        let packages = vec!["flask".to_string()];
+        let headers = HeaderMap::new();
+
+        let response = build_simple_root_response(&headers, "pypi-virtual", &packages).unwrap();
+        let csp = response
+            .headers()
+            .get("Content-Security-Policy")
+            .expect("CSP header MUST be present on simple-index responses")
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'none'"));
+        // X-Content-Type-Options nosniff also pins the content-type.
+        let xcto = response
+            .headers()
+            .get("X-Content-Type-Options")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(xcto, "nosniff");
+    }
+
+    #[test]
+    fn test_decode_html_entities_minimal_does_not_double_decode() {
+        // Naive chained `.replace()` would convert `&amp;lt;` -> `&lt;`
+        // -> `<`. A correct single-pass decoder yields `&lt;`.
+        assert_eq!(decode_html_entities_minimal("&amp;lt;"), "&lt;");
+        assert_eq!(decode_html_entities_minimal("&amp;gt;"), "&gt;");
+        assert_eq!(
+            decode_html_entities_minimal("&amp;amp;"),
+            "&amp;",
+            "double-encoded ampersand must decode once, not twice"
+        );
+        assert_eq!(decode_html_entities_minimal("&amp;quot;"), "&quot;");
+        // Single-encoded entities still decode normally.
+        assert_eq!(decode_html_entities_minimal("&lt;"), "<");
+        assert_eq!(decode_html_entities_minimal("&amp;"), "&");
+        assert_eq!(decode_html_entities_minimal("&quot;"), "\"");
+        // Mixed content.
+        assert_eq!(
+            decode_html_entities_minimal("foo &amp; &lt;bar&gt;"),
+            "foo & <bar>"
+        );
+        // Strings without `&` short-circuit and round-trip.
+        assert_eq!(decode_html_entities_minimal("hello world"), "hello world");
+        // Unknown entity references are passed through verbatim.
+        assert_eq!(decode_html_entities_minimal("&unknown;"), "&unknown;");
+    }
+
+    #[test]
+    fn test_malicious_upstream_simple_index_is_sanitized_end_to_end() {
+        // End-to-end pin: simulate a malicious upstream serving a
+        // `<script>`-bearing project name. After parsing + normalising,
+        // the rendered response must contain NO executable script
+        // markup (the package is effectively dropped because the only
+        // chars surviving normalisation are alphanumerics inside the
+        // `<script>` text, but the test focuses on the safety property
+        // rather than the exact surviving string).
+        let malicious_upstream = r#"
+            <!DOCTYPE html>
+            <html><body>
+              <a href="/simple/&lt;script&gt;alert(1)&lt;/script&gt;/">&lt;script&gt;alert(1)&lt;/script&gt;</a>
+              <a href="/simple/flask/">flask</a>
+              <a href="/simple/foo&amp;bar/">foo&amp;bar</a>
+            </body></html>
+        "#;
+
+        let names = parse_simple_root_projects(malicious_upstream);
+
+        // No surviving name may contain any HTML special character.
+        for name in &names {
+            assert!(!name.contains('<'), "parsed name leaked `<`: {:?}", name);
+            assert!(!name.contains('>'), "parsed name leaked `>`: {:?}", name);
+            assert!(!name.contains('&'), "parsed name leaked `&`: {:?}", name);
+            assert!(!name.contains('"'), "parsed name leaked `\"`: {:?}", name);
+            assert!(!name.contains('\''), "parsed name leaked `'`: {:?}", name);
+        }
+        // The benign names still come through.
+        assert!(names.iter().any(|n| n == "flask"));
+        assert!(names.iter().any(|n| n == "foobar"));
+
+        // Now render and verify the response body is XSS-safe.
+        let response =
+            build_simple_root_response(&HeaderMap::new(), "pypi-remote", &names).unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("</script>"));
+        assert!(!html.contains("onerror="));
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_local_into_remote_simple_html — #1230 virtual union behavior
+    // -----------------------------------------------------------------------
+
+    fn remote_html_with(entries: &[(&str, Option<&str>)]) -> String {
+        let mut s = String::from(
+            "<!DOCTYPE html>\n<html>\n<head>\n\
+             <meta name=\"pypi:repository-version\" content=\"1.0\"/>\n\
+             <title>Links for pkg</title>\n</head>\n<body>\n\
+             <h1>Links for pkg</h1>\n",
+        );
+        for (filename, rp) in entries {
+            let rp_attr = rp
+                .map(|v| format!(" data-requires-python=\"{}\"", v))
+                .unwrap_or_default();
+            s.push_str(&format!(
+                "<a href=\"/pypi/v/simple/pkg/{}\"{}>{}</a><br/>\n",
+                filename, rp_attr, filename
+            ));
+        }
+        s.push_str("</body>\n</html>\n");
+        s
+    }
+
+    #[test]
+    fn test_merge_local_appends_entries_absent_from_remote() {
+        // Reproducer for #1230: local member has versions upstream does not
+        // (or in our prod case, upstream has versions the local subset
+        // shadows — symmetric situation, same fix). The merged response
+        // must contain entries from both sides.
+        let remote = remote_html_with(&[("pkg-1.0.0.tar.gz", Some("&gt;=3.8"))]);
+        let local = vec![SimpleProjectArtifact {
+            path: "pkg/pkg-2.0.0-py3-none-any.whl".to_string(),
+            version: Some("2.0.0".to_string()),
+            size_bytes: 4096,
+            checksum_sha256: "ffeeddccbbaa99887766554433221100".to_string(),
+            metadata: None,
+        }];
+
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
+
+        assert!(
+            merged.contains("pkg-1.0.0.tar.gz"),
+            "remote entry preserved"
+        );
+        assert!(
+            merged.contains("pkg-2.0.0-py3-none-any.whl"),
+            "local entry spliced in"
+        );
+        assert!(
+            merged.contains("/pypi/virt/simple/pkg/pkg-2.0.0-py3-none-any.whl#sha256=ffeeddccbbaa99887766554433221100"),
+            "local URL uses the virtual repo key and carries the sha256 fragment"
+        );
+        // Spliced before </body> so the document is still well-formed.
+        let body_idx = merged.find("</body>").expect("</body> still present");
+        let local_idx = merged.find("pkg-2.0.0-py3-none-any.whl").unwrap();
+        assert!(local_idx < body_idx, "local entries must precede </body>");
+    }
+
+    #[test]
+    fn test_merge_local_skips_filenames_already_in_remote() {
+        // If a file with the same filename exists in both members, the
+        // remote entry wins (idempotence — no duplicate <a> emitted).
+        let remote = remote_html_with(&[("pkg-1.0.0.tar.gz", None)]);
+        let local = vec![SimpleProjectArtifact {
+            path: "pkg/pkg-1.0.0.tar.gz".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+            metadata: None,
+        }];
+
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
+        let count = merged.matches("pkg-1.0.0.tar.gz</a>").count();
+        assert_eq!(count, 1, "filename present exactly once after dedupe");
+        // The local sha256 must NOT appear — the remote entry is canonical.
+        assert!(
+            !merged.contains(
+                "sha256=0000000000000000000000000000000000000000000000000000000000000000"
+            ),
+            "local sha256 not spliced in when filename dedupes against remote"
+        );
+    }
+
+    #[test]
+    fn test_merge_empty_local_returns_remote_unchanged() {
+        let remote = remote_html_with(&[("pkg-1.0.0.tar.gz", None)]);
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &[]);
+        assert_eq!(merged, remote);
+    }
+
+    #[test]
+    fn test_merge_emits_data_requires_python_attribute() {
+        let remote = remote_html_with(&[]);
+        let metadata = serde_json::json!({
+            "pkg_info": { "requires_python": ">=3.10,<3.14" }
+        });
+        let local = vec![SimpleProjectArtifact {
+            path: "pkg/pkg-3.0.0.tar.gz".to_string(),
+            version: Some("3.0.0".to_string()),
+            size_bytes: 256,
+            checksum_sha256: "deadbeef".to_string(),
+            metadata: Some(metadata),
+        }];
+
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
+        assert!(
+            merged.contains("data-requires-python=\"&gt;=3.10,&lt;3.14\""),
+            "requires_python is HTML-escaped: {}",
+            merged
+        );
+    }
+
+    #[test]
+    fn test_merge_handles_remote_html_without_body_close() {
+        // Defensive: if upstream omits </body> (malformed but seen in the
+        // wild on some private indexes) the helper appends rather than
+        // dropping local entries.
+        let remote = String::from(
+            "<!DOCTYPE html>\n<html>\n<head></head>\n<body>\n\
+             <a href=\"/pypi/v/simple/pkg/pkg-1.0.0.tar.gz\">pkg-1.0.0.tar.gz</a><br/>\n",
+        );
+        let local = vec![SimpleProjectArtifact {
+            path: "pkg/pkg-2.0.0-py3-none-any.whl".to_string(),
+            version: Some("2.0.0".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "cafebabe".to_string(),
+            metadata: None,
+        }];
+
+        let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local);
+        assert!(merged.contains("pkg-1.0.0.tar.gz"));
+        assert!(merged.contains("pkg-2.0.0-py3-none-any.whl"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for #1377 — Remote PyPI root simple-index proxy + cache.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_simple_root_projects_extracts_from_pep503_html() {
+        // Canonical PEP 503 root index shape: <a href="<project>/"><project></a>
+        let html = "<!DOCTYPE html><html><body>\
+                    <a href=\"flask/\">Flask</a>\
+                    <a href=\"requests/\">requests</a>\
+                    <a href=\"my_pkg/\">My_Pkg</a>\
+                    </body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        // PEP 503 normalisation: lowercase + `_`/`.` collapsed to `-`.
+        assert_eq!(projects, vec!["flask", "my-pkg", "requests"]);
+    }
+
+    #[test]
+    fn test_parse_simple_root_projects_falls_back_to_href_when_text_missing() {
+        // Some indexes emit the link without text content (Nexus). The
+        // parser must fall back to the trailing href segment so we do not
+        // silently drop entries.
+        let html = "<html><body><a href=\"numpy/\"></a></body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        assert_eq!(projects, vec!["numpy"]);
+    }
+
+    #[test]
+    fn test_parse_simple_root_projects_empty_when_no_anchors() {
+        let projects = super::parse_simple_root_projects("<html><body>no links</body></html>");
+        assert!(projects.is_empty());
+    }
+
+    /// Regression: single-quoted href attributes are legal HTML and at
+    /// least one upstream (older Devpi releases) emits them. Before the
+    /// review hardening the regex only matched `href="..."`, silently
+    /// dropping single-quoted entries from the parsed project list.
+    #[test]
+    fn test_parse_simple_root_projects_accepts_single_quoted_hrefs() {
+        let html = "<html><body>\
+                    <a href='flask/'>Flask</a>\
+                    <a href='requests/'>requests</a>\
+                    </body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        assert_eq!(projects, vec!["flask", "requests"]);
+    }
+
+    /// Mixed single + double quote anchors in the same document must both
+    /// be picked up. Real-world index pages occasionally mix quoting styles
+    /// when concatenated from multiple templates.
+    #[test]
+    fn test_parse_simple_root_projects_mixed_quote_styles() {
+        let html = "<html><body>\
+                    <a href=\"flask/\">Flask</a>\
+                    <a href='requests/'>requests</a>\
+                    </body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        assert_eq!(projects, vec!["flask", "requests"]);
+    }
+
+    /// Regression: HTML entities inside the anchor text must be decoded
+    /// BEFORE PEP 503 normalisation, otherwise a name escaped as
+    /// `foo&amp;bar` would carry the literal entity reference (`&amp;`)
+    /// into the normalised output. After the #1377 review hardening,
+    /// `normalize_pep503` also DROPS any character outside `[a-z0-9.-]`
+    /// — so the decoded `&`, `<`, `>`, `"`, `'` characters are stripped
+    /// at the normalisation step rather than carried through. The
+    /// assertion here is that (a) the literal entity reference tokens
+    /// do not leak through (decoder ran), AND (b) the dangerous
+    /// characters themselves do not leak through (normalisation
+    /// stripped them).
+    #[test]
+    fn test_parse_simple_root_projects_decodes_html_entities_in_text() {
+        let html = "<html><body>\
+                    <a href=\"odd/\">foo&amp;bar</a>\
+                    <a href=\"q/\">a&lt;b</a>\
+                    <a href=\"r/\">a&gt;b</a>\
+                    <a href=\"s/\">a&quot;b</a>\
+                    <a href=\"t/\">a&apos;b</a>\
+                    </body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        for p in &projects {
+            // No entity reference TOKEN should survive into the output.
+            for token in ["amp;", "&lt", "&gt", "&quot", "&apos", "&#"] {
+                assert!(
+                    !p.contains(token),
+                    "entity reference token {token:?} leaked through into {p:?}"
+                );
+            }
+            // Nor the dangerous decoded characters themselves.
+            for ch in ['&', '<', '>', '"', '\''] {
+                assert!(
+                    !p.contains(ch),
+                    "dangerous character {ch:?} leaked through into {p:?}"
+                );
+            }
+        }
+        // The benign letters survive normalisation: `foo&amp;bar`
+        // decodes to `foo&bar`, the `&` is stripped, and the result is
+        // `foobar`.
+        assert!(
+            projects.iter().any(|p| p == "foobar"),
+            "expected `foobar` (from `foo&amp;bar` after decode + strip) in {projects:?}"
+        );
+    }
+
+    /// HTML entities in the href fallback path (when anchor text is
+    /// empty) must also be decoded before the trailing-segment
+    /// extraction. After #1377 review hardening, the apostrophe
+    /// produced by the decode is then dropped by `normalize_pep503` so
+    /// the resulting project name contains only `[a-z0-9.-]`.
+    #[test]
+    fn test_parse_simple_root_projects_decodes_html_entities_in_href_fallback() {
+        let html = "<html><body><a href=\"my&#39;pkg/\"></a></body></html>";
+        let projects = super::parse_simple_root_projects(html);
+        // The `&#39;` decodes to `'` (decoder ran), then the `'` is
+        // dropped at normalisation. The literal entity must not
+        // survive, and neither must the apostrophe.
+        assert_eq!(projects, vec!["mypkg"]);
+    }
+
+    // The body-size cap constant must be high enough to comfortably
+    // accommodate any legitimate private-mirror index but low enough to
+    // stop a hostile upstream from forcing a multi-hundred-megabyte
+    // allocation + regex sweep on a single request. We assert this at
+    // compile time rather than runtime so the test is free.
+    const _MIN_CAP: usize = 1024 * 1024; // 1 MiB
+    const _MAX_CAP: usize = 64 * 1024 * 1024; // 64 MiB
+    const _: () = assert!(super::MAX_SIMPLE_ROOT_BODY_BYTES >= _MIN_CAP);
+    const _: () = assert!(super::MAX_SIMPLE_ROOT_BODY_BYTES <= _MAX_CAP);
+
+    /// Regression: a Remote PyPI repo with NO local artifacts must proxy
+    /// upstream `/simple/` and return the upstream's package list. Before
+    /// #1377 this returned an empty index because `simple_root` only ever
+    /// queried the local `artifacts` table, and proxy-cached items no
+    /// longer create rows there (#1278 / #1280).
+    ///
+    /// Also covers the cache-roundtrip path: a second invocation must
+    /// reuse the proxy_service cache and produce the same package list
+    /// without re-hitting upstream.
+    #[tokio::test]
+    async fn test_simple_root_remote_proxies_and_caches_upstream_index() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let upstream_index = "<!DOCTYPE html><html><head><meta name=\"pypi:repository-version\" content=\"1.0\"/></head><body>\
+                              <a href=\"reltest-pkg/\">reltest-pkg</a>\
+                              <a href=\"flask/\">Flask</a>\
+                              </body></html>";
+
+        // Both /simple/ and /simple (without trailing slash) should be
+        // covered: the proxy fetch always lands on /simple/.
+        let hits_for_mock = hits.clone();
+        Mock::given(method("GET"))
+            .and(path("/simple/"))
+            .respond_with(move |_req: &wiremock::Request| {
+                hits_for_mock.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string(upstream_index)
+            })
+            .mount(&mock_server)
+            .await;
+
+        // Re-point repo at the mock upstream.
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        let cleanup_pool = fx.pool.clone();
+        let cleanup_repo = fx.repo_id;
+        let cleanup_user = fx.user_id;
+        let cleanup_dir = fx.storage_dir.clone();
+        let do_cleanup = || async move {
+            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
+            let _ = std::fs::remove_dir_all(&cleanup_dir);
+        };
+
+        // 1st call: HTML body must contain BOTH upstream packages and route
+        // their hrefs to the local repo (not the upstream URL).
+        let result = super::simple_root(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(fx.repo_key.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+        let response = match result {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                do_cleanup().await;
+                panic!("simple_root must succeed for Remote repo, got {status}");
+            }
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let body_str = std::str::from_utf8(&body_bytes).expect("utf8");
+        assert!(
+            body_str.contains(">reltest-pkg<"),
+            "root simple index must list 'reltest-pkg' from upstream (#1377): {body_str}"
+        );
+        assert!(
+            body_str.contains(">flask<"),
+            "root simple index must list 'flask' (normalised) from upstream: {body_str}"
+        );
+        assert!(
+            body_str.contains(&format!("/pypi/{}/simple/", fx.repo_key)),
+            "root simple index must point hrefs at the local repo, not the upstream: {body_str}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "upstream hit exactly once on first call"
+        );
+
+        // 2nd call: proxy cache must satisfy this request without a fresh
+        // upstream HEAD/GET. Package list must still be the same.
+        let result2 = super::simple_root(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(fx.repo_key.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+        let response2 = match result2 {
+            Ok(r) => r,
+            Err(r) => {
+                let status = r.status();
+                do_cleanup().await;
+                panic!("simple_root cache roundtrip must succeed, got {status}");
+            }
+        };
+        let body_bytes2 = axum::body::to_bytes(response2.into_body(), 1024 * 1024)
+            .await
+            .expect("body2");
+        let body_str2 = std::str::from_utf8(&body_bytes2).expect("utf82");
+        assert!(
+            body_str2.contains(">reltest-pkg<"),
+            "cached root simple index must still list 'reltest-pkg' (#1377): {body_str2}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "upstream must NOT be hit again on a cache-roundtrip read"
+        );
+
+        do_cleanup().await;
     }
 }

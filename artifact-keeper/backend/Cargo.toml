@@ -10,6 +10,9 @@ path = "src/main.rs"
 
 [features]
 vendored-openssl = ["openssl/vendored"]
+jemalloc = ["dep:tikv-jemallocator"]
+mimalloc = ["dep:mimalloc"]
+profiling = ["jemalloc", "dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "tikv-jemallocator/profiling"]
 
 [dependencies]
 openssl = { workspace = true, optional = true }
@@ -41,6 +44,7 @@ blake2 = "0.10"
 
 # Encryption
 aes-gcm.workspace = true
+zeroize.workspace = true
 
 # S3 storage using Apache object_store crate
 object_store.workspace = true
@@ -59,6 +63,7 @@ tracing-appender = "0.2"
 # OpenTelemetry
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
+opentelemetry-http.workspace = true
 opentelemetry-otlp.workspace = true
 tracing-opentelemetry.workspace = true
 
@@ -100,6 +105,8 @@ async-trait = "0.1"
 async-stream = "0.3"
 hex = "0.4"
 rand = "0.9"
+rand08 = { package = "rand", version = "0.8" }
+pgp = "0.14.2"
 
 # Format parsing
 quick-xml = { version = "0.39", features = ["serialize"] }
@@ -128,10 +135,15 @@ base64 = "0.22"
 totp-rs = { version = "5", features = ["qr", "gen_secret"] }
 
 # Search engine
-meilisearch-sdk = { workspace = true }
+opensearch = { workspace = true }
 
 # Temp files
 tempfile = "3.27"
+
+# Memory-mapped scan inputs: lets a multi-GiB artifact be staged to disk and
+# handed to scanners as file-backed (kernel-reclaimable) pages instead of anon
+# heap. Pairs with `Bytes::from_owner`.
+memmap2 = "0.9"
 
 # Directory walking
 walkdir = "2.5"
@@ -152,6 +164,17 @@ tonic.workspace = true
 tonic-reflection.workspace = true
 prost.workspace = true
 prost-types.workspace = true
+zxcvbn = "3"
+
+# SMTP email delivery
+lettre.workspace = true
+
+# Allocators
+mimalloc = { version = "0.1", optional = true }
+[target.'cfg(not(windows))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["stats"] }
+tikv-jemalloc-sys = { version = "0.6", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
@@ -161,5 +184,5 @@ tonic-build.workspace = true
 
 [dev-dependencies]
 tokio-test = "0.4"
-axum-test = "16"
+axum-test = "18"
 wiremock = "0.6"

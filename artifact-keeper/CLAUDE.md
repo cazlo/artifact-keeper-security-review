@@ -141,36 +141,80 @@ All changes must go through pull requests:
 
 4. **Merge via GitHub** after CI passes (squash merge preferred)
 
+### Merge Requirements (MANDATORY)
+
+**NEVER merge a PR unless ALL of the following are true:**
+
+1. **CI workflow fully green.** Every check must pass: Rust check (clippy), unit tests, code coverage gate, duplication gate, security audit, CodeQL. No exceptions.
+2. **Code coverage >= 70%** on new/changed lines. The CI coverage gate enforces this. If it fails, add tests until it passes.
+3. **Code duplication <= 3%** on changed files. The CI duplication gate (jscpd) enforces this. If it fails, refactor duplicated code into shared helpers.
+4. **No `--admin` bypass.** Do not use `gh pr merge --admin` to skip failing checks. If a gate is genuinely wrong (not a code issue), fix the gate first, get that fix merged, then rebase the PR.
+
+If a CI gate is blocking a PR due to a systemic issue (e.g., the gate itself has a bug), **ask the user before bypassing.** Document why the bypass was needed and create a follow-up issue to fix the gate. This rule exists because bypassing gates erodes trust in the CI pipeline.
+
 Branch naming conventions:
 - `feat/` — new features
 - `fix/` — bug fixes
 - `chore/` — maintenance, dependencies, CI
 - `docs/` — documentation only
 
+### Parallel Agent Work (shallow clones)
+
+When dispatching multiple agents to work on separate features or fixes in parallel, use **shallow clones in `/tmp/`** instead of git worktrees. Worktrees share the `.git` directory and agents end up switching branches in the main worktree, corrupting each other's state.
+
+**Pattern for each agent:**
+```bash
+WORK_DIR="/tmp/$(uuidgen)-artifact-keeper"
+git clone --depth 50 --branch main git@github.com:artifact-keeper/artifact-keeper.git "$WORK_DIR"
+cd "$WORK_DIR"
+git checkout -b feat/issue-description
+# ... make changes, run checks, commit, push, create PR ...
+rm -rf "$WORK_DIR"
+```
+
+Each agent gets a fully isolated repo copy. No shared state, no branch conflicts, no rust-analyzer cross-contamination. The agent must do ALL work inside `$WORK_DIR` and never touch the primary working directory at `/Users/khan/ak/artifact-keeper`.
+
+### Pre-push Quality Checklist
+
+Every commit must pass these checks locally before pushing. Do NOT use "push and see if CI passes" as a strategy.
+
+```bash
+cargo fmt --check                                          # formatting
+cargo clippy --workspace --all-targets -- -D warnings      # linting
+cargo test --workspace --lib                               # unit tests
+```
+
+Additionally, before pushing:
+- **Code coverage**: new/changed lines MUST have >= 70% test coverage. The CI gate measures only lines you added or modified (not the entire file). Extract testable logic into pure helper functions to make handler code coverable.
+- **Code duplication**: changed files MUST have <= 3% duplication (measured by jscpd). Extract repeated patterns into shared helpers. Common offenders: cache read/write patterns, test setup blocks, filter construction.
+- Check migration numbering: verify the migration number is not already taken (`ls backend/migrations/ | tail -5`)
+- If coverage or duplication gates will fail, fix them BEFORE pushing. Do not push and hope CI passes.
+
 ### Maintenance Branches
 
 Long-lived `release/X.Y.x` branches exist for shipping bug fixes to older release series:
 
 - **`release/1.0.x`** — maintenance branch for the 1.0 series (created from `v1.0.0-rc.5`)
-- **`main`** — continues with 1.1.x (and beyond) development
+- **`release/1.1.x`** — maintenance branch for the 1.1 series (created from `v1.1.2`)
+- **`main`** — continues with 1.2.x (and beyond) development
 
 **Bug fix workflow for maintenance branches:**
 1. Create a fix branch from the maintenance branch:
    ```bash
-   git checkout release/1.0.x && git pull
+   git checkout release/1.1.x && git pull
    git checkout -b fix/short-description
    ```
-2. Push and create a PR **targeting `release/1.0.x`** (not main):
+2. Push and create a PR **targeting `release/1.1.x`** (not main):
    ```bash
    git push -u origin fix/short-description
-   gh pr create --base release/1.0.x --fill
+   gh pr create --base release/1.1.x --fill
    ```
 3. Tag releases from the maintenance branch:
    ```bash
-   git checkout release/1.0.x && git pull
-   git tag v1.0.1 && git push origin v1.0.1
+   git checkout release/1.1.x && git pull
+   git tag v1.1.3 && git push origin v1.1.3
    ```
-4. Cherry-pick to the maintenance branch when a fix on `main` also applies to 1.0.x.
+4. Cherry-pick fixes between maintenance and `main` so both lines stay in sync. Bug fixes typically land on the maintenance branch first, then cherry-pick forward to main.
 
 **Docker image tags** (set by `docker/metadata-action` in `docker-publish.yml`):
 - Version tags **strip the `v` prefix**: git tag `v1.1.0-rc.2` → Docker tag `:1.1.0-rc.2`

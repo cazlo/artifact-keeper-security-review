@@ -34,7 +34,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
 
@@ -152,6 +152,14 @@ async fn list_module_versions(
         .flatten()
         .map(|v| serde_json::json!({ "version": v }))
         .collect();
+
+    if version_list.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Module {} not found", module_name),
+        )
+            .into_response());
+    }
 
     let json = serde_json::json!({
         "modules": [{
@@ -483,7 +491,8 @@ async fn upload_module(
     )>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "terraform")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "terraform", "write")?.user_id;
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     let module_name = format!("{}/{}/{}", namespace, name, provider);
@@ -700,6 +709,14 @@ async fn list_provider_versions(
         })
         .collect();
 
+    if versions.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Provider {} not found", provider_name),
+        )
+            .into_response());
+    }
+
     let json = serde_json::json!({
         "versions": versions,
     });
@@ -728,7 +745,7 @@ async fn download_provider(
 ) -> Result<Response, Response> {
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     let provider_name = format!("{}/{}", namespace, type_name);
-    let platform_path = format!("{}_{}", os, arch);
+    let platform_path = super::escape_like_literal(&format!("{}_{}", os, arch));
 
     let artifact = sqlx::query!(
         r#"
@@ -737,7 +754,7 @@ async fn download_provider(
         WHERE repository_id = $1
           AND name = $2
           AND version = $3
-          AND path LIKE '%' || $4 || '%'
+          AND path LIKE '%' || $4 || '%' ESCAPE '\'
           AND is_deleted = false
         LIMIT 1
         "#,
@@ -891,7 +908,8 @@ async fn upload_provider(
     )>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "terraform")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "terraform", "write")?.user_id;
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     let provider_name = format!("{}/{}", namespace, type_name);

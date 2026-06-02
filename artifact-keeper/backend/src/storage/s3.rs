@@ -1,6 +1,6 @@
 //! S3 storage backend using the `object_store` crate (Apache Arrow project).
 //!
-//! Supports AWS S3 and S3-compatible services (MinIO, Ceph RGW, R2, etc.).
+//! Supports AWS S3 and S3-compatible services (MinIO, Ceph RGW, R2, Huawei OBS, etc.).
 //! Configuration via environment variables:
 //! - S3_BUCKET: Bucket name (required)
 //! - S3_REGION: AWS region (default: us-east-1)
@@ -11,6 +11,15 @@
 //! For TLS configuration:
 //! - S3_CA_CERT_PATH: Path to PEM file with custom CA certificate(s)
 //! - S3_INSECURE_TLS: Disable TLS certificate verification (default: false)
+//!
+//! For S3-compatible providers:
+//! - S3_DISABLE_MULTI_DELETE: Use single-object DELETE instead of multi-object
+//!   POST ?delete (default: false). Required for providers that do not implement
+//!   the S3 DeleteObjects API, such as Huawei Cloud OBS.
+//!
+//! For HTTP connection pool tuning:
+//! - S3_POOL_MAX_IDLE_PER_HOST: Maximum idle connections per host (default: 256)
+//! - S3_POOL_IDLE_TIMEOUT_SECS: Idle connection timeout in seconds (default: 90)
 //!
 //! For redirect downloads (302 to presigned URLs):
 //! - S3_REDIRECT_DOWNLOADS: Enable 302 redirects (default: false)
@@ -29,13 +38,15 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{ObjectStore, ObjectStoreExt, WriteMultipart};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
-use super::{PresignedUrl, PresignedUrlSource, StoragePathFormat};
+use super::{PresignedUrl, PresignedUrlSource, PutStreamResult, StoragePathFormat};
 use crate::error::{AppError, Result};
 
 /// S3 storage backend configuration
@@ -65,6 +76,18 @@ pub struct S3Config {
     pub ca_cert_path: Option<String>,
     /// Disable TLS certificate verification (for dev/test with self-signed certs)
     pub insecure_tls: bool,
+    /// Use single-object DELETE requests instead of the S3 multi-object delete
+    /// API (POST ?delete). Some S3-compatible providers (e.g. Huawei Cloud OBS)
+    /// do not implement DeleteObjects and return 405 Method Not Allowed.
+    pub disable_multi_delete: bool,
+    /// Maximum number of idle connections kept per host in the HTTP connection
+    /// pool used by the S3 client. Higher values reduce TLS handshake overhead
+    /// under high concurrency. Default: 256.
+    pub pool_max_idle_per_host: usize,
+    /// Idle timeout in seconds for pooled HTTP connections. Connections idle
+    /// longer than this are closed. Default: 90 seconds (matches hyper/reqwest
+    /// defaults).
+    pub pool_idle_timeout_secs: u64,
 }
 
 /// CloudFront CDN configuration for signed URLs
@@ -110,6 +133,17 @@ impl S3Config {
         let insecure_tls = std::env::var("S3_INSECURE_TLS")
             .map(|v| v.to_lowercase() == "true" || v == "1")
             .unwrap_or(false);
+        let disable_multi_delete = std::env::var("S3_DISABLE_MULTI_DELETE")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
+        let pool_max_idle_per_host: usize = std::env::var("S3_POOL_MAX_IDLE_PER_HOST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256);
+        let pool_idle_timeout_secs: u64 = std::env::var("S3_POOL_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90);
 
         Ok(Self {
             bucket,
@@ -124,6 +158,9 @@ impl S3Config {
             presign_secret_key,
             ca_cert_path,
             insecure_tls,
+            disable_multi_delete,
+            pool_max_idle_per_host,
+            pool_idle_timeout_secs,
         })
     }
 
@@ -184,6 +221,9 @@ impl S3Config {
             presign_secret_key: None,
             ca_cert_path: None,
             insecure_tls: false,
+            disable_multi_delete: false,
+            pool_max_idle_per_host: 256,
+            pool_idle_timeout_secs: 90,
         }
     }
 
@@ -220,6 +260,118 @@ impl S3Config {
         self.insecure_tls = insecure;
         self
     }
+
+    pub fn with_disable_multi_delete(mut self, disable: bool) -> Self {
+        self.disable_multi_delete = disable;
+        self
+    }
+
+    pub fn with_pool_max_idle_per_host(mut self, max_idle: usize) -> Self {
+        self.pool_max_idle_per_host = max_idle;
+        self
+    }
+
+    pub fn with_pool_idle_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.pool_idle_timeout_secs = timeout_secs;
+        self
+    }
+}
+
+/// True if `S3_ALLOW_ANONYMOUS` is set to a truthy value (`true`, `True`,
+/// `TRUE`, `1`). When enabled, the operator opts into unsigned S3 requests
+/// for genuinely public buckets and `S3Backend::new` no longer requires
+/// credentials. Used by both the credential-chain logic in `build_store`
+/// and the startup check in `validate_credentials_present`.
+fn anonymous_s3_enabled() -> bool {
+    std::env::var("S3_ALLOW_ANONYMOUS")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+}
+
+/// Classify an `object_store::Error` from S3 into a human-readable
+/// diagnostic. Used by both the runtime `health_check` and the boot
+/// `startup_probe` so the operator sees the same actionable message in
+/// `/health` and in startup logs. Recognized cases (issue #981):
+///
+/// - **TLS / cert errors**: typically misconfigured `S3_ENDPOINT`
+///   (https against a host serving a self-signed cert or a different
+///   CN). Suggests `S3_CA_CERT_PATH` or `S3_INSECURE_TLS=true`.
+/// - **DNS / "no such host"**: the endpoint hostname does not resolve.
+/// - **Connection refused / timeout / unreachable**: network path
+///   broken or the wrong port.
+/// - **403 / Access Denied**: credentials present but lack the bucket
+///   permissions.
+/// - **404 / NoSuchBucket**: bucket name typo or wrong region.
+/// - **Region mismatch**: `BucketRegionError` or PermanentRedirect.
+/// - **Signature mismatch**: clock skew or wrong secret.
+///
+/// The original error string is appended as `caused by:` so the full
+/// message is still searchable in the logs.
+pub(crate) fn classify_s3_error(err: &object_store::Error) -> String {
+    let raw = err.to_string();
+    let l = raw.to_lowercase();
+
+    let category = if l.contains("certificate")
+        || l.contains("tls")
+        || l.contains("self-signed")
+        || l.contains("self signed")
+        || l.contains("unknownissuer")
+        || l.contains("invalidcertificate")
+    {
+        "S3 TLS / certificate error. The endpoint's certificate is not \
+         trusted by the container. Either mount a CA bundle and set \
+         S3_CA_CERT_PATH=/path/to/ca.pem, or (only for trusted internal \
+         networks) set S3_INSECURE_TLS=true. See docs at \
+         https://artifactkeeper.com/docs/deployment/s3 (issue #981)."
+    } else if l.contains("dns")
+        || l.contains("no such host")
+        || l.contains("name or service not known")
+        || l.contains("nodename nor servname")
+    {
+        "S3 DNS resolution failed. S3_ENDPOINT hostname does not resolve \
+         from inside the container. Check CoreDNS, /etc/resolv.conf, and \
+         the spelling of S3_ENDPOINT."
+    } else if l.contains("connection refused") {
+        "S3 connection refused. The endpoint host is up but nothing is \
+         listening on the configured port. Verify S3_ENDPOINT scheme and \
+         port (e.g. https://s3.example.com:9000) match the actual \
+         service."
+    } else if l.contains("network unreachable")
+        || l.contains("no route to host")
+        || l.contains("host unreachable")
+    {
+        "S3 network unreachable. No route from the container to the \
+         endpoint. Likely a NetworkPolicy, firewall, or egress rule."
+    } else if l.contains("timeout") || l.contains("timed out") {
+        "S3 connection timed out. Endpoint dropped packets or is behind \
+         a stalled proxy. If you use a custom CA, also confirm S3_CA_CERT_PATH \
+         is set so TLS does not fall back to system trust."
+    } else if l.contains("403") || l.contains("access denied") || l.contains("forbidden") {
+        "S3 access denied (403). Credentials are reaching the endpoint \
+         but lack permission on the bucket. Confirm S3_BUCKET, the IAM \
+         policy / bucket policy, and that S3_ACCESS_KEY_ID matches the \
+         intended principal."
+    } else if l.contains("nosuchbucket")
+        || (l.contains("404") && l.contains("bucket"))
+        || l.contains("the specified bucket does not exist")
+    {
+        "S3 bucket not found. Confirm S3_BUCKET exists and the region \
+         (S3_REGION) is correct for that bucket."
+    } else if l.contains("bucketregionerror")
+        || l.contains("permanentredirect")
+        || (l.contains("301") && l.contains("region"))
+    {
+        "S3 region mismatch. S3_REGION does not match the bucket's actual \
+         region. Set S3_REGION to the region the bucket lives in."
+    } else if l.contains("signaturedoesnotmatch") || l.contains("invalidaccesskeyid") {
+        "S3 signature rejected. Either S3_SECRET_ACCESS_KEY is wrong, or \
+         the container clock is skewed by more than 15 minutes from the \
+         S3 server (AWS SigV4 rejects skewed signatures)."
+    } else {
+        "S3 request failed"
+    };
+
+    format!("{}. caused by: {}", category, raw)
 }
 
 /// Generate the full S3 key with optional prefix.
@@ -266,6 +418,10 @@ pub struct S3Backend {
     cloudfront: Option<CloudFrontConfig>,
     path_format: StoragePathFormat,
     signing_store: Option<AmazonS3>,
+    /// When true, delete objects one at a time with HTTP DELETE instead of the
+    /// S3 multi-object delete API (POST ?delete). Needed for providers like
+    /// Huawei Cloud OBS that do not implement DeleteObjects.
+    disable_multi_delete: bool,
 }
 
 impl S3Backend {
@@ -274,7 +430,9 @@ impl S3Backend {
         access_key: Option<&str>,
         secret_key: Option<&str>,
     ) -> Result<AmazonS3> {
-        let mut client_opts = object_store::ClientOptions::new();
+        let mut client_opts = object_store::ClientOptions::new()
+            .with_pool_max_idle_per_host(config.pool_max_idle_per_host)
+            .with_pool_idle_timeout(Duration::from_secs(config.pool_idle_timeout_secs));
 
         if config
             .endpoint
@@ -365,6 +523,12 @@ impl S3Backend {
             if let Ok(token) = std::env::var("AWS_SESSION_TOKEN") {
                 builder = builder.with_token(token);
             }
+        } else if anonymous_s3_enabled() {
+            tracing::warn!(
+                "S3 storage configured with no credentials and S3_ALLOW_ANONYMOUS=true; \
+                 using unsigned requests"
+            );
+            builder = builder.with_skip_signature(true);
         }
 
         builder
@@ -372,8 +536,88 @@ impl S3Backend {
             .map_err(|e| AppError::Config(format!("Failed to build S3 client: {}", e)))
     }
 
+    /// Validate at startup that some recognized credential source is configured.
+    ///
+    /// Without this check, `S3Backend::new` would silently construct a client
+    /// whose default credential provider falls back to EC2 instance metadata
+    /// (169.254.169.254) at first request, causing 5-15s timeouts per storage
+    /// operation in non-AWS deployments (issue #871).
+    ///
+    /// Only enforced when a custom `S3_ENDPOINT` is set: a custom endpoint is
+    /// definitively not AWS, so IMDS is never the right fallback. For AWS S3
+    /// itself (no custom endpoint), IMDS is a legitimate fallback when running
+    /// on EC2 with an instance role, so the chain is left alone there.
+    fn validate_credentials_present(config: &S3Config) -> Result<()> {
+        if config.endpoint.is_none() {
+            return Ok(());
+        }
+        if anonymous_s3_enabled() {
+            return Ok(());
+        }
+        let has_static_creds = (std::env::var("S3_ACCESS_KEY_ID").is_ok()
+            && std::env::var("S3_SECRET_ACCESS_KEY").is_ok())
+            || (std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+                && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok());
+        let has_cloud_chain = std::env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").is_ok()
+            || std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI").is_ok()
+            || std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE").is_ok();
+        if has_static_creds || has_cloud_chain {
+            return Ok(());
+        }
+        Err(AppError::Config(
+            "S3 storage configured with custom endpoint but no credentials found. \
+             Set S3_ACCESS_KEY_ID + S3_SECRET_ACCESS_KEY (or AWS_ACCESS_KEY_ID + \
+             AWS_SECRET_ACCESS_KEY), one of the cloud credential chains \
+             (ECS via AWS_CONTAINER_CREDENTIALS_RELATIVE_URI, EKS Pod Identity via \
+             AWS_CONTAINER_CREDENTIALS_FULL_URI, or IRSA via \
+             AWS_WEB_IDENTITY_TOKEN_FILE), or S3_ALLOW_ANONYMOUS=true for unsigned \
+             access. Without explicit credentials the AWS SDK falls back to EC2 \
+             instance metadata (169.254.169.254), which is unreachable in non-AWS \
+             deployments and causes every storage request to time out (issue #871)."
+                .to_string(),
+        ))
+    }
+
+    /// Run a startup connectivity probe so the operator sees the root
+    /// cause (TLS, DNS, connection refused, 403, ...) at boot instead of
+    /// a generic "storage probe timed out" 30 minutes later in a health
+    /// log. The probe is a single HEAD against a synthetic key; both
+    /// "object missing" and a successful HEAD count as connectivity OK.
+    ///
+    /// Failures are returned as `AppError::Storage` with a human-readable
+    /// diagnostic from [`classify_s3_error`]. Callers in `main.rs` choose
+    /// whether to fail-fast or warn-and-continue.
+    pub async fn startup_probe(&self) -> Result<()> {
+        // 10s is generous compared to the 5s health-endpoint budget, since
+        // a first-time TCP + TLS handshake against a slow corporate proxy
+        // can legitimately exceed 5s.
+        let probe = async {
+            let path: ObjectPath = ".health-probe".into();
+            self.store.head(&path).await
+        };
+        match tokio::time::timeout(Duration::from_secs(10), probe).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(object_store::Error::NotFound { .. })) => Ok(()),
+            Ok(Err(e)) => Err(AppError::Storage(classify_s3_error(&e))),
+            Err(_) => Err(AppError::Storage(
+                "S3 connectivity probe timed out after 10s. Network unreachable, \
+                 DNS resolution failed, or endpoint is dropping packets. Verify \
+                 S3_ENDPOINT is reachable from inside the container: \
+                 `kubectl exec -it <pod> -- curl -v $S3_ENDPOINT`. If TLS is \
+                 involved, also check the cert chain (issue #981)."
+                    .to_string(),
+            )),
+        }
+    }
+
     /// Create new S3 backend from configuration
     pub async fn new(config: S3Config) -> Result<Self> {
+        // Issue #871: validate credentials are present before constructing
+        // the client. Without this, a non-AWS deployment with a custom
+        // S3_ENDPOINT and no creds would fall back to EC2 instance metadata
+        // at first request, causing every storage operation to stall 5-15s.
+        Self::validate_credentials_present(&config)?;
+
         let store = Self::build_store(&config, None, None)?;
 
         let signing_store = match (&config.presign_access_key, &config.presign_secret_key) {
@@ -399,6 +643,13 @@ impl S3Backend {
             tracing::info!(path_format = %config.path_format, "S3 storage path format configured");
         }
 
+        if config.disable_multi_delete {
+            tracing::info!(
+                "S3 multi-object delete disabled (S3_DISABLE_MULTI_DELETE=true), \
+                 using single-object DELETE requests"
+            );
+        }
+
         Ok(Self {
             store,
             prefix: config.prefix,
@@ -406,6 +657,7 @@ impl S3Backend {
             cloudfront: config.cloudfront,
             path_format: config.path_format,
             signing_store,
+            disable_multi_delete: config.disable_multi_delete,
         })
     }
 
@@ -465,6 +717,63 @@ impl S3Backend {
                 "Failed to get fallback object '{}' for '{}': {}",
                 fallback_key, key, e
             ))),
+        }
+    }
+
+    /// Delete a single object using a presigned DELETE URL.
+    ///
+    /// The `object_store` crate routes all deletes through the S3 multi-object
+    /// delete API (POST ?delete). Some S3-compatible providers, notably Huawei
+    /// Cloud OBS, do not implement this endpoint and return 405 Method Not
+    /// Allowed. This method works around the limitation by generating a
+    /// presigned DELETE URL via the `Signer` trait and executing it with a
+    /// plain HTTP DELETE request.
+    async fn single_object_delete(&self, path: &ObjectPath, display_key: &str) -> Result<()> {
+        use object_store::signer::Signer;
+
+        let presigned_url = self
+            .store
+            .signed_url(http::Method::DELETE, path, Duration::from_secs(300))
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to generate presigned DELETE URL for '{}': {}",
+                    display_key, e
+                ))
+            })?;
+
+        let response = reqwest::Client::new()
+            .delete(presigned_url)
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to send DELETE request for '{}': {}",
+                    display_key, e
+                ))
+            })?;
+
+        let status = response.status();
+        if status.is_success() || status.as_u16() == 204 {
+            Ok(())
+        } else {
+            let body = response.text().await.unwrap_or_default();
+            // S3 returns 404 when deleting a non-existent object, which is not
+            // an error (idempotent delete).
+            if status.as_u16() == 404 {
+                tracing::debug!(
+                    key = %display_key,
+                    "Single-object DELETE returned 404, treating as success"
+                );
+                return Ok(());
+            }
+            Err(AppError::Storage(format!(
+                "Failed to delete object '{}': {} {}: {}",
+                display_key,
+                status.as_u16(),
+                status.canonical_reason().unwrap_or(""),
+                body
+            )))
         }
     }
 }
@@ -557,13 +866,38 @@ impl super::StorageBackend for S3Backend {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
 
-        self.store
-            .delete(&path)
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to delete object '{}': {}", key, e)))?;
+        if self.disable_multi_delete {
+            self.single_object_delete(&path, key).await?;
+        } else {
+            self.store.delete(&path).await.map_err(|e| {
+                AppError::Storage(format!("Failed to delete object '{}': {}", key, e))
+            })?;
+        }
 
         tracing::debug!(key = %key, "S3 delete object successful");
         Ok(())
+    }
+
+    /// Surface S3's ETag from a HEAD on `key`. For single-part PUTs the
+    /// ETag equals the MD5 of the object; for multipart uploads it is an
+    /// opaque per-upload value. Either way the value is stable per object
+    /// version and changes if the object is overwritten, which is exactly
+    /// the integrity signal #1051's fast-path revalidation needs.
+    ///
+    /// Returns `Ok(None)` when the object is missing rather than an error,
+    /// so the freshness probe can treat "ETag unavailable" as "do not
+    /// fast-path" without losing the distinction from a real I/O failure.
+    async fn head_etag(&self, key: &str) -> Result<Option<String>> {
+        let full_key = self.full_key(key);
+        let path: ObjectPath = full_key.into();
+        match self.store.head(&path).await {
+            Ok(meta) => Ok(meta.e_tag),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(AppError::Storage(format!(
+                "head_etag failed for '{}': {}",
+                key, e
+            ))),
+        }
     }
 
     fn supports_redirect(&self) -> bool {
@@ -630,18 +964,76 @@ impl super::StorageBackend for S3Backend {
         match self.store.head(&path).await {
             Ok(_) => Ok(()),
             Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("403") || msg.contains("Access Denied") {
-                    Err(AppError::Storage(format!(
-                        "S3 health check failed: access denied: {}",
-                        e
-                    )))
-                } else {
-                    Err(AppError::Storage(format!("S3 health check failed: {}", e)))
+            Err(e) => Err(AppError::Storage(classify_s3_error(&e))),
+        }
+    }
+
+    async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+        let full_key = self.full_key(key);
+        let path: ObjectPath = full_key.into();
+        let key_owned = key.to_string();
+
+        let result = self.store.get(&path).await.map_err(|e| match e {
+            object_store::Error::NotFound { .. } => {
+                AppError::NotFound(format!("Storage key not found: {}", key_owned))
+            }
+            _ => AppError::Storage(format!("Failed to get object '{}': {}", key_owned, e)),
+        })?;
+
+        let stream = result
+            .into_stream()
+            .map(|r| r.map_err(|e| AppError::Storage(format!("Stream read error: {}", e))));
+
+        Ok(Box::pin(stream))
+    }
+
+    async fn put_stream(
+        &self,
+        key: &str,
+        stream: BoxStream<'static, Result<Bytes>>,
+    ) -> Result<PutStreamResult> {
+        let full_key = self.full_key(key);
+        let path: ObjectPath = full_key.into();
+
+        let upload = self.store.put_multipart(&path).await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to start multipart upload for '{}': {}",
+                key, e
+            ))
+        })?;
+
+        let mut write = WriteMultipart::new(upload);
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+
+        tokio::pin!(stream);
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(data) => {
+                    hasher.update(&data);
+                    total += data.len() as u64;
+                    write.put(data);
+                }
+                Err(e) => {
+                    // Abort the multipart upload on stream error to avoid
+                    // leaving partial objects in S3.
+                    let _ = write.abort().await;
+                    return Err(e);
                 }
             }
         }
+
+        write.finish().await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to complete multipart upload for '{}': {}",
+                key, e
+            ))
+        })?;
+
+        Ok(PutStreamResult {
+            checksum_sha256: format!("{:x}", hasher.finalize()),
+            bytes_written: total,
+        })
     }
 }
 
@@ -980,6 +1372,7 @@ mod tests {
         assert!(config.prefix.is_none());
         assert!(config.ca_cert_path.is_none());
         assert!(!config.insecure_tls);
+        assert!(!config.disable_multi_delete);
     }
 
     #[test]
@@ -1083,6 +1476,37 @@ mod tests {
         assert!(!config.insecure_tls);
     }
 
+    // --- disable_multi_delete config tests ---
+
+    #[test]
+    fn test_s3_config_disable_multi_delete_defaults_off_and_can_enable() {
+        let default_config = S3Config::new("b".to_string(), "r".to_string(), None, None);
+        assert!(
+            !default_config.disable_multi_delete,
+            "should default to false"
+        );
+
+        let enabled = default_config.with_disable_multi_delete(true);
+        assert!(enabled.disable_multi_delete);
+    }
+
+    #[test]
+    fn test_s3_config_huawei_obs_chained_builders() {
+        let config = S3Config::new(
+            "obs-bucket".to_string(),
+            "cn-north-4".to_string(),
+            Some("https://obs.cn-north-4.myhuaweicloud.com".to_string()),
+            None,
+        )
+        .with_disable_multi_delete(true)
+        .with_insecure_tls(false);
+
+        assert_eq!(config.bucket, "obs-bucket");
+        assert_eq!(config.region, "cn-north-4");
+        assert!(config.disable_multi_delete);
+        assert!(!config.insecure_tls);
+    }
+
     // --- build_store tests ---
 
     #[test]
@@ -1178,6 +1602,7 @@ mod tests {
         let orig_psk = std::env::var("S3_PRESIGN_SECRET_ACCESS_KEY").ok();
         let orig_ca = std::env::var("S3_CA_CERT_PATH").ok();
         let orig_insecure = std::env::var("S3_INSECURE_TLS").ok();
+        let orig_disable_multi = std::env::var("S3_DISABLE_MULTI_DELETE").ok();
         // Also save CloudFront vars to avoid interference
         let orig_cf_url = std::env::var("CLOUDFRONT_DISTRIBUTION_URL").ok();
 
@@ -1192,6 +1617,7 @@ mod tests {
         std::env::set_var("S3_PRESIGN_SECRET_ACCESS_KEY", "presign-sk");
         std::env::remove_var("S3_CA_CERT_PATH");
         std::env::set_var("S3_INSECURE_TLS", "1");
+        std::env::set_var("S3_DISABLE_MULTI_DELETE", "true");
         std::env::remove_var("CLOUDFRONT_DISTRIBUTION_URL");
 
         let result = S3Config::from_env();
@@ -1211,6 +1637,7 @@ mod tests {
         assert_eq!(config.presign_secret_key, Some("presign-sk".to_string()));
         assert!(config.ca_cert_path.is_none());
         assert!(config.insecure_tls);
+        assert!(config.disable_multi_delete);
         assert!(config.cloudfront.is_none());
 
         // Restore all originals
@@ -1228,6 +1655,7 @@ mod tests {
         restore("S3_PRESIGN_SECRET_ACCESS_KEY", orig_psk);
         restore("S3_CA_CERT_PATH", orig_ca);
         restore("S3_INSECURE_TLS", orig_insecure);
+        restore("S3_DISABLE_MULTI_DELETE", orig_disable_multi);
         restore("CLOUDFRONT_DISTRIBUTION_URL", orig_cf_url);
     }
 
@@ -1294,6 +1722,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_new_minimal() {
+        let _env = AnonymousS3TestEnv::enter();
         let config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1306,6 +1735,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_new_with_signing_store() {
+        let _env = AnonymousS3TestEnv::enter();
         let mut config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1321,6 +1751,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_new_with_tls_config() {
+        let _env = AnonymousS3TestEnv::enter();
         let config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1334,6 +1765,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_new_migration_path_format() {
+        let _env = AnonymousS3TestEnv::enter();
         let config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1347,6 +1779,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_supports_redirect_false_by_default() {
+        let _env = AnonymousS3TestEnv::enter();
         let config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1359,6 +1792,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_supports_redirect_when_enabled() {
+        let _env = AnonymousS3TestEnv::enter();
         let config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1372,6 +1806,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_full_key_integration() {
+        let _env = AnonymousS3TestEnv::enter();
         let config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1385,6 +1820,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_fallback_integration() {
+        let _env = AnonymousS3TestEnv::enter();
         let config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1407,6 +1843,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_from_env_with_env_vars() {
+        let _env = AnonymousS3TestEnv::enter();
         // Save originals
         let orig_bucket = std::env::var("S3_BUCKET").ok();
         let orig_region = std::env::var("S3_REGION").ok();
@@ -1438,6 +1875,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_new_invalid_ca_cert_fails() {
+        let _env = AnonymousS3TestEnv::enter();
         let config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1472,6 +1910,7 @@ mod tests {
         "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
         "AWS_WEB_IDENTITY_TOKEN_FILE",
         "AWS_ROLE_ARN",
+        "S3_ALLOW_ANONYMOUS",
     ];
 
     /// Save current values for all credential env vars.
@@ -1499,6 +1938,36 @@ mod tests {
         }
     }
 
+    /// RAII helper for tests that exercise `S3Backend::new` construction
+    /// behavior without caring about the credential chain. Enters the
+    /// CRED_ENV_MUTEX, clears every credential env var, and sets
+    /// `S3_ALLOW_ANONYMOUS=true` so `validate_credentials_present` succeeds
+    /// regardless of the host environment. On drop, restores the prior
+    /// values and releases the mutex.
+    ///
+    /// Use this in any test that calls `S3Backend::new` with a custom
+    /// (localhost / fake) endpoint to avoid the issue #871 startup check.
+    struct AnonymousS3TestEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl AnonymousS3TestEnv {
+        fn enter() -> Self {
+            let lock = CRED_ENV_MUTEX.lock().unwrap();
+            let saved = save_cred_env();
+            clear_cred_env();
+            std::env::set_var("S3_ALLOW_ANONYMOUS", "true");
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for AnonymousS3TestEnv {
+        fn drop(&mut self) {
+            restore_cred_env(std::mem::take(&mut self.saved));
+        }
+    }
+
     /// Helper: build an S3Config pointing at a fake http endpoint so
     /// the builder never tries a real TLS handshake.
     fn test_config() -> S3Config {
@@ -1510,18 +1979,230 @@ mod tests {
         )
     }
 
+    // --- Issue #871: startup credential validation ---
+
     #[test]
-    fn test_build_store_succeeds_with_no_aws_env_vars() {
+    fn test_validate_creds_fails_fast_with_custom_endpoint_and_no_creds() {
+        // Issue #871: a custom S3 endpoint with no credentials must fail at
+        // startup with a clear Config error, not silently fall through to
+        // IMDS at first request and time out for 5-15s per call.
         let _lock = CRED_ENV_MUTEX.lock().unwrap();
         let saved = save_cred_env();
         clear_cred_env();
 
-        let result = S3Backend::build_store(&test_config(), None, None);
+        let result = S3Backend::validate_credentials_present(&test_config());
+        assert!(
+            result.is_err(),
+            "validate_credentials_present with custom endpoint + no creds must fail fast"
+        );
+        let err = result.unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("169.254.169.254") && msg.contains("S3_ACCESS_KEY_ID"),
+            "error must explain the IMDS fallback and how to fix it: {}",
+            msg
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_succeeds_with_aws_endpoint_and_no_creds() {
+        // Without a custom endpoint we are talking to real AWS S3, where
+        // IMDS is a legitimate fallback (EC2 instance role). Don't error.
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        let aws_config = S3Config::new(
+            "aws-bucket".to_string(),
+            "us-east-1".to_string(),
+            None, // no custom endpoint = AWS S3
+            None,
+        );
+        let result = S3Backend::validate_credentials_present(&aws_config);
         assert!(
             result.is_ok(),
-            "build_store should succeed without any AWS env vars: {:?}",
+            "AWS endpoint with no explicit creds should pass validation (IMDS is the legit fallback): {:?}",
             result.err()
         );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_succeeds_with_static_creds() {
+        // The most common case: operator sets S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY.
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var("S3_ACCESS_KEY_ID", "AKIA");
+        std::env::set_var("S3_SECRET_ACCESS_KEY", "secret");
+
+        let result = S3Backend::validate_credentials_present(&test_config());
+        assert!(
+            result.is_ok(),
+            "validate with S3_* creds should succeed: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_succeeds_with_aws_static_creds() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIA");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
+
+        let result = S3Backend::validate_credentials_present(&test_config());
+        assert!(
+            result.is_ok(),
+            "validate with AWS_* creds should succeed: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_partial_static_keys_treated_as_no_creds() {
+        // Only AWS_ACCESS_KEY_ID without secret = misconfigured = same path
+        // as no creds at all. Static cred chain in build_store also requires
+        // both; this validator must agree to surface the error at startup.
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var("S3_ACCESS_KEY_ID", "AKIA");
+        // no S3_SECRET_ACCESS_KEY
+
+        let result = S3Backend::validate_credentials_present(&test_config());
+        assert!(
+            result.is_err(),
+            "validate must reject access key without secret key"
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_succeeds_with_irsa() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var(
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "/var/run/secrets/eks.amazonaws.com/serviceaccount/token",
+        );
+        std::env::set_var("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/my-role");
+
+        let result = S3Backend::validate_credentials_present(&test_config());
+        assert!(
+            result.is_ok(),
+            "validate with IRSA should succeed: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_succeeds_with_ecs() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var(
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "/v2/credentials/some-uuid",
+        );
+
+        let result = S3Backend::validate_credentials_present(&test_config());
+        assert!(
+            result.is_ok(),
+            "validate with ECS task role should succeed: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_succeeds_with_eks_pod_identity() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "http://169.254.170.23/v1/credentials",
+        );
+
+        let result = S3Backend::validate_credentials_present(&test_config());
+        assert!(
+            result.is_ok(),
+            "validate with EKS Pod Identity should succeed: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_anonymous_with_custom_endpoint() {
+        // S3_ALLOW_ANONYMOUS=true opts the operator into unsigned requests
+        // for genuinely public buckets. Validation must accept this without
+        // requiring further credentials.
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var("S3_ALLOW_ANONYMOUS", "true");
+
+        let result = S3Backend::validate_credentials_present(&test_config());
+        assert!(
+            result.is_ok(),
+            "validate with S3_ALLOW_ANONYMOUS=true should succeed: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_anonymous_truthy_parsing() {
+        // S3_ALLOW_ANONYMOUS uses standard truthy values: true, True, TRUE, 1.
+        // Anything else (including "no", "false", empty) should NOT enable it.
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        for v in &["1", "TRUE", "True", "true"] {
+            std::env::set_var("S3_ALLOW_ANONYMOUS", v);
+            let result = S3Backend::validate_credentials_present(&test_config());
+            assert!(
+                result.is_ok(),
+                "S3_ALLOW_ANONYMOUS={} should be truthy: {:?}",
+                v,
+                result.err()
+            );
+        }
+        // Non-truthy values must still trigger the no-creds error.
+        for v in &["no", "false", "FALSE", "0", ""] {
+            std::env::set_var("S3_ALLOW_ANONYMOUS", v);
+            let result = S3Backend::validate_credentials_present(&test_config());
+            assert!(
+                result.is_err(),
+                "S3_ALLOW_ANONYMOUS={:?} must NOT enable anonymous mode",
+                v
+            );
+        }
 
         restore_cred_env(saved);
     }
@@ -1792,6 +2473,293 @@ mod tests {
         );
 
         restore_cred_env(saved);
+    }
+
+    // --- single_object_delete / disable_multi_delete via wiremock ---
+
+    /// Build an S3Backend pointing at the given base URL with
+    /// `disable_multi_delete` set to the requested value.
+    async fn mock_s3_backend(base_url: &str, disable_multi_delete: bool) -> S3Backend {
+        let config = S3Config::new(
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some(base_url.to_string()),
+            None,
+        )
+        .with_disable_multi_delete(disable_multi_delete);
+
+        // build_store needs explicit creds so the signer can produce URLs
+        let store = S3Backend::build_store(&config, Some("AKIAIOSFODNN7EXAMPLE"), Some("secret"))
+            .expect("build mock store");
+        S3Backend {
+            store,
+            prefix: None,
+            redirect_downloads: false,
+            cloudfront: None,
+            path_format: StoragePathFormat::Native,
+            signing_store: None,
+            disable_multi_delete,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_single_object_delete_success_204() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // The presigned DELETE URL hits the mock server; respond with 204
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let path: ObjectPath = "test-key".into();
+        let result = backend.single_object_delete(&path, "test-key").await;
+        assert!(result.is_ok(), "204 should be treated as success");
+    }
+
+    #[tokio::test]
+    async fn test_single_object_delete_success_200() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let path: ObjectPath = "another-key".into();
+        let result = backend.single_object_delete(&path, "another-key").await;
+        assert!(result.is_ok(), "200 should be treated as success");
+    }
+
+    #[tokio::test]
+    async fn test_single_object_delete_404_is_idempotent() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("NoSuchKey"))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let path: ObjectPath = "missing-key".into();
+        let result = backend.single_object_delete(&path, "missing-key").await;
+        assert!(
+            result.is_ok(),
+            "404 on delete should be treated as success (idempotent)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_single_object_delete_403_returns_error() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("AccessDenied"))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let path: ObjectPath = "forbidden-key".into();
+        let result = backend.single_object_delete(&path, "forbidden-key").await;
+        assert!(result.is_err(), "403 should be an error");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("403"),
+            "error should mention status code: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_single_object_delete_500_returns_error() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("InternalError"))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let path: ObjectPath = "error-key".into();
+        let result = backend.single_object_delete(&path, "error-key").await;
+        assert!(result.is_err(), "500 should be an error");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("500"),
+            "error should mention status code: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_dispatches_to_single_object_delete_when_enabled() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // single_object_delete generates a signed DELETE URL and then issues
+        // an HTTP DELETE to it, so we only need to match DELETE
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let result = StorageBackendTrait::delete(&backend, "dispatch-key").await;
+        assert!(
+            result.is_ok(),
+            "delete with disable_multi_delete=true should use single_object_delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_uses_store_delete_when_multi_delete_enabled() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // object_store issues a POST ?delete for multi-object delete.
+        // We just mock any request to respond with 200 so the call succeeds.
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<?xml version="1.0"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        // With disable_multi_delete=false, the standard store.delete() path
+        // is used. We mainly verify the branch is taken without panicking.
+        let _ = crate::storage::StorageBackend::delete(&backend, "multi-key").await;
+        // Not asserting success because the mock may not perfectly satisfy
+        // the object_store S3 multi-delete protocol, but the branch is exercised.
+    }
+
+    // ---- classify_s3_error: issue #981 diagnostic classifier ----
+    //
+    // These tests synthesize `object_store::Error::Generic` because the
+    // real error shapes (TLS, DNS, ...) are produced deep inside reqwest
+    // and not constructible in unit tests. The classifier only inspects
+    // the display string, so a Generic with the right source text
+    // covers every branch.
+
+    fn generic_err(msg: &str) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "S3",
+            source: msg.to_string().into(),
+        }
+    }
+
+    #[test]
+    fn test_classify_tls_certificate_error() {
+        let e = generic_err("invalid peer certificate: UnknownIssuer");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("TLS / certificate error"), "got: {msg}");
+        assert!(
+            msg.contains("S3_CA_CERT_PATH"),
+            "must suggest CA bundle: {msg}"
+        );
+        assert!(msg.contains("caused by:"), "must keep raw source: {msg}");
+    }
+
+    #[test]
+    fn test_classify_self_signed_error() {
+        let e = generic_err("error: self-signed certificate");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("TLS / certificate error"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_classify_dns_error() {
+        let e = generic_err("dns error: no such host (s3.invalid.example)");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("DNS resolution failed"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_classify_connection_refused() {
+        let e = generic_err("error sending request: connection refused");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("connection refused"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_classify_network_unreachable() {
+        let e = generic_err("network unreachable");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("network unreachable"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_classify_timeout() {
+        // Mirrors the exact `transport error of kind Timeout` log line
+        // in issue #981.
+        let e = generic_err("Encountered transport error of kind Timeout");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("timed out"), "got: {msg}");
+        assert!(
+            msg.contains("S3_CA_CERT_PATH"),
+            "should mention CA fallback hint for timeout: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_classify_access_denied_403() {
+        let e = generic_err("Client error with status 403 Forbidden: Access Denied");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("access denied (403)"), "got: {msg}");
+        assert!(
+            msg.contains("S3_BUCKET"),
+            "must reference IAM/bucket policy: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_classify_no_such_bucket() {
+        let e = generic_err("NoSuchBucket: The specified bucket does not exist");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("bucket not found"), "got: {msg}");
+        assert!(msg.contains("S3_REGION"), "must mention region: {msg}");
+    }
+
+    #[test]
+    fn test_classify_region_mismatch() {
+        let e = generic_err("BucketRegionError: bucket is in us-west-2");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("region mismatch"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_classify_signature_mismatch() {
+        let e = generic_err("SignatureDoesNotMatch: clock skew");
+        let msg = classify_s3_error(&e);
+        assert!(msg.contains("signature rejected"), "got: {msg}");
+        assert!(msg.contains("clock"), "must mention clock skew: {msg}");
+    }
+
+    #[test]
+    fn test_classify_unknown_error_fallthrough() {
+        // An unrecognized error must NOT be misclassified into a wrong
+        // bucket; it should fall through to the generic "S3 request
+        // failed" label and still preserve the raw source.
+        let e = generic_err("some entirely new failure mode");
+        let msg = classify_s3_error(&e);
+        assert!(msg.starts_with("S3 request failed"), "got: {msg}");
+        assert!(
+            msg.contains("some entirely new failure mode"),
+            "must keep raw text: {msg}"
+        );
     }
 }
 

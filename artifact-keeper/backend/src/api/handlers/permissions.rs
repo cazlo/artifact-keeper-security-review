@@ -1,7 +1,8 @@
 //! Permission management handlers.
 
 use axum::{
-    extract::{Path, Query, State},
+    body::Bytes,
+    extract::{Extension, Path, Query, State},
     routing::get,
     Json, Router,
 };
@@ -11,8 +12,14 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+
+/// Require that the request is authenticated, returning an error if not.
+fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
+    auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
+}
 
 /// Create permission routes
 pub fn router() -> Router<SharedState> {
@@ -233,8 +240,37 @@ pub struct CreatedPermissionRow {
 )]
 pub async fn create_permission(
     State(state): State<SharedState>,
-    Json(payload): Json<CreatePermissionRequest>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    body: Bytes,
 ) -> Result<Json<PermissionResponse>> {
+    // GHSA-vvc3-h39c-mrq5: read-scoped service-account tokens were being
+    // accepted on this endpoint, enabling privilege escalation by creating
+    // a fine-grained admin permission on the system sentinel.
+    //
+    // The body is taken as raw `Bytes` (not `Json<CreatePermissionRequest>`)
+    // so the authorization gate runs BEFORE the payload is parsed. A
+    // `Json<T>` extractor runs during request extraction, i.e. before this
+    // handler body executes, so a malformed/short payload from a read-scope
+    // caller would short-circuit to a body-shape error (422/500) before the
+    // scope check ever ran. By gating first we guarantee a non-admin or
+    // read-scope caller gets a clean 403 with the canonical scope-error body
+    // before any deserialization or DB work. See #1438 (B10).
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+    // #1438 (1a): only admins may grant fine-grained permissions. Previously
+    // a non-admin JWT caller passed the scope check (JWT sessions are not
+    // scope-restricted), hit the INSERT, and tripped an FK violation that
+    // surfaced as 500 DATABASE_ERROR. The contract is admin-only, so reject
+    // here with 403 before any DB write.
+    auth.require_admin()?;
+    let _ = auth;
+
+    // Only now, after the caller is authorized, parse the payload. Malformed
+    // or missing fields surface as 400 VALIDATION_ERROR (the canonical
+    // client-error envelope), never 422/500.
+    let payload: CreatePermissionRequest = serde_json::from_slice(&body)
+        .map_err(|e| AppError::Validation(format!("Invalid permission payload: {}", e)))?;
+
     let permission: CreatedPermissionRow = sqlx::query_as(
         r#"
         INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions)
@@ -258,6 +294,7 @@ pub async fn create_permission(
         }
     })?;
 
+    state.permission_service.invalidate_cache();
     state
         .event_bus
         .emit("permission.created", permission.id, None);
@@ -354,9 +391,22 @@ pub async fn get_permission(
 )]
 pub async fn update_permission(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
-    Json(payload): Json<CreatePermissionRequest>,
+    body: Bytes,
 ) -> Result<Json<PermissionResponse>> {
+    // GHSA-vvc3-h39c-mrq5: enforce token scope on permission updates. As in
+    // create_permission, take the body as raw `Bytes` and authorize before
+    // parsing so a read-scope caller gets 403 (not a body-shape 422/500)
+    // before any deserialization or DB work.
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+    auth.require_admin()?;
+    let _ = auth;
+
+    let payload: CreatePermissionRequest = serde_json::from_slice(&body)
+        .map_err(|e| AppError::Validation(format!("Invalid permission payload: {}", e)))?;
+
     let permission: CreatedPermissionRow = sqlx::query_as(
         r#"
         UPDATE permissions
@@ -377,6 +427,7 @@ pub async fn update_permission(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Permission not found".to_string()))?;
 
+    state.permission_service.invalidate_cache();
     state
         .event_bus
         .emit("permission.updated", permission.id, None);
@@ -413,8 +464,16 @@ pub async fn update_permission(
 )]
 pub async fn delete_permission(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
+    // GHSA-vvc3-h39c-mrq5: destructive permission ops require the delete
+    // scope. Without this check a read-scoped service-account token could
+    // remove permission rows belonging to other principals.
+    let auth = require_auth(auth)?;
+    auth.require_scope("delete")?;
+    let _ = auth;
+
     let result = sqlx::query("DELETE FROM permissions WHERE id = $1")
         .bind(id)
         .execute(&state.db)
@@ -425,6 +484,7 @@ pub async fn delete_permission(
         return Err(AppError::NotFound("Permission not found".to_string()));
     }
 
+    state.permission_service.invalidate_cache();
     state.event_bus.emit("permission.deleted", id, None);
 
     Ok(())
@@ -757,5 +817,201 @@ mod tests {
         let json = serde_json::to_value(&row).unwrap();
         assert_eq!(json["principal_type"], "user");
         assert_eq!(json["actions"].as_array().unwrap().len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // GHSA-vvc3-h39c-mrq5: scope-check tests for admin endpoints. The
+    // privilege escalation chain in the advisory is:
+    //
+    //   read-scope SA token → POST /api/v1/permissions {actions: ["admin"]}
+    //   on the system sentinel → token now has fine-grained admin
+    //
+    // The tests below exercise the in-handler scope check directly without
+    // touching the database. The "permissions table missing" path inside
+    // each handler runs first because tests have no DB; but the scope check
+    // runs even earlier (right after `require_auth`), so the assertions
+    // below are independent of DB state.
+    // -----------------------------------------------------------------------
+
+    fn read_only_token() -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "sa-readonly".to_string(),
+            email: "sa@example.com".to_string(),
+            is_admin: false,
+            is_api_token: true,
+            is_service_account: true,
+            scopes: Some(vec!["read".to_string()]),
+            allowed_repo_ids: None,
+        }
+    }
+
+    fn write_token() -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "sa-write".to_string(),
+            email: "sa@example.com".to_string(),
+            is_admin: false,
+            is_api_token: true,
+            is_service_account: true,
+            scopes: Some(vec!["write".to_string()]),
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_require_auth_rejects_anonymous() {
+        // Sanity: no AuthExtension at all -> 401, regardless of scope check.
+        let result = require_auth(None);
+        assert!(matches!(result, Err(AppError::Authentication(_))));
+    }
+
+    #[test]
+    fn test_create_permission_scope_check_rejects_read_only() {
+        // GHSA-vvc3-h39c-mrq5: this is the exact handler path used in the
+        // advisory's privilege-escalation chain. A read-scoped SA token
+        // must be rejected with 403 (not 200) before any DB write happens.
+        let ext = read_only_token();
+        let result = ext.require_scope("write");
+        match result {
+            Err(AppError::Authorization(msg)) => {
+                assert_eq!(msg, "Token does not have required scope: write");
+            }
+            other => panic!("expected Authorization error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_create_permission_scope_check_accepts_write_token() {
+        let ext = write_token();
+        assert!(ext.require_scope("write").is_ok());
+    }
+
+    #[test]
+    fn test_delete_permission_scope_check_rejects_read_only() {
+        let ext = read_only_token();
+        let result = ext.require_scope("delete");
+        match result {
+            Err(AppError::Authorization(msg)) => {
+                assert_eq!(msg, "Token does not have required scope: delete");
+            }
+            other => panic!("expected Authorization error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_delete_permission_scope_check_write_token_insufficient() {
+        // A write-scoped token must NOT be able to delete a permission row.
+        // The advisory specifically calls out destructive ops as needing
+        // the delete scope, not just write.
+        let ext = write_token();
+        assert!(ext.require_scope("delete").is_err());
+    }
+
+    #[test]
+    fn test_update_permission_scope_check_rejects_read_only() {
+        let ext = read_only_token();
+        assert!(ext.require_scope("write").is_err());
+    }
+
+    #[test]
+    fn test_create_permission_non_admin_jwt_rejected_with_403() {
+        // #1438 (1a): a non-admin JWT caller (no `is_api_token` so scopes
+        // are not enforced) previously slipped past the scope check, hit
+        // the INSERT, and tripped an FK violation that surfaced as 500
+        // DATABASE_ERROR. The handler now calls `require_admin()` so the
+        // same caller gets a clean 403 Authorization error before any DB
+        // write happens. This unit test pins the gate at the predicate
+        // level (no DB needed).
+        let non_admin_jwt = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "alice".to_string(),
+            email: "alice@example.com".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+        // JWT sessions pass the scope check (they are not scope-restricted),
+        // so the next gate, require_admin, must catch them.
+        assert!(non_admin_jwt.require_scope("write").is_ok());
+        match non_admin_jwt.require_admin() {
+            Err(AppError::Authorization(_)) => {}
+            other => panic!("expected 403 Authorization, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_admin_user_with_read_only_token_still_rejected() {
+        // A user with `is_admin = true` who authenticated via a read-scoped
+        // API token must still be rejected. The scope is on the token, not
+        // the user. This is the exact bypass GHSA-vvc3-h39c-mrq5 documents.
+        let ext = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "admin-via-readonly-token".to_string(),
+            email: "admin@example.com".to_string(),
+            is_admin: true, // user is admin, but token is read-only
+            is_api_token: true,
+            is_service_account: true,
+            scopes: Some(vec!["read".to_string()]),
+            allowed_repo_ids: None,
+        };
+        assert!(
+            ext.require_scope("write").is_err(),
+            "admin user with read-only token must still be blocked by scope check"
+        );
+    }
+
+    #[test]
+    fn test_create_permission_body_shape_does_not_short_circuit_scope_check() {
+        // B10 regression: the security release-gate sends a read-scope SA
+        // token with a body shaped like {"name": ..., "description": ...},
+        // which does NOT match the required CreatePermissionRequest
+        // (principal_type/principal_id/target_type/target_id/actions). Before
+        // the fix the handler took `Json<CreatePermissionRequest>`, so the
+        // extractor rejected the malformed body during request extraction
+        // (a 422/500 body-shape error) BEFORE the scope check ever ran -- the
+        // caller never saw the canonical 403. The handler now takes raw
+        // `Bytes` and parses only after the scope/admin gate, so the gate is
+        // independent of body shape. This test pins both halves: the scope
+        // predicate rejects the read-scope token, and the security-suite body
+        // genuinely fails to deserialize into CreatePermissionRequest (so the
+        // old ordering really would have masked the 403).
+        let read_scope = read_only_token();
+        match read_scope.require_scope("write") {
+            Err(AppError::Authorization(msg)) => {
+                assert_eq!(msg, "Token does not have required scope: write");
+            }
+            other => panic!(
+                "expected 403 Authorization before any parse, got {:?}",
+                other
+            ),
+        }
+
+        let security_suite_body = r#"{"name":"ghsa-perm","description":"should not be created"}"#;
+        assert!(
+            serde_json::from_str::<CreatePermissionRequest>(security_suite_body).is_err(),
+            "the security-suite probe body must not deserialize into \
+             CreatePermissionRequest -- that is exactly why parsing it before \
+             the scope check used to mask the 403"
+        );
+    }
+
+    #[test]
+    fn test_create_permission_authorized_then_malformed_body_is_validation() {
+        // The mirror case: an authorized caller (write scope) that sends an
+        // unparseable body must get a 400 VALIDATION_ERROR, never a 422/500.
+        // The handler maps serde_json failures to AppError::Validation after
+        // the gate. Pin that mapping at the predicate level.
+        let err = serde_json::from_slice::<CreatePermissionRequest>(b"{ not json }")
+            .map_err(|e| AppError::Validation(format!("Invalid permission payload: {}", e)))
+            .unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(msg.starts_with("Invalid permission payload:"));
+            }
+            other => panic!("expected Validation error, got {:?}", other),
+        }
     }
 }

@@ -228,17 +228,53 @@ async fn handle_get(
 // GET sumdb/... — Proxy to upstream checksum database
 // ---------------------------------------------------------------------------
 
+/// Hostnames the sumdb proxy is permitted to forward to.
+///
+/// SECURITY: `proxy_sumdb` builds `https://{host}/{path}` from URL path
+/// components controlled by the caller. Without an allowlist this is an
+/// SSRF vector — an attacker can request `sumdb/169.254.169.254/...`
+/// to make the server fetch cloud metadata. Only well-known Go
+/// checksum-database hosts may be proxied.
+const SUMDB_ALLOWLIST: &[&str] = &["sum.golang.org", "sum.golang.google.cn"];
+
+/// Returns true iff `host` is a permitted upstream sumdb hostname.
+/// Comparison is case-insensitive per RFC 1035.
+///
+/// Visibility is `pub` (not `pub(crate)`) to expose the function to the
+/// `tests/security_regression_tests.rs` integration test, which validates
+/// the GHSA-mc8p-6758-jfp2 host allowlist from outside the crate.
+pub fn is_sumdb_host_allowed(host: &str) -> bool {
+    SUMDB_ALLOWLIST
+        .iter()
+        .any(|allowed| host.eq_ignore_ascii_case(allowed))
+}
+
 /// Proxy a sumdb request to the upstream checksum database.
 ///
 /// The Go toolchain performs go.sum verification by querying
 /// `$GOPROXY/sumdb/sum.golang.org/{path}`. We forward these requests
 /// to `https://{host}/{path}` (defaulting to sum.golang.org).
 async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
+    if !is_sumdb_host_allowed(host) {
+        tracing::warn!(
+            host = %host,
+            "Rejected sumdb proxy request to disallowed host (SSRF prevention)"
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "sumdb host '{}' is not in the allowlist of permitted upstreams",
+                host
+            ),
+        )
+            .into_response());
+    }
+
     let url = format!("https://{}/{}", host, path);
 
     tracing::debug!("Proxying sumdb request to {}", url);
 
-    let client = reqwest::Client::new();
+    let client = crate::services::http_client::default_client();
     let upstream_resp = client.get(&url).send().await.map_err(|e| {
         tracing::warn!("sumdb proxy request failed for {}: {}", url, e);
         (
@@ -284,6 +320,8 @@ async fn handle_put(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
+    // GHSA-vvc3-h39c-mrq5: reject read-scoped API tokens on PUT.
+    crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write")?;
     let user_id =
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "goproxy")
             .await?;
@@ -411,6 +449,8 @@ async fn list_versions(
         {
             return Ok(resp);
         }
+
+        return Err((StatusCode::NOT_FOUND, "module not found").into_response());
     }
 
     Ok(Response::builder()
@@ -605,6 +645,11 @@ async fn get_mod_file(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
+    // Check quarantine status before serving
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
+        .await
+        .map_err(|e| e.into_response())?;
+
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -680,22 +725,19 @@ async fn download_zip(
                 {
                     let encoded = encode_module_path(module);
                     let upstream_path = format!("{}/@v/{}.zip", encoded, version);
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
+                    // #895: stream large module .zip; default Content-Type
+                    // matches the buffered handler's prior fallback so the
+                    // Go toolchain still sees `application/zip` when
+                    // upstream omits the header (review N2).
+                    return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo.key,
                         upstream_url,
                         &upstream_path,
+                        "application/zip",
                     )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/zip".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
+                    .await;
                 }
             }
 
@@ -744,6 +786,11 @@ async fn download_zip(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
+    // Check quarantine status before serving
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
+        .await
+        .map_err(|e| e.into_response())?;
+
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1728,5 +1775,74 @@ mod tests {
             decode_module_path("github.com/!a!b/pkg"),
             "github.com/AB/pkg"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sumdb host allowlist (SSRF prevention)
+    //
+    // proxy_sumdb forwards requests to https://{host}/{path} where {host}
+    // comes from the URL path component sumdb/{host}/.... Without an
+    // allowlist this is a textbook SSRF: an attacker can request
+    // /goproxy/{repo}/sumdb/169.254.169.254/latest/meta-data/iam/...
+    // and the server will fetch cloud metadata on their behalf.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_proxy_sumdb_rejects_aws_metadata_ssrf() {
+        // SECURITY: must reject SSRF attempts to AWS metadata service.
+        let result = proxy_sumdb("169.254.169.254", "latest/meta-data/").await;
+        let response = result.expect_err("proxy_sumdb must reject SSRF; instead it allowed it");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "expected FORBIDDEN for SSRF attempt, got {}",
+            response.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_sumdb_rejects_internal_service_ssrf() {
+        // SECURITY: must reject SSRF attempts to internal cluster services.
+        let result = proxy_sumdb("internal-postgres.svc.cluster.local", "anything").await;
+        let response = result.expect_err("proxy_sumdb must reject internal-service SSRF");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_sumdb_allowlist_accepts_known_hosts() {
+        assert!(is_sumdb_host_allowed("sum.golang.org"));
+        assert!(is_sumdb_host_allowed("sum.golang.google.cn"));
+    }
+
+    #[test]
+    fn test_sumdb_allowlist_is_case_insensitive() {
+        // Hostnames are case-insensitive per RFC 1035.
+        assert!(is_sumdb_host_allowed("SUM.GOLANG.ORG"));
+        assert!(is_sumdb_host_allowed("Sum.Golang.Org"));
+    }
+
+    #[test]
+    fn test_sumdb_allowlist_rejects_cloud_metadata_endpoints() {
+        // SECURITY: cloud metadata endpoints are common SSRF targets.
+        assert!(!is_sumdb_host_allowed("169.254.169.254"));
+        assert!(!is_sumdb_host_allowed("metadata.google.internal"));
+        assert!(!is_sumdb_host_allowed("metadata.azure.com"));
+    }
+
+    #[test]
+    fn test_sumdb_allowlist_rejects_internal_services() {
+        assert!(!is_sumdb_host_allowed("localhost"));
+        assert!(!is_sumdb_host_allowed("127.0.0.1"));
+        assert!(!is_sumdb_host_allowed(
+            "internal-postgres.svc.cluster.local"
+        ));
+    }
+
+    #[test]
+    fn test_sumdb_allowlist_rejects_typosquatting() {
+        // SECURITY: prevent attacks via near-miss domain names.
+        assert!(!is_sumdb_host_allowed("sum.golang.org.evil.com"));
+        assert!(!is_sumdb_host_allowed("evil.com.sum.golang.org"));
+        assert!(!is_sumdb_host_allowed("sum-golang-org.evil.com"));
     }
 }

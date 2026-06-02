@@ -86,8 +86,21 @@ pub async fn oidc_login(
     // 1. Get decrypted OIDC config
     let (row, _client_secret) = AuthConfigService::get_oidc_decrypted(&state.db, id).await?;
 
-    // 2. Create SSO session for CSRF protection (generates state + nonce internally)
-    let session = AuthConfigService::create_sso_session(&state.db, "oidc", id).await?;
+    // 2. If PKCE is enabled for this provider, generate a verifier and stash
+    //    it in the SSO session for use on callback.
+    let pkce_verifier = if row.pkce_enabled {
+        Some(crate::services::auth_config_service::generate_pkce_verifier())
+    } else {
+        None
+    };
+
+    let session = AuthConfigService::create_sso_session_with_pkce(
+        &state.db,
+        "oidc",
+        id,
+        pkce_verifier.clone(),
+    )
+    .await?;
     let state_str = session.state;
     let nonce_str = session.nonce.unwrap_or_default();
 
@@ -124,7 +137,7 @@ pub async fn oidc_login(
         row.scopes.join(" ")
     };
 
-    let auth_url = format!(
+    let mut auth_url = format!(
         "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&nonce={}",
         authorization_endpoint,
         urlencoding::encode(&row.client_id),
@@ -133,6 +146,14 @@ pub async fn oidc_login(
         urlencoding::encode(&state_str),
         urlencoding::encode(&nonce_str),
     );
+
+    // 6. Append PKCE S256 challenge if enabled (issue #1091).
+    if let Some(verifier) = pkce_verifier.as_deref() {
+        let challenge = crate::services::auth_config_service::pkce_challenge_s256(verifier);
+        auth_url.push_str("&code_challenge=");
+        auth_url.push_str(&urlencoding::encode(&challenge));
+        auth_url.push_str("&code_challenge_method=S256");
+    }
 
     Ok(Redirect::temporary(&auth_url))
 }
@@ -145,6 +166,27 @@ pub async fn oidc_login(
 pub struct OidcCallbackQuery {
     code: String,
     state: String,
+}
+
+/// Validate the shape of an OIDC callback's `code` and `state` query
+/// parameters before any session lookup or IdP exchange.
+///
+/// Distinguishes "malformed callback" (the client sent us garbage) from
+/// "state mismatch / CSRF" (the client sent us well-formed but unrecognized
+/// state). Without this split, an empty state hits the SSO session lookup,
+/// misses, and returns 401, which leaks the ordering of our auth checks and
+/// confuses legitimate clients that crash mid-redirect.
+///
+/// Returns `AppError::Validation` (400) for missing/empty parameters. The
+/// CSRF replay defense (401) still fires for non-empty state values that
+/// don't match a cached session.
+fn validate_oidc_callback_params(params: &OidcCallbackQuery) -> Result<()> {
+    if params.state.is_empty() || params.code.is_empty() {
+        return Err(AppError::Validation(
+            "Invalid OIDC callback parameters: code and state are required".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Handle OIDC authorization callback
@@ -160,6 +202,7 @@ pub struct OidcCallbackQuery {
     responses(
         (status = 307, description = "Redirect to frontend with exchange code"),
         (status = 400, description = "Invalid callback parameters", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Invalid or expired SSO state (CSRF)", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn oidc_callback(
@@ -167,10 +210,35 @@ pub async fn oidc_callback(
     Path(id): Path<Uuid>,
     Query(params): Query<OidcCallbackQuery>,
     headers: HeaderMap,
-) -> Result<Redirect> {
-    // Validate SSO session (CSRF check), then delegate to shared logic
+) -> Result<Response> {
+    // Validate parameter shape BEFORE hitting the session store. Empty state
+    // or code is a malformed callback (400), not a CSRF failure (401). See
+    // `validate_oidc_callback_params` doc comment.
+    validate_oidc_callback_params(&params)?;
+
+    // Validate SSO session (CSRF check), then delegate to shared logic.
+    //
+    // Security: the path id MUST match the provider_id that was bound to the
+    // SSO session at login time. Without this check, an attacker can mint a
+    // valid (state, code) pair against provider A and replay the callback at
+    // /oidc/{B}/callback so the PKCE code_verifier and code travel to
+    // provider B's token endpoint. We derive provider_id from the session
+    // (the authoritative side) and reject if the URL path disagrees.
     let session = AuthConfigService::validate_sso_session(&state.db, &params.state).await?;
-    oidc_callback_inner(state, id, params.code, session.nonce, headers).await
+    if session.provider_id != id {
+        return Err(AppError::Authentication(
+            "SSO state does not match provider".to_string(),
+        ));
+    }
+    oidc_callback_inner(
+        state,
+        session.provider_id,
+        params.code,
+        session.nonce,
+        session.pkce_code_verifier,
+        headers,
+    )
+    .await
 }
 
 /// Handle OIDC callback without provider UUID in the path.
@@ -183,7 +251,11 @@ pub async fn oidc_callback_generic(
     State(state): State<SharedState>,
     Query(params): Query<OidcCallbackQuery>,
     headers: HeaderMap,
-) -> Result<Redirect> {
+) -> Result<Response> {
+    // Validate parameter shape BEFORE hitting the session store. See
+    // `validate_oidc_callback_params` doc comment.
+    validate_oidc_callback_params(&params)?;
+
     // Validate SSO session and resolve the provider from the stored state
     let session = AuthConfigService::validate_sso_session(&state.db, &params.state).await?;
     oidc_callback_inner(
@@ -191,6 +263,7 @@ pub async fn oidc_callback_generic(
         session.provider_id,
         params.code,
         session.nonce,
+        session.pkce_code_verifier,
         headers,
     )
     .await
@@ -203,8 +276,9 @@ async fn oidc_callback_inner(
     provider_id: Uuid,
     authorization_code: String,
     session_nonce: Option<String>,
+    pkce_code_verifier: Option<String>,
     headers: HeaderMap,
-) -> Result<Redirect> {
+) -> Result<Response> {
     // 1. Get decrypted OIDC config
     let (row, client_secret) =
         AuthConfigService::get_oidc_decrypted(&state.db, provider_id).await?;
@@ -232,16 +306,20 @@ async fn oidc_callback_inner(
     // 3. Build redirect_uri (must match the one used in the login request)
     let redirect_uri = resolve_oidc_redirect_uri(&row.attribute_mapping, &provider_id, &headers);
 
-    // 4. Exchange authorization code for tokens
+    // 4. Exchange authorization code for tokens (with PKCE verifier when present).
+    let mut form: Vec<(&str, &str)> = vec![
+        ("grant_type", "authorization_code"),
+        ("code", &authorization_code),
+        ("redirect_uri", &redirect_uri),
+        ("client_id", &row.client_id),
+        ("client_secret", &client_secret),
+    ];
+    if let Some(verifier) = pkce_code_verifier.as_deref() {
+        form.push(("code_verifier", verifier));
+    }
     let token_response: serde_json::Value = http_client
         .post(token_endpoint)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", &authorization_code),
-            ("redirect_uri", &redirect_uri),
-            ("client_id", &row.client_id),
-            ("client_secret", &client_secret),
-        ])
+        .form(&form)
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("Token exchange failed: {e}")))?
@@ -288,10 +366,17 @@ async fn oidc_callback_inner(
 
     let groups = extract_oidc_groups(&claims, groups_claim);
 
+    // Read admin group setting from DB attribute_mapping, falling back to env
+    let required_admin_group = attr
+        .get("admin_group")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("OIDC_ADMIN_GROUP").ok());
+
     // 7. Authenticate via federated flow (find/create user + generate tokens)
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
-    let (_user, tokens) = auth_service
+    let (user, tokens) = auth_service
         .authenticate_federated(
             AuthProvider::Oidc,
             FederatedCredentials {
@@ -299,10 +384,28 @@ async fn oidc_callback_inner(
                 username: preferred_username,
                 email,
                 display_name,
-                groups,
+                groups: groups.clone(),
+                required_admin_group,
             },
         )
         .await?;
+
+    // 7a. Issue #1094: when map_groups_to_groups is enabled, reflect the
+    //     OIDC group claim values as Artifact Keeper group memberships.
+    //     Auto-create groups (tagged with external_source = 'oidc') on first
+    //     sight and reconcile membership so removed groups drop their members.
+    if row.map_groups_to_groups {
+        if let Err(e) =
+            sync_oidc_groups_to_local_groups(&state.db, user.id, provider_id, &groups).await
+        {
+            tracing::warn!(
+                error = %e,
+                user_id = %user.id,
+                provider_id = %provider_id,
+                "Failed to sync OIDC groups to local groups; user login still succeeds"
+            );
+        }
+    }
 
     // 8. Create a short-lived exchange code instead of passing raw tokens in the URL
     let exchange_code = AuthConfigService::create_exchange_code(
@@ -312,12 +415,27 @@ async fn oidc_callback_inner(
     )
     .await?;
 
-    let frontend_url = format!(
-        "/auth/callback?code={}",
-        urlencoding::encode(&exchange_code),
-    );
+    let frontend_url = build_frontend_callback_url(&exchange_code);
 
-    Ok(Redirect::temporary(&frontend_url))
+    // Set auth cookies on the redirect itself (closes #1405).
+    //
+    // Without this, the browser arrives at `/callback?code=...` with no auth
+    // cookie set. The web AuthProvider mounts and fires `GET /auth/me` before
+    // the page-level `POST /exchange` completes, gets a 401 (no cookie), and
+    // redirects to `/login`. With multiple backend replicas the cookie-set
+    // response from `/exchange` and the cookieless `/auth/me` can interleave
+    // (the customer mitigation was ALB sticky sessions, confirming the race
+    // is per-replica state). Setting cookies on the 307 ensures the cookie is
+    // installed in the browser the instant it lands on `/callback`, so any
+    // eager `/auth/me` from the frontend succeeds. The `/exchange` POST still
+    // runs and re-sets cookies (idempotent) so the existing flow continues to
+    // work for frontends that read the response body.
+    build_sso_callback_redirect(
+        &frontend_url,
+        &tokens.access_token,
+        &tokens.refresh_token,
+        tokens.expires_in,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +503,7 @@ pub async fn ldap_login(
                 email: ldap_user.email,
                 display_name: ldap_user.display_name,
                 groups: ldap_user.groups,
+                required_admin_group: row.admin_group_dn.clone(),
             },
         )
         .await?;
@@ -486,7 +605,7 @@ pub async fn saml_acs(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     axum::extract::Form(form): axum::extract::Form<SamlAcsForm>,
-) -> Result<Redirect> {
+) -> Result<Response> {
     // Get SAML config from DB
     let row = AuthConfigService::get_saml_decrypted(&state.db, id).await?;
 
@@ -523,6 +642,7 @@ pub async fn saml_acs(
                 email: saml_user.email,
                 display_name: saml_user.display_name,
                 groups: saml_user.groups,
+                required_admin_group: row.admin_group.clone(),
             },
         )
         .await?;
@@ -535,12 +655,16 @@ pub async fn saml_acs(
     )
     .await?;
 
-    let frontend_url = format!(
-        "/auth/callback?code={}",
-        urlencoding::encode(&exchange_code),
-    );
+    let frontend_url = build_frontend_callback_url(&exchange_code);
 
-    Ok(Redirect::temporary(&frontend_url))
+    // Set auth cookies on the redirect itself; see oidc_callback_inner for
+    // the rationale (closes #1405).
+    build_sso_callback_redirect(
+        &frontend_url,
+        &tokens.access_token,
+        &tokens.refresh_token,
+        tokens.expires_in,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -615,6 +739,50 @@ pub struct SsoApiDoc;
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Build the frontend callback URL for the SSO exchange code flow.
+///
+/// The Next.js frontend serves the callback page at `/callback` (the `(auth)`
+/// route group does not add a URL prefix). The exchange code is URL-encoded
+/// and passed as a query parameter so the frontend can exchange it for tokens.
+pub(crate) fn build_frontend_callback_url(exchange_code: &str) -> String {
+    format!("/callback?code={}", urlencoding::encode(exchange_code))
+}
+
+/// Build a 307 redirect to the frontend `/callback` page that also carries
+/// the auth cookies (`Set-Cookie` headers).
+///
+/// This closes #1405. The web `AuthProvider` mounts on every route — including
+/// `/callback?code=...` — and eagerly fires `GET /api/v1/auth/me` to populate
+/// `user`. Before this change, that request raced the page-level `POST
+/// /api/v1/auth/sso/exchange` that installs the cookies: on multi-replica
+/// backends the eager `/auth/me` reached a replica without a cookie and 401-ed,
+/// which the frontend interpreted as "not authenticated" and bounced back to
+/// `/login` even though the exchange itself was about to (or had just) succeed.
+///
+/// Setting the cookies on the redirect itself means the browser stores them
+/// before it even loads the callback page, so the eager `/auth/me` always
+/// carries the JWT cookie and resolves to the authenticated user.
+///
+/// The exchange-code abstraction is preserved: the code is still single-use
+/// and the frontend still POSTs it to `/exchange` to retrieve raw tokens for
+/// JS-side storage. `/exchange` re-sets the same cookies (idempotent), so a
+/// frontend that ignores the redirect cookies continues to work.
+pub(crate) fn build_sso_callback_redirect(
+    frontend_url: &str,
+    access_token: &str,
+    refresh_token: &str,
+    expires_in: u64,
+) -> Result<Response> {
+    let mut response = Redirect::temporary(frontend_url).into_response();
+    set_auth_cookies(
+        response.headers_mut(),
+        access_token,
+        refresh_token,
+        expires_in,
+    );
+    Ok(response)
+}
+
 /// Resolve the redirect URI from OIDC attribute_mapping, falling back to an
 /// absolute URL built from request headers.
 ///
@@ -665,6 +833,111 @@ pub(crate) fn extract_oidc_groups(claims: &serde_json::Value, groups_claim: &str
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Reconcile an OIDC user's group memberships against the `groups` table.
+///
+/// For each group name in `oidc_groups`:
+/// - Find the group by name; if missing, auto-create it tagged with
+///   `external_source = 'oidc'` and `external_provider_id = provider_id`.
+/// - Ensure a `user_group_members` row exists.
+///
+/// Then remove the user from any group that:
+/// - is tagged with this same `external_source` + `external_provider_id`, AND
+/// - is not present in `oidc_groups`.
+///
+/// Operator-managed groups (NULL `external_source`) are never modified by
+/// this sync. (Issue #1094.)
+pub(crate) async fn sync_oidc_groups_to_local_groups(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    provider_id: Uuid,
+    oidc_groups: &[String],
+) -> Result<()> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Upsert each OIDC group: find-or-create, then ensure membership.
+    let mut current_group_ids: Vec<Uuid> = Vec::with_capacity(oidc_groups.len());
+    for name in oidc_groups {
+        if name.trim().is_empty() {
+            continue;
+        }
+
+        // Find-or-create the group atomically. Concurrent first-logins for
+        // the same brand-new group name from different users would race a
+        // separate SELECT + INSERT, with the loser of the race hitting the
+        // UNIQUE constraint on `groups.name` and aborting the transaction.
+        // ON CONFLICT (name) DO UPDATE … RETURNING id collapses the race
+        // into a single atomic upsert. The `DO UPDATE` (a no-op assignment)
+        // is what makes RETURNING populate for the conflicting row; a plain
+        // DO NOTHING would return zero rows on conflict. Operator-managed
+        // groups (NULL external_source) are reused without modification
+        // because we only assign description/external_source/external_provider_id
+        // when inserting, and the ON CONFLICT branch does not touch those
+        // columns.
+        let (group_id,): (Uuid,) = sqlx::query_as(
+            r#"
+            INSERT INTO groups (name, description, external_source, external_provider_id)
+            VALUES ($1, $2, 'oidc', $3)
+            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+            RETURNING id
+            "#,
+        )
+        .bind(name)
+        .bind(format!("Auto-created from OIDC group claim: {name}"))
+        .bind(provider_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO user_group_members (user_id, group_id)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id, group_id) DO NOTHING
+            "#,
+        )
+        .bind(user_id)
+        .bind(group_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        current_group_ids.push(group_id);
+    }
+
+    // Remove the user from any OIDC-managed group (same provider) that they
+    // are no longer a member of according to the latest claims. We deliberately
+    // limit the scope to groups marked external_source = 'oidc' AND
+    // external_provider_id = provider_id so we never strip membership in
+    // operator-managed groups or groups owned by other IdPs.
+    sqlx::query(
+        r#"
+        DELETE FROM user_group_members
+        WHERE user_id = $1
+          AND group_id IN (
+              SELECT id FROM groups
+              WHERE external_source = 'oidc'
+                AND external_provider_id = $2
+                AND NOT (id = ANY($3))
+          )
+        "#,
+    )
+    .bind(user_id)
+    .bind(provider_id)
+    .bind(&current_group_ids)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(())
 }
 
 /// Build a `DecodingKey` from a JWK JSON value based on its key type.
@@ -944,6 +1217,129 @@ mod tests {
         assert_eq!(q.state, "csrf_state_456");
     }
 
+    // -----------------------------------------------------------------------
+    // OIDC callback parameter validation (#1369)
+    //
+    // Empty state used to fall through to the SSO session lookup and return
+    // 401 ("Invalid or expired SSO state"). That leaked the ordering of our
+    // auth checks (info-leak via 401 vs 400) and confused legitimate clients
+    // that lost the state value mid-redirect. Malformed callbacks now get a
+    // 400; the 401 path is reserved for non-empty state values that miss the
+    // session cache (CSRF replay defense).
+    // -----------------------------------------------------------------------
+
+    /// Assert that an `AppError` maps to the expected HTTP status code.
+    /// Uses the same status mapping as the real `IntoResponse` impl.
+    fn assert_status(err: &AppError, expected: axum::http::StatusCode) {
+        let actual = match err {
+            AppError::Validation(_) => axum::http::StatusCode::BAD_REQUEST,
+            AppError::Authentication(_) => axum::http::StatusCode::UNAUTHORIZED,
+            AppError::Unauthorized(_) => axum::http::StatusCode::UNAUTHORIZED,
+            AppError::NotFound(_) => axum::http::StatusCode::NOT_FOUND,
+            other => panic!("unexpected error variant: {other:?}"),
+        };
+        assert_eq!(
+            actual, expected,
+            "expected status {expected:?} for {err:?}, got {actual:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_oidc_callback_params_empty_state_returns_400() {
+        let params = OidcCallbackQuery {
+            code: "valid_code".to_string(),
+            state: String::new(),
+        };
+        let err = validate_oidc_callback_params(&params).expect_err("empty state must reject");
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "empty state should map to Validation (400), got {err:?}"
+        );
+        assert_status(&err, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_oidc_callback_params_empty_code_returns_400() {
+        let params = OidcCallbackQuery {
+            code: String::new(),
+            state: "valid_state".to_string(),
+        };
+        let err = validate_oidc_callback_params(&params).expect_err("empty code must reject");
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "empty code should map to Validation (400), got {err:?}"
+        );
+        assert_status(&err, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_oidc_callback_params_both_empty_returns_400() {
+        let params = OidcCallbackQuery {
+            code: String::new(),
+            state: String::new(),
+        };
+        let err =
+            validate_oidc_callback_params(&params).expect_err("empty code and state must reject");
+        assert!(matches!(err, AppError::Validation(_)));
+        assert_status(&err, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_oidc_callback_params_well_formed_passes() {
+        // Well-formed values (any non-empty string) pass the shape check and
+        // delegate the CSRF / cache-miss decision to validate_sso_session,
+        // which keeps returning 401 (Authentication) on miss. We don't
+        // exercise the DB path here; the contract is that this validator
+        // does NOT veto well-formed inputs.
+        let params = OidcCallbackQuery {
+            code: "ac_xyz".to_string(),
+            state: "st_xyz".to_string(),
+        };
+        validate_oidc_callback_params(&params).expect("well-formed params should pass");
+    }
+
+    #[test]
+    fn test_validate_oidc_callback_params_error_message_no_leak() {
+        // The 400 message must not name internal subsystems (SSO sessions
+        // table, SQL, etc.). It only states what the caller did wrong.
+        let params = OidcCallbackQuery {
+            code: "ac".to_string(),
+            state: String::new(),
+        };
+        let err = validate_oidc_callback_params(&params).expect_err("must reject");
+        let msg = match &err {
+            AppError::Validation(m) => m.clone(),
+            other => panic!("expected Validation, got {other:?}"),
+        };
+        let lower = msg.to_lowercase();
+        assert!(!lower.contains("sso_sessions"), "leaks table name: {msg}");
+        assert!(!lower.contains("select"), "leaks SQL: {msg}");
+        assert!(!lower.contains("delete"), "leaks SQL: {msg}");
+        assert!(lower.contains("state"), "should mention what is missing");
+    }
+
+    #[test]
+    fn test_oidc_callback_400_distinct_from_401() {
+        // Regression for #1369: an empty state must NOT collide with the
+        // "session not found" 401 path. The two cases route to different
+        // AppError variants with different status codes.
+        let empty = OidcCallbackQuery {
+            code: "ac".to_string(),
+            state: String::new(),
+        };
+        let empty_err = validate_oidc_callback_params(&empty).expect_err("must reject");
+        // Empty -> 400 Validation
+        assert!(matches!(empty_err, AppError::Validation(_)));
+
+        // Non-empty but unrecognized state would flow to
+        // validate_sso_session, which returns AppError::Authentication
+        // ("Invalid or expired SSO state") -> 401. Simulate that path's
+        // error here so the test pins the contract.
+        let csrf_miss = AppError::Authentication("Invalid or expired SSO state".to_string());
+        assert_status(&empty_err, axum::http::StatusCode::BAD_REQUEST);
+        assert_status(&csrf_miss, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
     #[test]
     fn test_ldap_login_request_deserialize() {
         let json = r#"{"username":"alice","password":"secret"}"#;
@@ -986,6 +1382,155 @@ mod tests {
         assert_eq!(json["access_token"], "at_123");
         assert_eq!(json["refresh_token"], "rt_456");
         assert_eq!(json["token_type"], "Bearer");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_frontend_callback_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_frontend_callback_url_simple_code() {
+        let url = build_frontend_callback_url("abc123");
+        assert_eq!(url, "/callback?code=abc123");
+    }
+
+    #[test]
+    fn test_frontend_callback_url_does_not_use_auth_prefix() {
+        let url = build_frontend_callback_url("test");
+        assert!(url.starts_with("/callback?"));
+        assert!(!url.contains("/auth/callback"));
+    }
+
+    #[test]
+    fn test_frontend_callback_url_encodes_special_chars() {
+        let url = build_frontend_callback_url("code with spaces&symbols=yes");
+        assert_eq!(url, "/callback?code=code%20with%20spaces%26symbols%3Dyes");
+    }
+
+    #[test]
+    fn test_frontend_callback_url_empty_code() {
+        let url = build_frontend_callback_url("");
+        assert_eq!(url, "/callback?code=");
+    }
+
+    #[test]
+    fn test_frontend_callback_url_unicode_code() {
+        let url = build_frontend_callback_url("token-\u{00e9}\u{00e8}");
+        // urlencoding will percent-encode the non-ASCII bytes
+        assert!(url.starts_with("/callback?code="));
+        assert!(!url.contains('\u{00e9}'));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_sso_callback_redirect (#1405)
+    //
+    // The SSO callback must install the auth cookies on the 307 redirect
+    // itself, not only on the later POST /exchange response. Without cookies
+    // on the redirect, the web AuthProvider fires GET /auth/me as soon as the
+    // frontend mounts at /callback, and on multi-replica backends that
+    // request can land on a replica before /exchange has had a chance to set
+    // cookies, returning 401 and bouncing the user back to /login even
+    // though the SSO exchange itself succeeds a moment later.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sso_callback_redirect_is_307_to_frontend_callback() {
+        let response = build_sso_callback_redirect(
+            "/callback?code=abc",
+            "access_token_value",
+            "refresh_token_value",
+            3600,
+        )
+        .expect("build_sso_callback_redirect must succeed");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::TEMPORARY_REDIRECT,
+            "SSO callback must be a 307 redirect"
+        );
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must set Location")
+            .to_str()
+            .unwrap();
+        assert_eq!(location, "/callback?code=abc");
+    }
+
+    #[test]
+    fn test_sso_callback_redirect_sets_access_and_refresh_cookies() {
+        // Regression for #1405: the 307 redirect must carry Set-Cookie
+        // headers for both tokens so the browser has the auth cookies
+        // installed by the time it lands on the frontend /callback page.
+        let response = build_sso_callback_redirect(
+            "/callback?code=xyz",
+            "the_access_token",
+            "the_refresh_token",
+            7200,
+        )
+        .expect("build_sso_callback_redirect must succeed");
+        let cookies: Vec<String> = response
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            cookies.len(),
+            2,
+            "must set both access and refresh cookies on the redirect, got {cookies:?}"
+        );
+        let access = cookies
+            .iter()
+            .find(|c| c.contains("ak_access_token="))
+            .expect("must include ak_access_token Set-Cookie");
+        assert!(
+            access.contains("ak_access_token=the_access_token"),
+            "access cookie must carry the token value, got {access}"
+        );
+        assert!(
+            access.contains("HttpOnly"),
+            "access cookie must be HttpOnly so JS cannot exfiltrate the JWT, got {access}"
+        );
+        assert!(
+            access.contains("SameSite=Strict"),
+            "access cookie must be SameSite=Strict, got {access}"
+        );
+        let refresh = cookies
+            .iter()
+            .find(|c| c.contains("ak_refresh_token="))
+            .expect("must include ak_refresh_token Set-Cookie");
+        assert!(
+            refresh.contains("ak_refresh_token=the_refresh_token"),
+            "refresh cookie must carry the token value, got {refresh}"
+        );
+        assert!(
+            refresh.contains("Path=/api/v1/auth/refresh"),
+            "refresh cookie must be scoped to the refresh path, got {refresh}"
+        );
+    }
+
+    #[test]
+    fn test_sso_callback_redirect_uses_passed_access_token_max_age() {
+        // The access cookie Max-Age must match the token's `expires_in`
+        // (in seconds) so the cookie expires roughly when the JWT does.
+        let response = build_sso_callback_redirect(
+            "/callback?code=mm",
+            "at",
+            "rt",
+            1800, // 30 minutes
+        )
+        .expect("build_sso_callback_redirect must succeed");
+        let access_cookie = response
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .find(|c| c.contains("ak_access_token="))
+            .expect("must include access cookie");
+        assert!(
+            access_cookie.contains("Max-Age=1800"),
+            "access cookie Max-Age must equal expires_in (1800), got {access_cookie}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1473,5 +2018,362 @@ mod tests {
         let result = super::select_jwk_key(&keys, Some("k1"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Unsupported"));
+    }
+
+    // =======================================================================
+    // DB-backed tests for sync_oidc_groups_to_local_groups (issue #1094).
+    //
+    // These opt into a real Postgres via test_db_helpers::try_pool(): when
+    // DATABASE_URL is unset they no-op so `cargo test --lib` stays usable
+    // without a database. The coverage CI job provisions Postgres and runs
+    // migrations, so the group-reconciliation paths are exercised there.
+    // =======================================================================
+
+    mod sync_db {
+        use super::super::sync_oidc_groups_to_local_groups;
+        use crate::api::handlers::test_db_helpers as db_helpers;
+        use sqlx::PgPool;
+        use uuid::Uuid;
+
+        /// Insert a user with the local auth_provider and a random username.
+        async fn make_user(pool: &PgPool) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                r#"
+                INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active)
+                VALUES ($1, $2, $3, 'unused', 'oidc', false, true)
+                "#,
+            )
+            .bind(id)
+            .bind(format!("oidc-sync-{}", id.as_simple()))
+            .bind(format!("oidc-sync-{}@test.local", id.as_simple()))
+            .execute(pool)
+            .await
+            .expect("insert user");
+            id
+        }
+
+        async fn group_id_by_name(pool: &PgPool, name: &str) -> Option<Uuid> {
+            let row: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM groups WHERE name = $1")
+                .bind(name)
+                .fetch_optional(pool)
+                .await
+                .expect("group lookup");
+            row.map(|(id,)| id)
+        }
+
+        async fn user_is_in_group(pool: &PgPool, user_id: Uuid, group_id: Uuid) -> bool {
+            let row: Option<(Uuid,)> = sqlx::query_as(
+                "SELECT group_id FROM user_group_members WHERE user_id = $1 AND group_id = $2",
+            )
+            .bind(user_id)
+            .bind(group_id)
+            .fetch_optional(pool)
+            .await
+            .expect("membership lookup");
+            row.is_some()
+        }
+
+        async fn group_external_source(pool: &PgPool, group_id: Uuid) -> Option<String> {
+            let row: Option<(Option<String>,)> =
+                sqlx::query_as("SELECT external_source FROM groups WHERE id = $1")
+                    .bind(group_id)
+                    .fetch_optional(pool)
+                    .await
+                    .expect("group source lookup");
+            row.and_then(|(s,)| s)
+        }
+
+        /// Random group name with a UUID suffix so parallel tests do not
+        /// collide on the UNIQUE constraint.
+        fn rand_group_name(prefix: &str) -> String {
+            format!("{prefix}-{}", Uuid::new_v4().as_simple())
+        }
+
+        async fn cleanup_groups(pool: &PgPool, ids: &[Uuid]) {
+            for id in ids {
+                let _ = sqlx::query("DELETE FROM user_group_members WHERE group_id = $1")
+                    .bind(id)
+                    .execute(pool)
+                    .await;
+                let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+                    .bind(id)
+                    .execute(pool)
+                    .await;
+            }
+        }
+
+        async fn cleanup_user(pool: &PgPool, user_id: Uuid) {
+            let _ = sqlx::query("DELETE FROM user_group_members WHERE user_id = $1")
+                .bind(user_id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(pool)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn test_sync_creates_groups_and_membership() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let g1 = rand_group_name("eng");
+            let g2 = rand_group_name("ops");
+
+            sync_oidc_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                &[g1.clone(), g2.clone()],
+            )
+            .await
+            .expect("sync");
+
+            let g1_id = group_id_by_name(&pool, &g1).await.expect("g1 created");
+            let g2_id = group_id_by_name(&pool, &g2).await.expect("g2 created");
+            assert!(user_is_in_group(&pool, user_id, g1_id).await);
+            assert!(user_is_in_group(&pool, user_id, g2_id).await);
+            // Auto-created groups must be tagged with external_source = 'oidc'.
+            assert_eq!(
+                group_external_source(&pool, g1_id).await.as_deref(),
+                Some("oidc")
+            );
+            assert_eq!(
+                group_external_source(&pool, g2_id).await.as_deref(),
+                Some("oidc")
+            );
+
+            cleanup_groups(&pool, &[g1_id, g2_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        #[tokio::test]
+        async fn test_sync_skips_empty_and_whitespace_group_names() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let real = rand_group_name("real");
+
+            sync_oidc_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                &[
+                    String::new(),
+                    "   ".to_string(),
+                    "\t".to_string(),
+                    real.clone(),
+                ],
+            )
+            .await
+            .expect("sync");
+
+            // Only the real group should exist.
+            let real_id = group_id_by_name(&pool, &real).await.expect("real group");
+            assert!(user_is_in_group(&pool, user_id, real_id).await);
+            // Empty/whitespace names must not have produced groups.
+            assert!(group_id_by_name(&pool, "").await.is_none());
+            assert!(group_id_by_name(&pool, "   ").await.is_none());
+
+            cleanup_groups(&pool, &[real_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        #[tokio::test]
+        async fn test_sync_reuses_operator_managed_group_without_modifying_source() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let name = rand_group_name("operator");
+
+            // Pre-create an operator-managed group (NULL external_source).
+            let preexisting_id = Uuid::new_v4();
+            sqlx::query("INSERT INTO groups (id, name, description) VALUES ($1, $2, $3)")
+                .bind(preexisting_id)
+                .bind(&name)
+                .bind("operator-managed")
+                .execute(&pool)
+                .await
+                .expect("create operator group");
+
+            sync_oidc_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                std::slice::from_ref(&name),
+            )
+            .await
+            .expect("sync");
+
+            // The same group id must be reused (not duplicated).
+            let found_id = group_id_by_name(&pool, &name).await.expect("found");
+            assert_eq!(found_id, preexisting_id);
+            assert!(user_is_in_group(&pool, user_id, found_id).await);
+            // external_source must remain NULL (operator-managed).
+            assert!(group_external_source(&pool, found_id).await.is_none());
+
+            cleanup_groups(&pool, &[found_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        #[tokio::test]
+        async fn test_sync_prunes_removed_oidc_groups_but_not_operator_groups() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let oidc_name_a = rand_group_name("oidc-a");
+            let oidc_name_b = rand_group_name("oidc-b");
+            let operator_name = rand_group_name("op-stable");
+
+            // First sync seeds both OIDC groups + adds the user.
+            sync_oidc_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                &[oidc_name_a.clone(), oidc_name_b.clone()],
+            )
+            .await
+            .expect("first sync");
+
+            let a_id = group_id_by_name(&pool, &oidc_name_a).await.unwrap();
+            let b_id = group_id_by_name(&pool, &oidc_name_b).await.unwrap();
+
+            // Add the user to an operator-managed group (NULL external_source).
+            let op_id = Uuid::new_v4();
+            sqlx::query("INSERT INTO groups (id, name) VALUES ($1, $2)")
+                .bind(op_id)
+                .bind(&operator_name)
+                .execute(&pool)
+                .await
+                .expect("create op group");
+            sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+                .bind(user_id)
+                .bind(op_id)
+                .execute(&pool)
+                .await
+                .expect("op membership");
+
+            // Second sync drops oidc_name_b from the claim list. Expect a_id
+            // membership to survive, b_id membership to be pruned, and the
+            // operator-managed group membership to remain untouched.
+            sync_oidc_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                std::slice::from_ref(&oidc_name_a),
+            )
+            .await
+            .expect("second sync");
+
+            assert!(user_is_in_group(&pool, user_id, a_id).await);
+            assert!(!user_is_in_group(&pool, user_id, b_id).await);
+            assert!(
+                user_is_in_group(&pool, user_id, op_id).await,
+                "operator-managed membership must survive pruning"
+            );
+
+            cleanup_groups(&pool, &[a_id, b_id, op_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        #[tokio::test]
+        async fn test_sync_scoped_to_provider_id() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_a = Uuid::new_v4();
+            let provider_b = Uuid::new_v4();
+            let shared_name = rand_group_name("shared");
+            let provider_a_only = rand_group_name("pa-only");
+
+            // Sync against provider_a creates a group tagged with provider_a.
+            sync_oidc_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_a,
+                &[shared_name.clone(), provider_a_only.clone()],
+            )
+            .await
+            .expect("sync A");
+            let pa_only_id = group_id_by_name(&pool, &provider_a_only).await.unwrap();
+            let shared_id = group_id_by_name(&pool, &shared_name).await.unwrap();
+
+            // Now sync against provider_b with an empty claim list. This must
+            // NOT prune the provider_a-owned groups: the DELETE is scoped to
+            // external_provider_id = provider_b.
+            sync_oidc_groups_to_local_groups(&pool, user_id, provider_b, &[])
+                .await
+                .expect("sync B empty");
+
+            assert!(
+                user_is_in_group(&pool, user_id, pa_only_id).await,
+                "provider_a-owned membership must not be touched by a provider_b sync"
+            );
+            assert!(user_is_in_group(&pool, user_id, shared_id).await);
+
+            cleanup_groups(&pool, &[pa_only_id, shared_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        #[tokio::test]
+        async fn test_sync_empty_claim_list_is_clean_noop_on_first_run() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+
+            // No memberships exist; empty claim list must commit cleanly.
+            sync_oidc_groups_to_local_groups(&pool, user_id, provider_id, &[])
+                .await
+                .expect("sync empty");
+
+            cleanup_user(&pool, user_id).await;
+        }
+
+        #[tokio::test]
+        async fn test_sync_is_idempotent() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let name = rand_group_name("idem");
+
+            // Run the same sync twice. Second run must not error on the
+            // ON CONFLICT DO NOTHING path and must leave the same state.
+            sync_oidc_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                std::slice::from_ref(&name),
+            )
+            .await
+            .expect("sync 1");
+            sync_oidc_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                std::slice::from_ref(&name),
+            )
+            .await
+            .expect("sync 2 (idempotent)");
+
+            let gid = group_id_by_name(&pool, &name).await.unwrap();
+            assert!(user_is_in_group(&pool, user_id, gid).await);
+            cleanup_groups(&pool, &[gid]).await;
+            cleanup_user(&pool, user_id).await;
+        }
     }
 }

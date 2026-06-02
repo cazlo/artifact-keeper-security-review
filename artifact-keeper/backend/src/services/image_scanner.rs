@@ -5,8 +5,14 @@ use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{RawFinding, Severity};
-use crate::services::scanner_service::Scanner;
+use crate::services::scanner_service::{
+    cached_trivy_cli_version, ScanOutput, Scanner, VersionCache,
+};
+
+#[cfg(test)]
+use crate::models::security::RawFinding;
+#[cfg(test)]
+use crate::services::scanner_service::convert_trivy_findings;
 
 // Trivy JSON report structures
 #[derive(Debug, Deserialize)]
@@ -25,6 +31,12 @@ pub struct TrivyResult {
     pub result_type: String,
     #[serde(rename = "Vulnerabilities", default)]
     pub vulnerabilities: Option<Vec<TrivyVulnerability>>,
+    /// Populated when Trivy is invoked with `--list-all-pkgs`. Lists every
+    /// package the scanner enumerated for this target, including ones with
+    /// no known vulnerabilities, so SBOM generation (#903) can reflect the
+    /// full dependency tree rather than only the CVE-bearing subset.
+    #[serde(rename = "Packages", default)]
+    pub packages: Option<Vec<TrivyPackage>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -47,10 +59,40 @@ pub struct TrivyVulnerability {
     pub primary_url: Option<String>,
 }
 
+/// A package entry from a Trivy `Packages` block. Only fields used by
+/// inventory persistence are deserialized; everything else (DependsOn,
+/// SrcVersion, Layer, etc.) is dropped silently via the default
+/// `deny_unknown_fields` policy being absent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrivyPackage {
+    #[serde(rename = "Name", default)]
+    pub name: String,
+    #[serde(rename = "Version", default)]
+    pub version: String,
+    /// Trivy emits `Licenses` as an array of strings. Multi-license packages
+    /// produce multiple entries; persistence joins them with `" OR "` per
+    /// CycloneDX convention.
+    #[serde(rename = "Licenses", default)]
+    pub licenses: Option<Vec<String>>,
+    #[serde(rename = "Identifier", default)]
+    pub identifier: Option<TrivyPackageIdentifier>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrivyPackageIdentifier {
+    #[serde(rename = "PURL", default)]
+    pub purl: Option<String>,
+}
+
 /// Container image scanner that delegates to a Trivy server instance.
 pub struct ImageScanner {
     trivy_url: String,
     http: reqwest::Client,
+    /// Lazily-probed version string from `trivy --version`, e.g.
+    /// `trivy-0.62.1`. Successful probes are cached for an hour so each scan
+    /// does not pay an extra subprocess; failed probes expire after 60s so
+    /// the field starts populating once the binary becomes available.
+    cached_version: VersionCache,
 }
 
 impl ImageScanner {
@@ -61,46 +103,106 @@ impl ImageScanner {
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_default(),
+            cached_version: VersionCache::new(),
         }
     }
 
-    /// Check if this artifact is an OCI/Docker image manifest.
+    /// Check if this artifact is an OCI/Docker image manifest. Thin wrapper
+    /// around the shared [`crate::services::scanner_service::is_oci_image_artifact`]
+    /// helper so the predicate has one source of truth.
     fn is_container_image(artifact: &Artifact) -> bool {
-        let ct = &artifact.content_type;
-        ct.contains("vnd.oci.image")
-            || ct.contains("vnd.docker.distribution")
-            || ct.contains("vnd.docker.container")
-            || artifact.path.contains("/manifests/")
+        crate::services::scanner_service::is_oci_image_artifact(artifact)
     }
 
     /// Extract an image reference from the artifact path.
-    /// OCI paths look like: v2/<name>/manifests/<reference>
+    /// OCI paths look like: v2/<name>/manifests/<reference>. Parsing is
+    /// shared with `GrypeScanner::build_registry_image_ref` via
+    /// `parse_oci_manifest_path` so both scanners agree on what counts as
+    /// a well-formed image artifact (#1160). The name and reference are
+    /// joined via `join_oci_image_ref`, which uses `@` for digest refs and
+    /// `:` for tags per the OCI distribution spec (#1483). Using `:` for
+    /// digest refs produces a string the Trivy CLI rejects with
+    /// "could not parse reference".
     fn extract_image_ref(artifact: &Artifact) -> Option<String> {
-        let path = artifact.path.trim_start_matches('/');
-        if let Some(rest) = path.strip_prefix("v2/") {
-            // v2/<name>/manifests/<ref>
-            if let Some(idx) = rest.find("/manifests/") {
-                let name = &rest[..idx];
-                let reference = &rest[idx + "/manifests/".len()..];
-                if !name.is_empty() && !reference.is_empty() {
-                    return Some(format!("{}:{}", name, reference));
-                }
-            }
-        }
-        None
+        let (name, reference) =
+            crate::services::scanner_service::parse_oci_manifest_path(&artifact.path)?;
+        Some(crate::services::scanner_service::join_oci_image_ref(
+            name, reference,
+        ))
     }
 
+    /// Number of `/healthz` attempts before declaring the Trivy server down.
+    /// Three attempts with backoff covers a 30-60s pod restart without
+    /// permanently failing in-flight scans, which would otherwise flag the
+    /// underlying artifacts. See issue #888.
+    const HEALTH_CHECK_ATTEMPTS: u32 = 3;
+    /// Per-attempt timeout for `/healthz`. Independent of the 300s scan
+    /// timeout so a NetworkPolicy-blocked or hung Trivy does not tie up a
+    /// worker for five minutes per scan.
+    const HEALTH_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    /// Backoff between health-check attempts. Short on purpose: the goal is
+    /// to absorb a pod-restart blip, not to wait out a sustained outage.
+    const HEALTH_CHECK_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+
     /// Check if the Trivy server is available.
-    async fn check_trivy_health(&self) -> bool {
-        match self
-            .http
-            .get(format!("{}/healthz", self.trivy_url))
-            .send()
-            .await
-        {
-            Ok(resp) => resp.status().is_success(),
-            Err(_) => false,
+    ///
+    /// Returns `Ok(())` when `/healthz` responds 2xx. On failure, retries
+    /// `HEALTH_CHECK_ATTEMPTS` times with `HEALTH_CHECK_BACKOFF` between
+    /// attempts before surfacing an `AppError::BadGateway` so the scan
+    /// orchestrator can mark the scan FAILED with a descriptive message
+    /// rather than silently completing with zero findings (issue #888).
+    ///
+    /// Each attempt has its own `HEALTH_CHECK_TIMEOUT` so a hung Trivy does
+    /// not block a worker for the full 300s scan timeout.
+    async fn check_trivy_health(&self) -> Result<()> {
+        let url = format!("{}/healthz", self.trivy_url);
+        let mut last_err: Option<AppError> = None;
+
+        for attempt in 1..=Self::HEALTH_CHECK_ATTEMPTS {
+            let result = self
+                .http
+                .get(&url)
+                .timeout(Self::HEALTH_CHECK_TIMEOUT)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) => {
+                    let msg = format!(
+                        "Trivy server at {} is unhealthy: HTTP {}",
+                        self.trivy_url,
+                        resp.status()
+                    );
+                    crate::services::metrics_service::record_scanner_health_check_failure(
+                        "trivy",
+                        "unhealthy",
+                    );
+                    warn!("Trivy /healthz attempt {} failed: {}", attempt, msg);
+                    last_err = Some(AppError::BadGateway(msg));
+                }
+                Err(e) => {
+                    let msg = format!("Trivy server at {} is unreachable: {}", self.trivy_url, e);
+                    crate::services::metrics_service::record_scanner_health_check_failure(
+                        "trivy",
+                        "unreachable",
+                    );
+                    warn!("Trivy /healthz attempt {} failed: {}", attempt, msg);
+                    last_err = Some(AppError::BadGateway(msg));
+                }
+            }
+
+            if attempt < Self::HEALTH_CHECK_ATTEMPTS {
+                tokio::time::sleep(Self::HEALTH_CHECK_BACKOFF).await;
+            }
         }
+
+        Err(last_err.unwrap_or_else(|| {
+            AppError::BadGateway(format!(
+                "Trivy server at {} health check failed",
+                self.trivy_url
+            ))
+        }))
     }
 
     /// Scan an image reference using the Trivy CLI with server mode.
@@ -113,6 +215,10 @@ impl ImageScanner {
                 &self.trivy_url,
                 "--format",
                 "json",
+                // #903: enumerate the full package inventory, not just
+                // CVE-bearing rows. Adds the `Packages` block to the
+                // JSON report which `convert_trivy_packages` consumes.
+                "--list-all-pkgs",
                 "--quiet",
                 "--timeout",
                 "5m",
@@ -145,12 +251,18 @@ impl ImageScanner {
         // POST /twirp/trivy.scanner.v1.Scanner/Scan
         let url = format!("{}/twirp/trivy.scanner.v1.Scanner/Scan", self.trivy_url);
 
+        // `list_all_packages: true` mirrors the `--list-all-pkgs` CLI flag
+        // (#903): without it the Twirp endpoint returns no `Packages`
+        // block, and any environment that falls through to this HTTP
+        // path (ARC runners + demo EC2 without the trivy CLI binary)
+        // would silently keep the empty-SBOM bug for image scans.
         let body = serde_json::json!({
             "target": image_ref,
             "artifact_type": "container_image",
             "options": {
                 "vuln_type": ["os", "library"],
                 "scanners": ["vuln"],
+                "list_all_packages": true,
             }
         });
 
@@ -176,36 +288,14 @@ impl ImageScanner {
             .map_err(|e| AppError::Internal(format!("Failed to parse Trivy response: {}", e)))
     }
 
-    /// Convert Trivy vulnerabilities to RawFindings.
-    fn convert_findings(report: &TrivyReport) -> Vec<RawFinding> {
-        let mut findings = Vec::new();
-
-        for result in &report.results {
-            if let Some(ref vulns) = result.vulnerabilities {
-                for vuln in vulns {
-                    let severity =
-                        Severity::from_str_loose(&vuln.severity).unwrap_or(Severity::Info);
-
-                    let title = vuln.title.clone().unwrap_or_else(|| {
-                        format!("{} in {}", vuln.vulnerability_id, vuln.pkg_name)
-                    });
-
-                    findings.push(RawFinding {
-                        severity,
-                        title,
-                        description: vuln.description.clone(),
-                        cve_id: Some(vuln.vulnerability_id.clone()),
-                        affected_component: Some(format!("{} ({})", vuln.pkg_name, result.target)),
-                        affected_version: Some(vuln.installed_version.clone()),
-                        fixed_version: vuln.fixed_version.clone(),
-                        source: Some("trivy".to_string()),
-                        source_url: vuln.primary_url.clone(),
-                    });
-                }
-            }
-        }
-
-        findings
+    /// Convert Trivy vulnerabilities into RawFinding rows. Thin wrapper
+    /// around the shared [`convert_trivy_findings`] helper so the existing
+    /// tests can call `ImageScanner::convert_findings(report)` as before.
+    /// Production code uses `ScanOutput::from_trivy_report` instead, which
+    /// also extracts the package inventory (#903).
+    #[cfg(test)]
+    pub(crate) fn convert_findings(report: &TrivyReport) -> Vec<RawFinding> {
+        convert_trivy_findings(report, "trivy")
     }
 }
 
@@ -219,75 +309,117 @@ impl Scanner for ImageScanner {
         "image"
     }
 
+    /// Surface the container-image content-type check through the trait so
+    /// the orchestrator can gate on it without creating a `scan_results`
+    /// row for non-image artifacts (issues #961, #994). This is the exact
+    /// case that produced the lodash silent-success: a generic tarball
+    /// uploaded as `scan_type=image` should never have flowed into
+    /// `ImageScanner::scan` at all.
+    fn is_applicable(&self, artifact: &Artifact) -> bool {
+        Self::is_container_image(artifact)
+    }
+
+    /// Probe `trivy --version` once and cache the parsed version string.
+    /// Returns `None` if the binary is missing or its output cannot be
+    /// parsed.
+    async fn version(&self) -> Option<String> {
+        cached_trivy_cli_version(&self.cached_version).await
+    }
+
     async fn scan(
         &self,
         artifact: &Artifact,
         _metadata: Option<&ArtifactMetadata>,
         _content: &Bytes,
-    ) -> Result<Vec<RawFinding>> {
-        // Only scan OCI/Docker image manifests
-        if !Self::is_container_image(artifact) {
-            return Ok(vec![]);
-        }
+    ) -> Result<ScanOutput> {
+        debug_assert!(
+            Self::is_container_image(artifact),
+            "ImageScanner::scan called on a non-container artifact; the orchestrator must gate on is_applicable first"
+        );
 
+        // Image reference extraction can still fail even on an applicable
+        // (content-type-matching) artifact when the path is malformed.
+        // That is a real error, not a "not applicable" case: surface it as
+        // a failed scan so the operator sees error_message rather than a
+        // silent completed-with-zero-findings row (issue #994).
         let image_ref = match Self::extract_image_ref(artifact) {
             Some(r) => r,
             None => {
-                info!(
+                return Err(AppError::Internal(format!(
                     "Could not extract image reference from artifact path: {}",
                     artifact.path
-                );
-                return Ok(vec![]);
+                )));
             }
         };
 
-        // Check if Trivy server is healthy
-        if !self.check_trivy_health().await {
-            warn!(
-                "Trivy server at {} is not available, skipping image scan for {}",
-                self.trivy_url, image_ref
-            );
-            return Ok(vec![]);
+        // Check if Trivy server is healthy. If it is not reachable we must
+        // surface an error so the scan record is marked FAILED. Returning
+        // Ok(vec![]) here would silently mark the scan COMPLETED with zero
+        // findings even though no scanning ever happened (issue #888).
+        if let Err(e) = self.check_trivy_health().await {
+            return Err(AppError::BadGateway(format!(
+                "Trivy image scan failed for {}: {}",
+                image_ref, e
+            )));
         }
 
         info!("Starting Trivy scan for image: {}", image_ref);
 
         let report = self.scan_with_trivy(&image_ref).await?;
-        let findings = Self::convert_findings(&report);
+        // Source label is intentionally "trivy" (not "trivy-image") to
+        // preserve back-compat with dashboards / filters that group
+        // findings by `source = 'trivy'`. The pre-#903 ImageScanner used
+        // the same string. Changing it here would silently drop
+        // existing image-scanner rows from any operator filter.
+        let output = ScanOutput::from_trivy_report(&report, "trivy");
 
         info!(
-            "Trivy scan complete for {}: {} vulnerabilities found",
+            "Trivy scan complete for {}: {} vulnerabilities, {} packages",
             image_ref,
-            findings.len()
+            output.findings.len(),
+            output.packages.len()
         );
 
-        Ok(findings)
+        Ok(output)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::security::Severity;
 
-    #[test]
-    fn test_is_container_image() {
-        let mut artifact = Artifact {
+    /// Build an Artifact fixture for scanner tests. Most fields are not
+    /// load-bearing for the scanner — the scanner only branches on `path`
+    /// and `content_type` — so we collapse the boilerplate here.
+    fn make_test_artifact(path: &str, content_type: &str) -> Artifact {
+        Artifact {
             id: uuid::Uuid::new_v4(),
             repository_id: uuid::Uuid::new_v4(),
-            path: "v2/myapp/manifests/latest".to_string(),
-            name: "myapp".to_string(),
-            version: Some("latest".to_string()),
+            path: path.to_string(),
+            name: "test".to_string(),
+            version: None,
             size_bytes: 1000,
             checksum_sha256: "abc123".to_string(),
             checksum_md5: None,
             checksum_sha1: None,
-            content_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            content_type: content_type.to_string(),
             storage_key: "test".to_string(),
             is_deleted: false,
             uploaded_by: None,
+            quarantine_status: None,
+            quarantine_until: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
-        };
+        }
+    }
+
+    #[test]
+    fn test_is_container_image() {
+        let mut artifact = make_test_artifact(
+            "v2/myapp/manifests/latest",
+            "application/vnd.oci.image.manifest.v1+json",
+        );
         assert!(ImageScanner::is_container_image(&artifact));
 
         artifact.content_type = "application/json".to_string();
@@ -297,23 +429,10 @@ mod tests {
 
     #[test]
     fn test_extract_image_ref() {
-        let artifact = Artifact {
-            id: uuid::Uuid::new_v4(),
-            repository_id: uuid::Uuid::new_v4(),
-            path: "v2/myapp/manifests/v1.0.0".to_string(),
-            name: "myapp".to_string(),
-            version: Some("v1.0.0".to_string()),
-            size_bytes: 1000,
-            checksum_sha256: "abc123".to_string(),
-            checksum_md5: None,
-            checksum_sha1: None,
-            content_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
-            storage_key: "test".to_string(),
-            is_deleted: false,
-            uploaded_by: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
+        let artifact = make_test_artifact(
+            "v2/myapp/manifests/v1.0.0",
+            "application/vnd.oci.image.manifest.v1+json",
+        );
         assert_eq!(
             ImageScanner::extract_image_ref(&artifact),
             Some("myapp:v1.0.0".to_string())
@@ -321,49 +440,42 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_image_ref_with_namespace() {
-        let artifact = Artifact {
-            id: uuid::Uuid::new_v4(),
-            repository_id: uuid::Uuid::new_v4(),
-            path: "v2/org/myapp/manifests/sha256:abc123".to_string(),
-            name: "myapp".to_string(),
-            version: None,
-            size_bytes: 1000,
-            checksum_sha256: "abc123".to_string(),
-            checksum_md5: None,
-            checksum_sha1: None,
-            content_type: "application/vnd.docker.distribution.manifest.v2+json".to_string(),
-            storage_key: "test".to_string(),
-            is_deleted: false,
-            uploaded_by: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
+    fn test_extract_image_ref_with_namespace_tag() {
+        let artifact = make_test_artifact(
+            "v2/org/myapp/manifests/v1.0.0",
+            "application/vnd.docker.distribution.manifest.v2+json",
+        );
         assert_eq!(
             ImageScanner::extract_image_ref(&artifact),
-            Some("org/myapp:sha256:abc123".to_string())
+            Some("org/myapp:v1.0.0".to_string())
+        );
+    }
+
+    /// Regression test for issue #1483. Digest-pinned manifests must use
+    /// the `name@sha256:...` form so the Trivy CLI can parse them. The
+    /// previous code emitted `name:sha256:...` which Trivy and Grype reject
+    /// with "could not parse reference". A single `docker buildx push`
+    /// creates two such digest-referenced manifests (platform manifest +
+    /// attestation manifest), so this case is the common case for image
+    /// scans, not an edge case.
+    #[test]
+    fn test_extract_image_ref_digest_uses_at_separator() {
+        let artifact = make_test_artifact(
+            "v2/org/myapp/manifests/sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b",
+            "application/vnd.oci.image.manifest.v1+json",
+        );
+        assert_eq!(
+            ImageScanner::extract_image_ref(&artifact),
+            Some(
+                "org/myapp@sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b"
+                    .to_string()
+            )
         );
     }
 
     #[test]
     fn test_extract_image_ref_invalid_path() {
-        let artifact = Artifact {
-            id: uuid::Uuid::new_v4(),
-            repository_id: uuid::Uuid::new_v4(),
-            path: "some/random/path".to_string(),
-            name: "test".to_string(),
-            version: None,
-            size_bytes: 0,
-            checksum_sha256: "abc".to_string(),
-            checksum_md5: None,
-            checksum_sha1: None,
-            content_type: "application/json".to_string(),
-            storage_key: "test".to_string(),
-            is_deleted: false,
-            uploaded_by: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
+        let artifact = make_test_artifact("some/random/path", "application/json");
         assert_eq!(ImageScanner::extract_image_ref(&artifact), None);
     }
 
@@ -396,6 +508,7 @@ mod tests {
                         primary_url: None,
                     },
                 ]),
+                packages: None,
             }],
         };
 
@@ -426,11 +539,116 @@ mod tests {
                 class: "os-pkgs".to_string(),
                 result_type: "alpine".to_string(),
                 vulnerabilities: None,
+                packages: None,
             }],
         };
 
         let findings = ImageScanner::convert_findings(&report);
         assert_eq!(findings.len(), 0);
+    }
+
+    /// Regression test for issue #888: when the Trivy server is
+    /// unreachable, `scan` must return Err so the orchestrator marks the
+    /// scan FAILED. Returning Ok(vec![]) would silently complete the scan
+    /// with zero findings even though Trivy never ran.
+    #[tokio::test]
+    async fn test_scan_fails_when_trivy_unreachable() {
+        // Use an unrouteable port so /healthz cannot succeed. Port 1 is
+        // reserved and any client binding to it will get a connection error.
+        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
+        let artifact = make_test_artifact(
+            "v2/myapp/manifests/latest",
+            "application/vnd.oci.image.manifest.v1+json",
+        );
+
+        let result = scanner.scan(&artifact, None, &Bytes::new()).await;
+
+        assert!(
+            result.is_err(),
+            "scan() must return Err when Trivy is unreachable, not Ok(vec![]); \
+             a silent Ok(vec![]) is what caused the scan to be marked COMPLETED \
+             instead of FAILED in issue #888"
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Trivy") && err_msg.contains("myapp:latest"),
+            "error must identify the failed scanner and image, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_trivy_health_returns_err_on_unreachable() {
+        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
+        let result = scanner.check_trivy_health().await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unreachable") || msg.contains("unhealthy"),
+            "error message should describe the health-check failure, got: {}",
+            msg
+        );
+    }
+
+    /// `check_trivy_health` retries before declaring failure so a brief
+    /// Trivy pod restart does not hard-fail every concurrent scan. Verified
+    /// indirectly by elapsed time: with ATTEMPTS=3 and BACKOFF=500ms there
+    /// are two backoff sleeps, so a fully-failed run takes >= ~900ms.
+    #[tokio::test]
+    async fn test_check_trivy_health_retries_before_failing() {
+        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
+        let start = std::time::Instant::now();
+        let result = scanner.check_trivy_health().await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        let expected_min =
+            ImageScanner::HEALTH_CHECK_BACKOFF * (ImageScanner::HEALTH_CHECK_ATTEMPTS - 1);
+        assert!(
+            elapsed >= expected_min - std::time::Duration::from_millis(100),
+            "expected at least {:?} of backoff across {} attempts, got {:?}",
+            expected_min,
+            ImageScanner::HEALTH_CHECK_ATTEMPTS,
+            elapsed
+        );
+    }
+
+    /// `check_trivy_health` returns BadGateway, not Internal. The
+    /// orchestrator does not currently translate AppError to HTTP, but
+    /// classifying upstream-scanner failures as 502 keeps internal-error
+    /// alerting clean. Pinned because we just changed the variant.
+    #[tokio::test]
+    async fn test_check_trivy_health_error_is_bad_gateway() {
+        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
+        let err = scanner.check_trivy_health().await.unwrap_err();
+        assert!(
+            matches!(err, AppError::BadGateway(_)),
+            "expected BadGateway, got {:?}",
+            err
+        );
+    }
+
+    /// Non-container artifacts must report `is_applicable=false` so the
+    /// orchestrator never calls `scan()` on them, rather than the scanner
+    /// silently swallowing them inside `scan()` and producing a
+    /// completed-with-zero-findings row. This is the trait-level contract
+    /// behind the fix for issues #961 and #994.
+    ///
+    /// `scan()` itself is now allowed to panic on a non-applicable artifact
+    /// via `debug_assert!`, because the orchestrator is the single gate
+    /// point. Asserting on `is_applicable` here keeps the regression-test
+    /// pressure on the right surface.
+    #[test]
+    fn test_is_applicable_rejects_non_container_artifact() {
+        use crate::services::scanner_service::Scanner;
+
+        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
+        let artifact = make_test_artifact("pypi/pkg/1.0.0/pkg-1.0.0.tar.gz", "application/gzip");
+        assert!(
+            !Scanner::is_applicable(&scanner, &artifact),
+            "ImageScanner must yield to a filesystem scanner for non-container artifacts (#961, #994)"
+        );
     }
 
     #[test]
@@ -456,5 +674,25 @@ mod tests {
         let report: TrivyReport = serde_json::from_str(json).unwrap();
         assert_eq!(report.results.len(), 1);
         assert_eq!(report.results[0].vulnerabilities.as_ref().unwrap().len(), 1);
+    }
+
+    /// `version()` covers the TTL-backed cached `trivy --version` probe path
+    /// for the container-image scanner. As with the Trivy filesystem
+    /// scanner, we tolerate hosts both with and without `trivy` installed:
+    /// the assertion is that repeated calls are cached and that any
+    /// returned token has the normalized `trivy-` prefix.
+    #[tokio::test]
+    async fn test_version_is_cached_and_deterministic() {
+        let scanner = ImageScanner::new("http://localhost:0".to_string());
+        let v1 = scanner.version().await;
+        let v2 = scanner.version().await;
+        assert_eq!(v1, v2, "VersionCache must return identical value on repeat");
+        if let Some(v) = v1 {
+            assert!(
+                v.starts_with("trivy-"),
+                "image scanner version must be normalized 'trivy-<ver>'; got {}",
+                v
+            );
+        }
     }
 }

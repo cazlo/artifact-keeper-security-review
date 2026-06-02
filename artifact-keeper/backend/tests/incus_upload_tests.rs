@@ -18,8 +18,10 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use artifact_keeper_backend::api::handlers::incus;
+use artifact_keeper_backend::api::middleware::auth::optional_auth_middleware;
 use artifact_keeper_backend::api::{AppState, SharedState};
 use artifact_keeper_backend::config::Config;
+use artifact_keeper_backend::services::auth_service::AuthService;
 
 // ===========================================================================
 // Test helpers
@@ -48,21 +50,67 @@ fn test_config(storage_path: &str) -> Config {
         trivy_url: None,
         openscap_url: None,
         openscap_profile: "standard".into(),
-        meilisearch_url: None,
-        meilisearch_api_key: None,
+        opensearch_url: None,
+        opensearch_username: None,
+        opensearch_password: None,
+        opensearch_allow_invalid_certs: false,
         scan_workspace_path: "/tmp/scan".into(),
         demo_mode: false,
+        guest_access_enabled: true,
         peer_instance_name: "test".into(),
         peer_public_endpoint: "http://localhost:8080".into(),
         peer_api_key: "test-key".into(),
         dependency_track_url: None,
+        dependency_track_enabled: false,
         otel_exporter_otlp_endpoint: None,
         otel_service_name: "test".into(),
         gc_schedule: "0 0 * * * *".into(),
         lifecycle_check_interval_secs: 60,
+        stuck_scan_threshold_secs: 1800,
+        stuck_scan_check_interval_secs: 600,
+        stuck_scan_reap_limit: 1000,
         allow_local_admin_login: false,
         max_upload_size_bytes: 10_737_418_240,
         metrics_port: None,
+        database_max_connections: 20,
+        database_min_connections: 5,
+        database_acquire_timeout_secs: 30,
+        database_idle_timeout_secs: 600,
+        database_max_lifetime_secs: 1800,
+        auth_max_concurrency: 8,
+        rate_limit_auth_per_window: 120,
+        rate_limit_api_per_window: 5000,
+        rate_limit_search_per_window: 300,
+        rate_limit_presign_per_window: 30,
+        rate_limit_password_change_per_window: 5,
+        rate_limit_password_change_window_secs: 900,
+        rate_limit_window_secs: 60,
+        rate_limit_exempt_usernames: Vec::new(),
+        rate_limit_exempt_service_accounts: false,
+        rate_limit_trusted_cidrs: Vec::new(),
+        account_lockout_threshold: 5,
+        account_lockout_duration_minutes: 30,
+        quarantine_enabled: false,
+        quarantine_duration_minutes: 60,
+        password_history_count: 0,
+        password_expiry_days: 0,
+        password_expiry_warning_days: vec![14, 7, 1],
+        password_expiry_check_interval_secs: 3600,
+        password_min_length: 8,
+        password_max_length: 128,
+        password_require_uppercase: false,
+        password_require_lowercase: false,
+        password_require_digit: false,
+        password_require_special: false,
+        password_min_strength: 0,
+        presigned_downloads_enabled: false,
+        presigned_download_expiry_secs: 300,
+        smtp_host: None,
+        smtp_port: 587,
+        smtp_username: None,
+        smtp_password: None,
+        smtp_from_address: "noreply@artifact-keeper.local".to_string(),
+        smtp_tls_mode: "starttls".to_string(),
     }
 }
 
@@ -151,6 +199,18 @@ async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
         .execute(pool)
         .await
         .ok();
+}
+
+/// Build the `AuthService` used by the optional-auth middleware so the routers
+/// resolve the `Authorization: Basic ...` header into an `AuthExtension`
+/// exactly as they do in production. Without this layer the handlers'
+/// mandatory `Extension<Option<AuthExtension>>` extractor is missing and every
+/// request 500s ("Missing request extension").
+fn auth_service(state: &SharedState, storage_path: &str) -> Arc<AuthService> {
+    Arc::new(AuthService::new(
+        state.db.clone(),
+        Arc::new(test_config(storage_path)),
+    ))
 }
 
 /// Build a SharedState for the incus router.
@@ -864,4 +924,177 @@ async fn test_stale_session_cleanup() {
     // Cleanup
     let _ = std::fs::remove_dir_all(&storage_path);
     cleanup(&pool, repo_id, user_id).await;
+}
+
+// ===========================================================================
+// Issue #1317 regression: cross-repo session use is rejected.
+//
+// Reproduce: a user creates an upload session under repo A, then attempts to
+// chunk, finalize, cancel, or read progress under repo B's URL using A's
+// session_id. All four operations must return 404 (we deliberately use the
+// same status as "session does not exist" to avoid leaking session existence
+// across repos).
+// ===========================================================================
+
+#[tokio::test]
+#[ignore]
+async fn test_chunked_upload_cross_repo_session_rejected() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let username = format!("incus-1317-{}", &Uuid::new_v4().to_string()[..8]);
+    let user_id = create_test_user(&pool, &username, "crosspass").await;
+    let (repo_a_id, storage_path) = create_incus_repo(&pool, "1317-repo-a").await;
+    let (repo_b_id, _storage_path_b) = create_incus_repo(&pool, "1317-repo-b").await;
+    let key_a = repo_key(&pool, repo_a_id).await;
+    let key_b = repo_key(&pool, repo_b_id).await;
+    let state = build_state(pool.clone(), storage_path.to_str().unwrap());
+    let auth_svc = auth_service(&state, storage_path.to_str().unwrap());
+    let auth = basic_auth_header(&username, "crosspass");
+
+    let make_app = || {
+        incus::router()
+            .layer(axum::middleware::from_fn_with_state(
+                auth_svc.clone(),
+                optional_auth_middleware,
+            ))
+            .with_state(state.clone())
+    };
+
+    // POST start under repo A.
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/{}/images/alpine/3.20/rootfs.tar.gz/uploads",
+            key_a
+        ))
+        .header("Authorization", &auth)
+        .body(Body::from(test_data(1024)))
+        .unwrap();
+    let resp = make_app().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body);
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "POST start should return 202: {}",
+        body_str
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let session_id = json["session_id"].as_str().unwrap().to_string();
+
+    // Sanity check: PATCH under repo A succeeds.
+    let req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/{}/uploads/{}", key_a, session_id))
+        .header("Authorization", &auth)
+        .body(Body::from(test_data(512)))
+        .unwrap();
+    let resp = make_app().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body);
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "PATCH under owning repo should succeed: {}",
+        body_str
+    );
+
+    // Attack: PATCH the same session under repo B's URL. Must be rejected.
+    let req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/{}/uploads/{}", key_b, session_id))
+        .header("Authorization", &auth)
+        .body(Body::from(test_data(512)))
+        .unwrap();
+    let resp = make_app().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "PATCH chunk under wrong repo must be 404 (issue #1317)"
+    );
+
+    // Attack: GET progress under repo B. Must be rejected.
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/{}/uploads/{}", key_b, session_id))
+        .header("Authorization", &auth)
+        .body(Body::empty())
+        .unwrap();
+    let resp = make_app().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "GET progress under wrong repo must be 404 (issue #1317)"
+    );
+
+    // Attack: PUT complete under repo B. Must be rejected.
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/{}/uploads/{}", key_b, session_id))
+        .header("Authorization", &auth)
+        .body(Body::empty())
+        .unwrap();
+    let resp = make_app().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "PUT complete under wrong repo must be 404 (issue #1317)"
+    );
+
+    // Attack: DELETE cancel under repo B. Must be rejected.
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/{}/uploads/{}", key_b, session_id))
+        .header("Authorization", &auth)
+        .body(Body::empty())
+        .unwrap();
+    let resp = make_app().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "DELETE cancel under wrong repo must be 404 (issue #1317)"
+    );
+
+    // Session must still exist under repo A (the cross-repo attempts must
+    // not have side-effected the original session row).
+    let session_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM incus_upload_sessions WHERE id = $1::uuid")
+            .bind(&session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        session_count, 1,
+        "cross-repo attempts must not delete the legitimate session"
+    );
+
+    // Legitimate cancel under repo A still works.
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/{}/uploads/{}", key_a, session_id))
+        .header("Authorization", &auth)
+        .body(Body::empty())
+        .unwrap();
+    let resp = make_app().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "legitimate cancel under owning repo should succeed"
+    );
+
+    // Cleanup
+    let _ = std::fs::remove_dir_all(&storage_path);
+    cleanup(&pool, repo_a_id, user_id).await;
+    sqlx::query("DELETE FROM repositories WHERE id = $1")
+        .bind(repo_b_id)
+        .execute(&pool)
+        .await
+        .ok();
 }

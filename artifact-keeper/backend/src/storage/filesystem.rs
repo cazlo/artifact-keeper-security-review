@@ -2,12 +2,20 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::BoxStream;
+use futures::StreamExt;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufReader};
+use tokio_util::io::ReaderStream;
+use uuid::Uuid;
 
-use super::StorageBackend;
+use super::{PutStreamResult, StorageBackend};
 use crate::error::{AppError, Result};
+
+/// Chunk size for streaming reads (256 KB).
+const STREAM_CHUNK_SIZE: usize = 256 * 1024;
 
 /// Filesystem-based storage backend
 pub struct FilesystemStorage {
@@ -22,16 +30,41 @@ impl FilesystemStorage {
         }
     }
 
-    /// Get full path for a key (using first 2 chars as subdirectory for distribution).
+    /// Get full path for a key.
     ///
     /// Keys are sanitized to prevent path traversal: only normal path components
     /// are kept, stripping `..`, `/`, and other special components.
+    ///
+    /// Two layouts are supported, selected by whether the key already encodes
+    /// a directory hierarchy:
+    ///
+    /// * **Hierarchical keys** (containing `/`, e.g. `proxy-cache/repo/path/__content__`,
+    ///   `maven/org/example/.../file.jar`): written under `base_path` verbatim.
+    ///   The key's own path segments provide directory distribution, and adding a
+    ///   2-char shard prefix on top of that produced the bug behind #1073, where
+    ///   `put_stream` (via `StorageService::FilesystemBackend`) and `get` (via this
+    ///   backend) ended up writing to and reading from different directories for
+    ///   the same proxy-cache key.
+    /// * **Flat keys** (no `/`, e.g. a bare sha256 hash `916f0027...`): written
+    ///   under a 2-char prefix subdirectory so a single directory does not accumulate
+    ///   millions of entries. This is the original behaviour and is preserved for
+    ///   the legacy hash-key callers.
     fn key_to_path(&self, key: &str) -> PathBuf {
         let sanitized: PathBuf = std::path::Path::new(key)
             .components()
             .filter(|c| matches!(c, std::path::Component::Normal(_)))
             .collect();
         let sanitized_str = sanitized.to_string_lossy();
+
+        // Hierarchical keys (the key contains its own `/` separators) already
+        // distribute themselves across directories. Skip the shard prefix so
+        // path-style keys land where every other call site expects them.
+        // See #1073: proxy-cache writes went to `<base>/proxy-cache/...` while
+        // reads looked under `<base>/pr/proxy-cache/...`.
+        if sanitized.components().count() > 1 {
+            return self.base_path.join(&sanitized);
+        }
+
         let prefix = &sanitized_str[..2.min(sanitized_str.len())];
         self.base_path.join(prefix).join(&sanitized)
     }
@@ -47,19 +80,59 @@ impl StorageBackend for FilesystemStorage {
             fs::create_dir_all(parent).await?;
         }
 
-        // Write content
-        let mut file = fs::File::create(&path).await?;
-        file.write_all(&content).await?;
-        file.sync_all().await?;
+        // Write to a unique temp file in the same directory, then atomically
+        // rename into place (same filesystem => atomic rename on POSIX). The
+        // previous implementation wrote directly to `path` via
+        // `File::create` + `write_all`, which is NOT atomic: under a
+        // cold-cache proxy stampede, N concurrent writers target the SAME
+        // cache file and race on truncate/write, and a reader interleaving
+        // with a sibling writer's truncate can observe a torn or
+        // transiently-missing file. Writing to a per-writer temp path and
+        // renaming gives each writer an isolated file and makes the visible
+        // `path` flip atomically from old bytes to new bytes, never to a
+        // partial/empty state. This closes the B6 stampede 502 leak at the
+        // storage layer (the proxy-service call site additionally treats a
+        // cache-write failure as best-effort).
+        let mut temp_name = path.as_os_str().to_os_string();
+        temp_name.push(format!(".tmp.{}", Uuid::new_v4()));
+        let temp_path = PathBuf::from(temp_name);
+
+        let mut file = fs::File::create(&temp_path).await?;
+        if let Err(e) = file.write_all(&content).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(e.into());
+        }
+        if let Err(e) = file.sync_all().await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(e.into());
+        }
+        drop(file);
+
+        if let Err(e) = fs::rename(&temp_path, &path).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(e.into());
+        }
 
         Ok(())
     }
 
     async fn get(&self, key: &str) -> Result<Bytes> {
         let path = self.key_to_path(key);
-        let content = fs::read(&path)
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to read {}: {}", key, e)))?;
+        let content = fs::read(&path).await.map_err(|e| {
+            // #1016: missing keys MUST map to AppError::NotFound so callers
+            // that branch on cache-miss (proxy_service::get_cached_artifact,
+            // OCI blob lookups, etc.) treat ENOENT as "not present" rather
+            // than as a 500-class storage failure. The S3 backend already
+            // distinguishes NotFound; the filesystem backend was
+            // historically lumping every io::Error into AppError::Storage,
+            // which surfaced as "Internal server error / os error 2" on
+            // cached-package re-downloads.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::NotFound(format!("Storage key not found: {}", key))
+            } else {
+                AppError::Storage(format!("Failed to read {}: {}", key, e))
+            }
+        })?;
         Ok(Bytes::from(content))
     }
 
@@ -70,9 +143,16 @@ impl StorageBackend for FilesystemStorage {
 
     async fn delete(&self, key: &str) -> Result<()> {
         let path = self.key_to_path(key);
-        fs::remove_file(&path)
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to delete {}: {}", key, e)))?;
+        fs::remove_file(&path).await.map_err(|e| {
+            // Same #1016 contract for delete: ENOENT → NotFound so callers
+            // (artifact deletion, cache eviction) can handle "already gone"
+            // as idempotent rather than as a hard failure.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::NotFound(format!("Storage key not found: {}", key))
+            } else {
+                AppError::Storage(format!("Failed to delete {}: {}", key, e))
+            }
+        })?;
         Ok(())
     }
 
@@ -85,6 +165,82 @@ impl StorageBackend for FilesystemStorage {
             .await
             .map_err(|e| AppError::Storage(format!("Failed to copy file to {}: {}", key, e)))?;
         Ok(())
+    }
+
+    async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+        let path = self.key_to_path(key);
+        let file = fs::File::open(&path)
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to open {}: {}", key, e)))?;
+
+        let reader = BufReader::new(file);
+        let stream = ReaderStream::with_capacity(reader, STREAM_CHUNK_SIZE);
+
+        // Map tokio io errors to our Result type
+        let mapped = stream
+            .map(|result| result.map_err(|e| AppError::Storage(format!("Read error: {}", e))));
+
+        Ok(Box::pin(mapped))
+    }
+
+    async fn put_stream(
+        &self,
+        key: &str,
+        stream: BoxStream<'static, Result<Bytes>>,
+    ) -> Result<PutStreamResult> {
+        let dest = self.key_to_path(key);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        // Write to a temp file in the same directory so rename is atomic
+        // (same filesystem guarantees atomic rename on POSIX).
+        let mut temp_name = dest.as_os_str().to_os_string();
+        temp_name.push(format!(".tmp.{}", Uuid::new_v4()));
+        let temp_path = PathBuf::from(temp_name);
+        let mut file = fs::File::create(&temp_path)
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to create temp file: {}", e)))?;
+
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+
+        tokio::pin!(stream);
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(data) => {
+                    hasher.update(&data);
+                    total += data.len() as u64;
+                    if let Err(e) = file.write_all(&data).await {
+                        let _ = fs::remove_file(&temp_path).await;
+                        return Err(AppError::Storage(format!("Write error: {}", e)));
+                    }
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&temp_path).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        // Flush and sync to disk before renaming
+        if let Err(e) = file.sync_all().await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::Storage(format!("Sync error: {}", e)));
+        }
+        drop(file);
+
+        // Atomic rename
+        if let Err(e) = fs::rename(&temp_path, &dest).await {
+            // Best-effort cleanup; the temp file may already be gone
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::Storage(format!("Rename error: {}", e)));
+        }
+
+        Ok(PutStreamResult {
+            checksum_sha256: format!("{:x}", hasher.finalize()),
+            bytes_written: total,
+        })
     }
 }
 
@@ -158,29 +314,61 @@ mod tests {
     fn test_key_to_path_traversal_dot_dot() {
         let storage = FilesystemStorage::new("/data");
         let path = storage.key_to_path("../../etc/passwd");
-        // "../" components are stripped; only "etc" and "passwd" remain
+        // "../" components are stripped; only "etc" and "passwd" remain.
+        // Multi-segment hierarchical key, so no shard prefix is added.
         assert!(path.starts_with("/data"));
         assert!(!path.to_string_lossy().contains(".."));
-        assert_eq!(path, PathBuf::from("/data/et/etc/passwd"));
+        assert_eq!(path, PathBuf::from("/data/etc/passwd"));
     }
 
     #[test]
     fn test_key_to_path_absolute_key() {
         let storage = FilesystemStorage::new("/data");
         let path = storage.key_to_path("/etc/passwd");
-        // Leading "/" (RootDir component) is stripped; result stays inside base
+        // Leading "/" (RootDir component) is stripped; result stays inside base.
+        // Multi-segment hierarchical key, so no shard prefix is added.
         assert!(path.starts_with("/data"));
-        assert_eq!(path, PathBuf::from("/data/et/etc/passwd"));
+        assert_eq!(path, PathBuf::from("/data/etc/passwd"));
     }
 
     #[test]
     fn test_key_to_path_mixed_traversal() {
         let storage = FilesystemStorage::new("/data");
         let path = storage.key_to_path("maven/../../../etc/passwd");
-        // ".." components stripped, only Normal components kept
+        // ".." components stripped, only Normal components kept.
+        // Multi-segment hierarchical key, so no shard prefix is added.
         assert!(path.starts_with("/data"));
         assert!(!path.to_string_lossy().contains(".."));
-        assert_eq!(path, PathBuf::from("/data/ma/maven/etc/passwd"));
+        assert_eq!(path, PathBuf::from("/data/maven/etc/passwd"));
+    }
+
+    // #1073: proxy-cache keys must not be sharded. They already carry a
+    // hierarchical layout (`proxy-cache/<repo>/<path>/__content__`) that the
+    // proxy_service writer in `services::storage_service::FilesystemBackend`
+    // honors verbatim. Sharding under the first 2 chars made `get` look in
+    // `<base>/pr/proxy-cache/...` while the file was at `<base>/proxy-cache/...`.
+    #[test]
+    fn test_key_to_path_proxy_cache_key_not_sharded() {
+        let storage = FilesystemStorage::new("/data/storage");
+        let key = "proxy-cache/docker-hub-remote/v2/library/nginx/manifests/latest/__content__";
+        let path = storage.key_to_path(key);
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "/data/storage/proxy-cache/docker-hub-remote/v2/library/nginx/manifests/latest/__content__"
+            )
+        );
+    }
+
+    #[test]
+    fn test_key_to_path_proxy_cache_meta_not_sharded() {
+        let storage = FilesystemStorage::new("/data/storage");
+        let key = "proxy-cache/pypi-remote/simple/flask/__cache_meta__.json";
+        let path = storage.key_to_path(key);
+        assert_eq!(
+            path,
+            PathBuf::from("/data/storage/proxy-cache/pypi-remote/simple/flask/__cache_meta__.json")
+        );
     }
 
     #[test]
@@ -204,10 +392,11 @@ mod tests {
     fn test_key_to_path_current_dir_traversal() {
         let storage = FilesystemStorage::new("/data");
         let path = storage.key_to_path("./secret/../passwords");
-        // "." and ".." are stripped, only "secret" and "passwords" remain
+        // "." and ".." are stripped, only "secret" and "passwords" remain.
+        // Multi-segment hierarchical key, so no shard prefix is added.
         assert!(path.starts_with("/data"));
         assert!(!path.to_string_lossy().contains(".."));
-        assert_eq!(path, PathBuf::from("/data/se/secret/passwords"));
+        assert_eq!(path, PathBuf::from("/data/secret/passwords"));
     }
 
     #[tokio::test]
@@ -222,6 +411,107 @@ mod tests {
 
         let retrieved = storage.get(key).await.unwrap();
         assert_eq!(retrieved, content);
+    }
+
+    /// B6 (stampede 502 leak, storage half): `put` writes via a temp file +
+    /// atomic rename so concurrent writers to the SAME key never observe a
+    /// torn / transiently-missing file. Before the fix, `put` did
+    /// `File::create(&dest) + write_all`, which truncated `dest` in place and
+    /// let a reader interleave with a sibling writer's truncate. This test
+    /// fires many concurrent writers + readers at one key and asserts every
+    /// `put` succeeds, no `.tmp.` files leak, and the final read returns a
+    /// complete (non-empty) body.
+    #[tokio::test]
+    async fn test_concurrent_put_same_key_is_atomic() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(FilesystemStorage::new(temp_dir.path()));
+        let key = "proxy-cache/stampede-repo/simple/pkg/__content__";
+        let content = Bytes::from(vec![b'x'; 4096]);
+
+        let mut handles = Vec::new();
+        for _ in 0..24 {
+            let s = storage.clone();
+            let c = content.clone();
+            handles.push(tokio::spawn(async move {
+                // Each writer writes the same body; the read may race a
+                // concurrent rename but must never see a partial file.
+                s.put(key, c).await
+            }));
+        }
+        for h in handles {
+            // Every put must succeed (no ENOENT from the create_dir_all /
+            // File::create race the old non-atomic path exhibited).
+            h.await.unwrap().expect("concurrent put must not fail");
+        }
+
+        let got = storage.get(key).await.expect("final read must succeed");
+        assert_eq!(got.len(), content.len(), "body must be complete, not torn");
+
+        // No leftover temp files.
+        let mut leftovers = Vec::new();
+        let mut entries = fs::read_dir(temp_dir.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            collect_tmp_files(entry.path(), &mut leftovers).await;
+        }
+        assert!(
+            leftovers.is_empty(),
+            "atomic put must not leave .tmp. files: {leftovers:?}"
+        );
+    }
+
+    // #1073 regression: a proxy-cache key written by the un-sharded writer
+    // (`services::storage_service::FilesystemBackend`) must be readable by
+    // this backend's `get`. Before the fix, this backend sharded the key
+    // under the first 2 chars and looked in `<base>/pr/proxy-cache/...`,
+    // missing the file that lived at `<base>/proxy-cache/...`.
+    #[tokio::test]
+    async fn test_proxy_cache_key_readable_at_unsharded_path() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        // Simulate what the proxy writer puts on disk: file at
+        // `<base>/proxy-cache/<repo>/<path>/__content__` with no shard prefix.
+        let key = "proxy-cache/docker-hub-remote/v2/library/nginx/manifests/latest/__content__";
+        let on_disk = temp_dir
+            .path()
+            .join("proxy-cache/docker-hub-remote/v2/library/nginx/manifests/latest/__content__");
+        tokio::fs::create_dir_all(on_disk.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&on_disk, b"manifest body").await.unwrap();
+
+        // Reader path must resolve to the same on-disk location.
+        let bytes = storage.get(key).await.expect("get must find file");
+        assert_eq!(bytes.as_ref(), b"manifest body");
+    }
+
+    // #1073 regression: roundtrip via this backend's own put/get for a
+    // proxy-cache key. With sharding still enabled this previously wrote to
+    // `<base>/pr/proxy-cache/...` (matching the get path), but the bug was
+    // that the *writer* in `services::storage_service::FilesystemBackend`
+    // didn't shard. Today both paths land at `<base>/proxy-cache/...`.
+    #[tokio::test]
+    async fn test_proxy_cache_key_roundtrip_unsharded() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let key = "proxy-cache/pypi-remote/simple/flask/__content__";
+        storage
+            .put(key, Bytes::from_static(b"index html"))
+            .await
+            .unwrap();
+
+        let expected_path = temp_dir
+            .path()
+            .join("proxy-cache/pypi-remote/simple/flask/__content__");
+        assert!(
+            expected_path.exists(),
+            "proxy-cache key must land at unsharded path; expected {} to exist",
+            expected_path.display()
+        );
+
+        let bytes = storage.get(key).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"index html");
     }
 
     #[tokio::test]
@@ -284,5 +574,315 @@ mod tests {
 
         let retrieved = storage.get(key).await.unwrap();
         assert_eq!(retrieved, Bytes::from_static(b"updated"));
+    }
+
+    // --- get_stream tests ---
+
+    #[tokio::test]
+    async fn test_get_stream_returns_correct_content() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let key = "abcdef1234567890";
+        let content = Bytes::from_static(b"streaming content here");
+        storage.put(key, content.clone()).await.unwrap();
+
+        let mut stream = storage.get_stream(key).await.unwrap();
+        let mut collected = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(collected, content.as_ref());
+    }
+
+    #[tokio::test]
+    async fn test_get_stream_large_file_produces_multiple_chunks() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let key = "abcdef1234567890";
+        // Create content larger than STREAM_CHUNK_SIZE (256 KB)
+        let size = STREAM_CHUNK_SIZE * 3 + 100;
+        let content = Bytes::from(vec![0xABu8; size]);
+        storage.put(key, content.clone()).await.unwrap();
+
+        let mut stream = storage.get_stream(key).await.unwrap();
+        let mut chunk_count = 0u64;
+        let mut total_bytes = 0usize;
+        while let Some(chunk) = stream.next().await {
+            let data = chunk.unwrap();
+            total_bytes += data.len();
+            chunk_count += 1;
+        }
+        assert_eq!(total_bytes, size);
+        // Multiple chunks expected for a file > STREAM_CHUNK_SIZE
+        assert!(
+            chunk_count > 1,
+            "expected multiple chunks, got {}",
+            chunk_count
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_stream_nonexistent_key_returns_error() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let result = storage.get_stream("nonexistent-key1234").await;
+        assert!(result.is_err());
+    }
+
+    // --- put_stream tests ---
+
+    #[tokio::test]
+    async fn test_put_stream_writes_correct_content() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let key = "abcdef1234567890";
+        let chunks: Vec<Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"chunk1-")),
+            Ok(Bytes::from_static(b"chunk2-")),
+            Ok(Bytes::from_static(b"chunk3")),
+        ];
+        let stream = Box::pin(futures::stream::iter(chunks)) as BoxStream<'static, Result<Bytes>>;
+
+        let result = storage.put_stream(key, stream).await.unwrap();
+        assert_eq!(result.bytes_written, 20);
+
+        // Verify content was written correctly
+        let retrieved = storage.get(key).await.unwrap();
+        assert_eq!(retrieved.as_ref(), b"chunk1-chunk2-chunk3");
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_computes_correct_sha256() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let key = "abcdef1234567890";
+        let data = Bytes::from_static(b"hello world");
+        let stream = Box::pin(futures::stream::once(async { Ok(data) }))
+            as BoxStream<'static, Result<Bytes>>;
+
+        let result = storage.put_stream(key, stream).await.unwrap();
+        assert_eq!(
+            result.checksum_sha256,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_atomic_rename_no_temp_file_left() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let key = "abcdef1234567890";
+        let data = Bytes::from_static(b"test data");
+        let stream = Box::pin(futures::stream::once(async { Ok(data) }))
+            as BoxStream<'static, Result<Bytes>>;
+
+        storage.put_stream(key, stream).await.unwrap();
+
+        // Walk the storage directory and verify no .tmp files remain
+        let mut entries = fs::read_dir(temp_dir.path()).await.unwrap();
+        let mut tmp_files = Vec::new();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            collect_tmp_files(entry.path(), &mut tmp_files).await;
+        }
+        assert!(
+            tmp_files.is_empty(),
+            "temp files should be cleaned up after put_stream, found: {:?}",
+            tmp_files
+        );
+    }
+
+    /// Recursively collect .tmp files under a path.
+    async fn collect_tmp_files(path: PathBuf, out: &mut Vec<PathBuf>) {
+        if path.is_dir() {
+            let mut entries = fs::read_dir(&path).await.unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                Box::pin(collect_tmp_files(entry.path(), out)).await;
+            }
+        } else if path
+            .file_name()
+            .map(|n| n.to_string_lossy().contains(".tmp."))
+            .unwrap_or(false)
+        {
+            out.push(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_cleans_temp_on_stream_error() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let key = "abcdef1234567890";
+        let chunks: Vec<Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"good data")),
+            Err(AppError::Storage("simulated stream error".into())),
+        ];
+        let stream = Box::pin(futures::stream::iter(chunks)) as BoxStream<'static, Result<Bytes>>;
+
+        let result = storage.put_stream(key, stream).await;
+        assert!(result.is_err());
+
+        // Verify no temp files or final files remain
+        let mut tmp_files = Vec::new();
+        let mut entries = fs::read_dir(temp_dir.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            collect_tmp_files(entry.path(), &mut tmp_files).await;
+        }
+        assert!(
+            tmp_files.is_empty(),
+            "temp files should be cleaned up on error, found: {:?}",
+            tmp_files
+        );
+
+        // The final file should not exist either
+        assert!(!storage.exists(key).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_empty_stream() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let key = "abcdef1234567890";
+        let stream = Box::pin(futures::stream::empty()) as BoxStream<'static, Result<Bytes>>;
+
+        let result = storage.put_stream(key, stream).await.unwrap();
+        assert_eq!(result.bytes_written, 0);
+        // SHA-256 of empty input
+        assert_eq!(
+            result.checksum_sha256,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+
+        // Verify the file exists and is empty
+        let content = storage.get(key).await.unwrap();
+        assert!(content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_roundtrip_with_get_stream() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let key = "abcdef1234567890";
+        let original = b"roundtrip content for streaming test";
+        let data = Bytes::from_static(original);
+        let stream = Box::pin(futures::stream::once(async { Ok(data) }))
+            as BoxStream<'static, Result<Bytes>>;
+
+        let put_result = storage.put_stream(key, stream).await.unwrap();
+        assert_eq!(put_result.bytes_written, original.len() as u64);
+
+        // Read back via get_stream and verify
+        let mut read_stream = storage.get_stream(key).await.unwrap();
+        let mut collected = Vec::new();
+        while let Some(chunk) = read_stream.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(collected, original);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1016 / #1089 regression tests
+    //
+    // The filesystem backend previously mapped every io::Error from
+    // `fs::read` and `fs::remove_file` into `AppError::Storage`, including
+    // `ErrorKind::NotFound` (ENOENT / "os error 2"). Callers that branched
+    // on `AppError::NotFound` for cache-miss handling (notably
+    // `proxy_service::get_cached_artifact`) would never match, so a
+    // missing proxy cache key surfaced as a 500 with "os error 2" rather
+    // than as a cache miss that re-fetched from upstream. The S3 backend
+    // had the right behaviour for years; the filesystem one drifted.
+    // -----------------------------------------------------------------------
+
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_get_missing_key_returns_not_found_not_storage_error() {
+        let tmp = TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(tmp.path());
+        let err = storage.get("does-not-exist-xyz").await.unwrap_err();
+        match err {
+            AppError::NotFound(_) => {}
+            other => panic!(
+                "missing key must map to AppError::NotFound (closes #1016 / \
+                 #1089); got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_missing_key_message_mentions_key() {
+        let tmp = TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(tmp.path());
+        let key = "proxy-cache/debian/pool/main/p/php/php_7.4.deb/__content__";
+        let err = storage.get(key).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains(key),
+            "NotFound error must include the missing key for log correlation; got {:?}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_missing_key_returns_not_found_not_storage_error() {
+        let tmp = TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(tmp.path());
+        let err = storage.delete("never-existed").await.unwrap_err();
+        match err {
+            AppError::NotFound(_) => {}
+            other => panic!(
+                "delete of missing key must map to AppError::NotFound so \
+                 cache eviction can treat 'already gone' as idempotent; \
+                 got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_existing_key_round_trips() {
+        // Sanity / non-regression for the happy path of the modified
+        // map_err closure. A successful read must still return Ok(Bytes).
+        let tmp = TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(tmp.path());
+        storage
+            .put("existing-key", Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+        let bytes = storage.get("existing-key").await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"hello"));
+    }
+
+    #[tokio::test]
+    async fn test_get_then_delete_then_get_yields_not_found() {
+        // Full lifecycle: a put + get works, delete succeeds, second
+        // get returns NotFound. This is the exact sequence
+        // proxy_service::get_cached_artifact relies on to treat a
+        // cache-miss after an eviction as a real miss rather than a
+        // 500-class storage failure.
+        let tmp = TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(tmp.path());
+        storage
+            .put("lifecycle-key", Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get("lifecycle-key").await.unwrap(),
+            Bytes::from_static(b"data")
+        );
+        storage.delete("lifecycle-key").await.unwrap();
+        match storage.get("lifecycle-key").await.unwrap_err() {
+            AppError::NotFound(_) => {}
+            other => panic!("post-delete get must be NotFound, got {:?}", other),
+        }
     }
 }

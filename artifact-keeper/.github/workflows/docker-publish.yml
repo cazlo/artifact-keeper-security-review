@@ -2,7 +2,7 @@ name: Docker Publish
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, 'release/1.1.x']
     tags: ['v*']
     paths-ignore:
       - '**/*.md'
@@ -17,6 +17,20 @@ on:
         default: 'latest'
 
 permissions: {}
+
+# Concurrency rules:
+#
+# - The group is keyed by `event_name` + `ref` so push and workflow_dispatch
+#   for the same branch are in DIFFERENT groups. A manual run (`workflow_dispatch`)
+#   never gets cancelled by an auto run, and vice versa.
+# - `cancel-in-progress` is true ONLY for branch pushes (not tag pushes,
+#   not workflow_dispatch). When a new commit lands on main while an
+#   earlier auto-build is still running, the older one is cancelled so we
+#   stop building stale containers.
+# - Tag pushes (releases) and manual dispatches always run to completion.
+concurrency:
+  group: docker-publish-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   REGISTRY: ghcr.io
@@ -37,7 +51,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ak-ci-runners
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
     outputs:
@@ -58,6 +72,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Authenticate to Docker Hub before buildx so transitive `FROM`
+      # statements that pull from docker.io (e.g., the alpine:3.23 stage
+      # used to pre-seed the Grype CVE DB inside Dockerfile.backend) are
+      # not subject to the 100-pull/6h anonymous rate limit.
+      - name: Log in to Docker Hub (for transitive base-image pulls)
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
@@ -66,7 +90,7 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
           file: ./docker/Dockerfile.backend
@@ -79,6 +103,7 @@ jobs:
           provenance: mode=max
           build-args: |
             GIT_SHA=${{ github.sha }}
+            APP_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
 
       - name: Export digest
         run: |
@@ -87,7 +112,7 @@ jobs:
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: backend-digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
           path: /tmp/digests/*
@@ -105,7 +130,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ak-ci-runners
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
     outputs:
@@ -126,6 +151,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Authenticate to Docker Hub for transitive base-image pulls; see
+      # the matching step in build-backend for rationale.
+      - name: Log in to Docker Hub (for transitive base-image pulls)
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
@@ -134,7 +167,7 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
           file: ./docker/Dockerfile.openscap
@@ -153,7 +186,7 @@ jobs:
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: openscap-digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
           path: /tmp/digests/*
@@ -162,6 +195,10 @@ jobs:
 
   build-backend-alpine:
     name: Backend Alpine (${{ matrix.platform }})
+    # Alpine builds suspended. UBI is the default backend image and the
+    # only one we currently publish. Re-enable when the Alpine variant is
+    # needed again (smaller footprint, distroless-style use cases).
+    if: false
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -171,7 +208,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ak-ci-runners
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
     outputs:
@@ -200,7 +237,7 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
           file: ./docker/Dockerfile.backend.alpine
@@ -213,6 +250,7 @@ jobs:
           provenance: mode=max
           build-args: |
             GIT_SHA=${{ github.sha }}
+            APP_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
 
       - name: Export digest
         run: |
@@ -221,7 +259,7 @@ jobs:
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: backend-alpine-digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
           path: /tmp/digests/*
@@ -231,7 +269,10 @@ jobs:
   scan-containers:
     name: Security Scan
     runs-on: ubuntu-24.04
-    needs: [build-backend, build-openscap, build-backend-alpine]
+    # `build-backend-alpine` removed from `needs` while alpine builds are
+    # suspended. Re-add it (and re-enable the alpine-gated steps below)
+    # when the alpine variant comes back online.
+    needs: [build-backend, build-openscap]
     permissions:
       contents: read
       packages: read
@@ -260,21 +301,21 @@ jobs:
           name: openscap-digests-amd64
           path: /tmp/openscap-digests
 
-      - name: Download backend alpine amd64 digest
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: backend-alpine-digests-amd64
-          path: /tmp/backend-alpine-digests
+      # Alpine digest download skipped while alpine builds are suspended.
+      # - name: Download backend alpine amd64 digest
+      #   uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      #   with:
+      #     name: backend-alpine-digests-amd64
+      #     path: /tmp/backend-alpine-digests
 
       - name: Resolve image references
         id: refs
         run: |
           BACKEND_DIGEST=$(ls /tmp/backend-digests/)
           OPENSCAP_DIGEST=$(ls /tmp/openscap-digests/)
-          BACKEND_ALPINE_DIGEST=$(ls /tmp/backend-alpine-digests/)
           echo "backend=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@sha256:${BACKEND_DIGEST}" >> $GITHUB_OUTPUT
           echo "openscap=${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}@sha256:${OPENSCAP_DIGEST}" >> $GITHUB_OUTPUT
-          echo "backend-alpine=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@sha256:${BACKEND_ALPINE_DIGEST}" >> $GITHUB_OUTPUT
+          # backend-alpine digest output skipped while alpine builds are suspended.
 
       # --- Trivy CVE scanning ---
       # --ignore-unfixed: only fail on CVEs with available patches.
@@ -293,7 +334,7 @@ jobs:
           trivy --version
 
       - name: Trivy scan - Backend
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           image-ref: ${{ steps.refs.outputs.backend }}
           format: 'sarif'
@@ -304,7 +345,7 @@ jobs:
           skip-setup-trivy: true
 
       - name: Trivy scan - OpenSCAP
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         if: always()
         with:
           image-ref: ${{ steps.refs.outputs.openscap }}
@@ -315,9 +356,10 @@ jobs:
           exit-code: '0'
           skip-setup-trivy: true
 
+      # Alpine scan skipped while alpine builds are suspended.
       - name: Trivy scan - Backend Alpine
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
-        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        if: false
         with:
           image-ref: ${{ steps.refs.outputs.backend-alpine }}
           format: 'sarif'
@@ -328,28 +370,29 @@ jobs:
           skip-setup-trivy: true
 
       - name: Upload Backend Trivy SARIF
-        uses: github/codeql-action/upload-sarif@c10b8064de6f491fea524254123dbe5e09572f13 # v4
+        uses: github/codeql-action/upload-sarif@9e0d7b8d25671d64c341c19c0152d693099fb5ba # v4
         if: always()
         with:
           sarif_file: 'backend-trivy.sarif'
           category: 'trivy-backend'
 
       - name: Upload OpenSCAP Trivy SARIF
-        uses: github/codeql-action/upload-sarif@c10b8064de6f491fea524254123dbe5e09572f13 # v4
+        uses: github/codeql-action/upload-sarif@9e0d7b8d25671d64c341c19c0152d693099fb5ba # v4
         if: always()
         with:
           sarif_file: 'openscap-trivy.sarif'
           category: 'trivy-openscap'
 
+      # Alpine SARIF upload skipped while alpine builds are suspended.
       - name: Upload Backend Alpine Trivy SARIF
-        uses: github/codeql-action/upload-sarif@c10b8064de6f491fea524254123dbe5e09572f13 # v4
-        if: always()
+        uses: github/codeql-action/upload-sarif@9e0d7b8d25671d64c341c19c0152d693099fb5ba # v4
+        if: false
         with:
           sarif_file: 'backend-alpine-trivy.sarif'
           category: 'trivy-backend-alpine'
 
       - name: Upload Trivy reports
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
           name: trivy-scan-reports
@@ -409,7 +452,7 @@ jobs:
             "${SSG_DS}" || true
 
       - name: Upload STIG reports
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
           name: stig-compliance-reports
@@ -459,7 +502,7 @@ jobs:
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
@@ -486,6 +529,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
@@ -501,6 +545,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
@@ -578,7 +623,7 @@ jobs:
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
@@ -605,6 +650,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
@@ -620,6 +666,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
@@ -660,6 +707,8 @@ jobs:
 
   merge-backend-alpine:
     name: Backend Alpine Multi-Arch Manifest
+    # Alpine builds suspended; the multi-arch manifest job follows them.
+    if: false
     runs-on: ubuntu-latest
     needs: [build-backend-alpine]
     permissions:
@@ -680,7 +729,7 @@ jobs:
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
@@ -709,6 +758,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
@@ -726,6 +776,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=1.1-dev,enable=${{ github.ref == format('refs/heads/{0}', 'release/1.1.x') }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
@@ -780,6 +831,87 @@ jobs:
               ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.inspect.outputs.digest }}
           done
         continue-on-error: true
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # VERIFY-PUBLISHED: fail fast if a tag-triggered run did not actually
+  # publish the expected semver tags on ghcr.io.
+  #
+  # Background: issue #905 was filed because operators believed semver tags
+  # (1.1.7, 1.1.8) were missing on ghcr.io. The reproduction used
+  # `gh api .../packages/.../versions` without `--paginate`; that endpoint
+  # returns at most 30 versions per page sorted by recency, and the page is
+  # dominated by sha-prefixed dev/branch tags, so semver tags get pushed off
+  # the visible window. The tags were in fact present.
+  #
+  # To make the publish contract self-evident, this job probes the registry
+  # the same way consumers do (a HEAD on the manifest endpoint) and fails
+  # the workflow if any expected semver tag is missing for the current ref.
+  # That way we catch the real failure mode (a push that silently no-op'd)
+  # in the publish workflow itself, not days later via a broken helm install.
+  # ════════════════════════════════════════════════════════════════════════════
+  verify-published:
+    name: Verify Published Tags
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    # `merge-backend-alpine` removed from `needs` while alpine builds are
+    # suspended (it is `if: false` and would never report success).
+    needs: [merge-backend, merge-openscap]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Probe ghcr.io manifests for expected semver tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BACKEND_IMAGE: ${{ env.BACKEND_IMAGE }}
+          OPENSCAP_IMAGE: ${{ env.OPENSCAP_IMAGE }}
+        run: |
+          set -u
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "Verifying ghcr.io semver tags for version: ${VERSION}"
+
+          MANIFEST_ACCEPT='-H Accept:application/vnd.oci.image.index.v1+json -H Accept:application/vnd.docker.distribution.manifest.list.v2+json -H Accept:application/vnd.docker.distribution.manifest.v2+json'
+
+          probe_ghcr() {
+            local name="$1"; local tag="$2"
+            local token
+            token=$(curl -sf "https://ghcr.io/token?service=ghcr.io&scope=repository:${name}:pull" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              | jq -r '.token // empty')
+            [ -n "${token}" ] || return 1
+            # shellcheck disable=SC2086
+            curl -sfL --proto =https -o /dev/null \
+              -H "Authorization: Bearer ${token}" \
+              ${MANIFEST_ACCEPT} \
+              "https://ghcr.io/v2/${name}/manifests/${tag}"
+          }
+
+          # Tags this workflow promises to publish on a tag push. Mirror the
+          # metadata-action `tags:` blocks above. Alpine variant gets the
+          # `-alpine` suffix from the metadata-action `flavor` setting.
+          EXPECTED=(
+            "${BACKEND_IMAGE}:${VERSION}"
+            "${BACKEND_IMAGE}:${VERSION}-alpine"
+            "${OPENSCAP_IMAGE}:${VERSION}"
+          )
+
+          missing=()
+          for entry in "${EXPECTED[@]}"; do
+            name="${entry%:*}"
+            tag="${entry#*:}"
+            if probe_ghcr "${name}" "${tag}"; then
+              echo "  ok  ghcr.io/${name}:${tag}"
+            else
+              echo "::error::ghcr.io/${name}:${tag} is missing"
+              missing+=("ghcr.io/${name}:${tag}")
+            fi
+          done
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Tag-triggered publish completed but some expected semver tags are not present on ghcr.io. Inspect the merge-* jobs for silent imagetools failures."
+            printf '  - %s\n' "${missing[@]}"
+            exit 1
+          fi
+          echo "All expected ghcr.io semver tags present for ${VERSION}."
 
   summary:
     name: Publish Summary

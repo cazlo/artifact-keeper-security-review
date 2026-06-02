@@ -36,7 +36,7 @@ use sqlx::{PgPool, Row};
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
 
@@ -870,7 +870,8 @@ async fn create_modules(
     Path(repo_key): Path<String>,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Result<Response, Response> {
-    let _user_id = require_auth_basic(auth, "protobuf")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let _user_id = require_auth_basic_scope(auth, "protobuf", "write")?.user_id;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -1040,7 +1041,8 @@ async fn upload(
     Path(repo_key): Path<String>,
     axum::Json(body): axum::Json<UploadRequest>,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "protobuf")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "protobuf", "write")?.user_id;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -1379,6 +1381,15 @@ async fn download(
             }
         };
 
+        // Check quarantine status before serving
+        let artifact_id_for_check: uuid::Uuid = artifact_row.get("id");
+        crate::services::quarantine_service::check_artifact_download(
+            &state.db,
+            artifact_id_for_check,
+        )
+        .await
+        .map_err(|e| e.into_response())?;
+
         // Read bundle from local storage
         let storage_key: String = artifact_row.get("storage_key");
         let storage = state
@@ -1483,7 +1494,8 @@ async fn create_or_update_labels(
     Path(repo_key): Path<String>,
     axum::Json(body): axum::Json<CreateOrUpdateLabelsRequest>,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "protobuf")?.user_id;
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let user_id = require_auth_basic_scope(auth, "protobuf", "write")?.user_id;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;

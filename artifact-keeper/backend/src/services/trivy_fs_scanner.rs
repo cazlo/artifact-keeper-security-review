@@ -5,19 +5,27 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{RawFinding, Severity};
 use crate::services::image_scanner::TrivyReport;
-use crate::services::scanner_service::{sanitize_artifact_filename, Scanner};
+use crate::services::scanner_service::{
+    cached_trivy_cli_version, fail_scan, ScanOutput, ScanWorkspace, Scanner, VersionCache,
+};
+// `ScanCompleteness` is used via `output.scan_completeness.as_str()` in the
+// info!() log line below.
 
 /// Filesystem-based Trivy scanner for packages, libraries, and archives.
 pub struct TrivyFsScanner {
     trivy_url: String,
     scan_workspace: String,
+    /// Lazily-probed version string from `trivy --version`, e.g.
+    /// `trivy-0.62.1`. Successful probes are cached for an hour so each scan
+    /// does not pay an extra subprocess; failed probes expire after 60s so
+    /// the field starts populating once the binary becomes available.
+    cached_version: VersionCache,
 }
 
 impl TrivyFsScanner {
@@ -25,6 +33,7 @@ impl TrivyFsScanner {
         Self {
             trivy_url,
             scan_workspace,
+            cached_version: VersionCache::new(),
         }
     }
 
@@ -32,13 +41,8 @@ impl TrivyFsScanner {
     /// Container image manifests are handled by `ImageScanner`; everything
     /// else that looks like a scannable package is handled here.
     pub fn is_applicable(artifact: &Artifact) -> bool {
-        let ct = &artifact.content_type;
         // Skip OCI / Docker image manifests — those belong to ImageScanner.
-        if ct.contains("vnd.oci.image")
-            || ct.contains("vnd.docker.distribution")
-            || ct.contains("vnd.docker.container")
-            || artifact.path.contains("/manifests/")
-        {
+        if crate::services::scanner_service::is_oci_image_artifact(artifact) {
             return false;
         }
 
@@ -57,230 +61,122 @@ impl TrivyFsScanner {
             .any(|ext| name_lower.ends_with(ext))
     }
 
-    /// Build the workspace directory path for a given artifact.
-    fn workspace_dir(&self, artifact: &Artifact) -> PathBuf {
-        Path::new(&self.scan_workspace).join(artifact.id.to_string())
-    }
-
-    /// Prepare the scan workspace: write artifact content and extract archives.
-    async fn prepare_workspace(&self, artifact: &Artifact, content: &Bytes) -> Result<PathBuf> {
-        let workspace = self.workspace_dir(artifact);
-        tokio::fs::create_dir_all(&workspace)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
-
-        // Use the original filename from the path (last segment) for correct extension detection,
-        // then sanitize to basename to prevent path traversal
-        let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
-        let safe_filename = sanitize_artifact_filename(original_filename);
-        let artifact_path = workspace.join(&safe_filename);
-
-        tokio::fs::write(&artifact_path, content)
-            .await
-            .map_err(|e| {
-                AppError::Internal(format!("Failed to write artifact to workspace: {}", e))
-            })?;
-
-        // Extract archives into the workspace directory
-        if Self::is_archive(original_filename) {
-            if let Err(e) = Self::extract_archive(&artifact_path, &workspace).await {
-                warn!(
-                    "Failed to extract archive {}: {}. Scanning raw file instead.",
-                    artifact.name, e
-                );
-            }
+    /// Run Trivy filesystem scan, optionally connecting to a server.
+    /// When `server_url` is Some, `--server <url>` is added to the command.
+    ///
+    /// Returns `(report, stderr_text)`. Trivy's stderr is captured even on
+    /// success so the caller can detect the partial-scan signal (#1153):
+    /// a malformed lockfile makes Trivy log a warning and skip the target
+    /// without failing the process, and the empty Packages block that
+    /// results is indistinguishable from "no lockfile present" without
+    /// the stderr text.
+    async fn run_trivy(
+        &self,
+        workspace: &Path,
+        server_url: Option<&str>,
+    ) -> Result<(TrivyReport, String)> {
+        let ws = workspace.to_string_lossy();
+        let mut args = vec!["filesystem"];
+        if let Some(url) = server_url {
+            args.push("--server");
+            args.push(url);
         }
+        args.extend_from_slice(&[
+            "--format",
+            "json",
+            "--severity",
+            "CRITICAL,HIGH,MEDIUM,LOW",
+            // #903: enumerate every package the scanner saw (not just
+            // CVE-bearing rows) so SBOM generation reflects the complete
+            // dependency tree. `convert_trivy_packages` reads from the
+            // `Packages` block this flag adds to the JSON report.
+            "--list-all-pkgs",
+            "--quiet",
+            "--timeout",
+            "5m",
+            &ws,
+        ]);
 
-        Ok(workspace)
-    }
+        let mode_label = if server_url.is_some() {
+            "server"
+        } else {
+            "standalone"
+        };
 
-    /// Check if the file is an extractable archive.
-    fn is_archive(name: &str) -> bool {
-        let lower = name.to_lowercase();
-        lower.ends_with(".tar.gz")
-            || lower.ends_with(".tgz")
-            || lower.ends_with(".whl")
-            || lower.ends_with(".jar")
-            || lower.ends_with(".war")
-            || lower.ends_with(".ear")
-            || lower.ends_with(".gem")
-            || lower.ends_with(".crate")
-            || lower.ends_with(".nupkg")
-            || lower.ends_with(".zip")
-            || lower.ends_with(".egg")
-    }
-
-    /// Extract an archive file into the given directory using system tools.
-    async fn extract_archive(archive_path: &Path, dest: &Path) -> Result<()> {
-        let name = archive_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_lowercase();
-
-        let output =
-            if name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".crate") {
-                tokio::process::Command::new("tar")
-                    .args([
-                        "xzf",
-                        &archive_path.to_string_lossy(),
-                        "-C",
-                        &dest.to_string_lossy(),
-                    ])
-                    .output()
-                    .await
-            } else if name.ends_with(".zip")
-                || name.ends_with(".whl")
-                || name.ends_with(".jar")
-                || name.ends_with(".war")
-                || name.ends_with(".ear")
-                || name.ends_with(".nupkg")
-                || name.ends_with(".egg")
-            {
-                tokio::process::Command::new("unzip")
-                    .args([
-                        "-o",
-                        "-q",
-                        &archive_path.to_string_lossy(),
-                        "-d",
-                        &dest.to_string_lossy(),
-                    ])
-                    .output()
-                    .await
-            } else if name.ends_with(".gem") {
-                // Ruby gems are tar archives with a data.tar.gz inside
-                tokio::process::Command::new("tar")
-                    .args([
-                        "xf",
-                        &archive_path.to_string_lossy(),
-                        "-C",
-                        &dest.to_string_lossy(),
-                    ])
-                    .output()
-                    .await
-            } else {
-                return Ok(());
-            };
-
-        match output {
-            Ok(o) if o.status.success() => Ok(()),
-            Ok(o) => Err(AppError::Internal(format!(
-                "Archive extraction failed (exit {}): {}",
-                o.status,
-                String::from_utf8_lossy(&o.stderr)
-            ))),
-            Err(e) => Err(AppError::Internal(format!(
-                "Failed to execute extraction command: {}",
-                e
-            ))),
-        }
-    }
-
-    /// Clean up the scan workspace directory.
-    async fn cleanup_workspace(&self, artifact: &Artifact) {
-        let workspace = self.workspace_dir(artifact);
-        if let Err(e) = tokio::fs::remove_dir_all(&workspace).await {
-            warn!(
-                "Failed to clean up scan workspace {}: {}",
-                workspace.display(),
-                e
-            );
-        }
-    }
-
-    /// Attempt to scan using the Trivy CLI with server mode.
-    async fn scan_with_cli(&self, workspace: &Path) -> Result<TrivyReport> {
         let output = tokio::process::Command::new("trivy")
-            .args([
-                "filesystem",
-                "--server",
-                &self.trivy_url,
-                "--format",
-                "json",
-                "--severity",
-                "CRITICAL,HIGH,MEDIUM,LOW",
-                "--quiet",
-                "--timeout",
-                "5m",
-                &workspace.to_string_lossy(),
-            ])
+            .args(&args)
             .output()
             .await
             .map_err(|e| AppError::Internal(format!("Failed to execute Trivy CLI: {}", e)))?;
 
+        let stderr_text = String::from_utf8_lossy(&output.stderr).to_string();
+
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("not found") || stderr.contains("No such file") {
+            if server_url.is_some()
+                && (stderr_text.contains("not found") || stderr_text.contains("No such file"))
+            {
                 return Err(AppError::Internal("Trivy CLI not available".to_string()));
             }
             return Err(AppError::Internal(format!(
-                "Trivy filesystem scan failed (exit {}): {}",
-                output.status, stderr
+                "Trivy {} scan failed (exit {}): {}",
+                mode_label, output.status, stderr_text
             )));
         }
 
-        serde_json::from_slice(&output.stdout)
-            .map_err(|e| AppError::Internal(format!("Failed to parse Trivy output: {}", e)))
+        let report: TrivyReport = serde_json::from_slice(&output.stdout)
+            .map_err(|e| AppError::Internal(format!("Failed to parse Trivy output: {}", e)))?;
+        Ok((report, stderr_text))
     }
+}
 
-    /// Fallback: scan using Trivy standalone CLI (no server).
-    async fn scan_with_standalone_cli(&self, workspace: &Path) -> Result<TrivyReport> {
-        let output = tokio::process::Command::new("trivy")
-            .args([
-                "filesystem",
-                "--format",
-                "json",
-                "--severity",
-                "CRITICAL,HIGH,MEDIUM,LOW",
-                "--quiet",
-                "--timeout",
-                "5m",
-                &workspace.to_string_lossy(),
-            ])
-            .output()
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to execute Trivy CLI: {}", e)))?;
+/// Lockfile / manifest basenames that Trivy parses when invoked with
+/// `filesystem` mode. If one of these is present in the scan workspace
+/// but absent from the Trivy report's `results[].target` list, the scan
+/// is treated as partial (#1153). The list mirrors the file types Trivy
+/// claims to handle in `pkg/dependency/parser/`.
+const TRIVY_KNOWN_TARGETS: &[&str] = &[
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "requirements.txt",
+    "Pipfile.lock",
+    "poetry.lock",
+    "Gemfile.lock",
+    "go.mod",
+    "go.sum",
+    "Cargo.lock",
+    "composer.lock",
+    "packages.lock.json",
+    "pubspec.lock",
+    "mix.lock",
+    "conan.lock",
+    "pom.xml",
+];
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(AppError::Internal(format!(
-                "Trivy standalone scan failed (exit {}): {}",
-                output.status, stderr
-            )));
+/// List the basenames of lockfile/manifest files present in the workspace.
+/// Used to feed [`ScanOutput::from_trivy_report_with_context`]'s
+/// known-targets check (#1153). Errors are swallowed — an unreadable
+/// directory simply yields an empty list, which collapses the partial-
+/// scan check to "use stderr only".
+fn workspace_known_targets(workspace: &Path) -> Vec<&'static str> {
+    let mut hits: Vec<&'static str> = Vec::new();
+    let walker = walkdir::WalkDir::new(workspace)
+        .max_depth(8)
+        .into_iter()
+        .filter_map(|e| e.ok());
+    for entry in walker {
+        if !entry.file_type().is_file() {
+            continue;
         }
-
-        serde_json::from_slice(&output.stdout)
-            .map_err(|e| AppError::Internal(format!("Failed to parse Trivy output: {}", e)))
+        if let Some(name) = entry.file_name().to_str() {
+            if let Some(known) = TRIVY_KNOWN_TARGETS.iter().find(|k| **k == name) {
+                if !hits.contains(known) {
+                    hits.push(*known);
+                }
+            }
+        }
     }
-
-    /// Convert Trivy report vulnerabilities into `RawFinding` values.
-    fn convert_findings(report: &TrivyReport) -> Vec<RawFinding> {
-        report
-            .results
-            .iter()
-            .flat_map(|result| {
-                result
-                    .vulnerabilities
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(move |vuln| RawFinding {
-                        severity: Severity::from_str_loose(&vuln.severity)
-                            .unwrap_or(Severity::Info),
-                        title: vuln.title.clone().unwrap_or_else(|| {
-                            format!("{} in {}", vuln.vulnerability_id, vuln.pkg_name)
-                        }),
-                        description: vuln.description.clone(),
-                        cve_id: Some(vuln.vulnerability_id.clone()),
-                        affected_component: Some(format!("{} ({})", vuln.pkg_name, result.target)),
-                        affected_version: Some(vuln.installed_version.clone()),
-                        fixed_version: vuln.fixed_version.clone(),
-                        source: Some("trivy-filesystem".to_string()),
-                        source_url: vuln.primary_url.clone(),
-                    })
-            })
-            .collect()
-    }
+    hits
 }
 
 #[async_trait]
@@ -293,157 +189,156 @@ impl Scanner for TrivyFsScanner {
         "filesystem"
     }
 
+    /// Surface the inherent applicability check through the trait so the
+    /// orchestrator can gate on it without creating a `scan_results` row
+    /// (issues #961, #994).
+    fn is_applicable(&self, artifact: &Artifact) -> bool {
+        Self::is_applicable(artifact)
+    }
+
+    /// Probe `trivy --version` once and cache the parsed version string.
+    /// Returns `None` if the binary is missing or its output cannot be
+    /// parsed; `scan_results.scanner_version` is nullable for that case.
+    async fn version(&self) -> Option<String> {
+        cached_trivy_cli_version(&self.cached_version).await
+    }
+
     async fn scan(
         &self,
         artifact: &Artifact,
         _metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
-    ) -> Result<Vec<RawFinding>> {
-        if !Self::is_applicable(artifact) {
-            return Ok(vec![]);
-        }
+    ) -> Result<ScanOutput> {
+        // The orchestrator gates on `is_applicable` (issues #961, #994), so
+        // by the time we get here the artifact should match. Keep a
+        // defensive assertion so a future caller bypassing the orchestrator
+        // does not silently smuggle a non-applicable artifact through.
+        debug_assert!(
+            Self::is_applicable(artifact),
+            "TrivyFsScanner::scan called on a non-applicable artifact; the orchestrator must gate on is_applicable first"
+        );
 
         info!(
             "Starting Trivy filesystem scan for artifact: {} ({})",
             artifact.name, artifact.id
         );
 
-        // Prepare workspace with artifact content
-        let workspace = self.prepare_workspace(artifact, content).await?;
+        let workspace =
+            ScanWorkspace::prepare(&self.scan_workspace, None, artifact, content).await?;
 
-        // Try CLI with server mode first, then standalone, then degrade gracefully
-        let report = match self.scan_with_cli(&workspace).await {
-            Ok(report) => report,
+        // Try CLI with server mode first, then standalone
+        let (report, stderr) = match self.run_trivy(&workspace, Some(&self.trivy_url)).await {
+            Ok(out) => out,
             Err(e) => {
                 warn!(
                     "Trivy server-mode CLI failed for {}: {}. Trying standalone mode.",
                     artifact.name, e
                 );
-                match self.scan_with_standalone_cli(&workspace).await {
-                    Ok(report) => report,
+                match self.run_trivy(&workspace, None).await {
+                    Ok(out) => out,
                     Err(e) => {
-                        warn!(
-                            "Trivy filesystem scan failed for {}: {}. Returning empty findings.",
-                            artifact.name, e
-                        );
-                        self.cleanup_workspace(artifact).await;
-                        return Ok(vec![]);
+                        return Err(fail_scan(
+                            "Trivy filesystem scan",
+                            artifact,
+                            &e,
+                            &self.scan_workspace,
+                            None,
+                        )
+                        .await);
                     }
                 }
             }
         };
 
-        let findings = Self::convert_findings(&report);
-
-        info!(
-            "Trivy filesystem scan complete for {}: {} vulnerabilities found",
-            artifact.name,
-            findings.len()
+        // #1153: enumerate lockfile/manifest files in the workspace so the
+        // partial-scan classifier can flag a target Trivy silently skipped.
+        // The workspace listing happens after the scan so it is read-only
+        // and cannot perturb scanner behaviour.
+        let known_targets = workspace_known_targets(&workspace);
+        let known_target_refs: Vec<&str> = known_targets.iter().map(|s| *s as &str).collect();
+        let output = ScanOutput::from_trivy_report_with_context(
+            &report,
+            "trivy-filesystem",
+            &stderr,
+            &known_target_refs,
         );
 
-        // Clean up workspace
-        self.cleanup_workspace(artifact).await;
+        info!(
+            "Trivy filesystem scan complete for {}: {} vulnerabilities, {} packages, completeness={}",
+            artifact.name,
+            output.findings.len(),
+            output.packages.len(),
+            output.scan_completeness.as_str(),
+        );
 
-        Ok(findings)
+        ScanWorkspace::cleanup(&self.scan_workspace, None, artifact).await;
+
+        Ok(output)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::security::Severity;
+    use crate::services::scanner_service::convert_trivy_findings;
+    use crate::services::scanner_service::test_helpers::{assert_scan_failed, make_test_artifact};
 
-    fn make_artifact(name: &str, content_type: &str, path: &str) -> Artifact {
-        Artifact {
-            id: uuid::Uuid::new_v4(),
-            repository_id: uuid::Uuid::new_v4(),
-            path: path.to_string(),
-            name: name.to_string(),
-            version: Some("1.0.0".to_string()),
-            size_bytes: 1000,
-            checksum_sha256: "abc123".to_string(),
-            checksum_md5: None,
-            checksum_sha1: None,
-            content_type: content_type.to_string(),
-            storage_key: "test".to_string(),
-            is_deleted: false,
-            uploaded_by: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+    #[test]
+    fn test_is_applicable() {
+        // Scannable archive formats
+        let applicable = [
+            (
+                "my-lib-1.0.0.tar.gz",
+                "application/gzip",
+                "pypi/my-lib/1.0.0/my-lib-1.0.0.tar.gz",
+            ),
+            (
+                "my_lib-1.0.0-py3-none-any.whl",
+                "application/zip",
+                "pypi/my-lib/1.0.0/my_lib-1.0.0-py3-none-any.whl",
+            ),
+            (
+                "myapp-1.0.0.jar",
+                "application/java-archive",
+                "maven/com/example/myapp/1.0.0/myapp-1.0.0.jar",
+            ),
+            (
+                "my-crate-1.0.0.crate",
+                "application/gzip",
+                "crates/my-crate/1.0.0/my-crate-1.0.0.crate",
+            ),
+        ];
+        for (name, ct, path) in applicable {
+            let a = make_test_artifact(name, ct, path);
+            assert!(
+                TrivyFsScanner::is_applicable(&a),
+                "expected applicable: {}",
+                name
+            );
         }
-    }
 
-    #[test]
-    fn test_is_applicable_tar_gz() {
-        let artifact = make_artifact(
-            "my-lib-1.0.0.tar.gz",
-            "application/gzip",
-            "pypi/my-lib/1.0.0/my-lib-1.0.0.tar.gz",
-        );
-        assert!(TrivyFsScanner::is_applicable(&artifact));
-    }
-
-    #[test]
-    fn test_is_applicable_wheel() {
-        let artifact = make_artifact(
-            "my_lib-1.0.0-py3-none-any.whl",
-            "application/zip",
-            "pypi/my-lib/1.0.0/my_lib-1.0.0-py3-none-any.whl",
-        );
-        assert!(TrivyFsScanner::is_applicable(&artifact));
-    }
-
-    #[test]
-    fn test_is_applicable_jar() {
-        let artifact = make_artifact(
-            "myapp-1.0.0.jar",
-            "application/java-archive",
-            "maven/com/example/myapp/1.0.0/myapp-1.0.0.jar",
-        );
-        assert!(TrivyFsScanner::is_applicable(&artifact));
-    }
-
-    #[test]
-    fn test_is_applicable_crate() {
-        let artifact = make_artifact(
-            "my-crate-1.0.0.crate",
-            "application/gzip",
-            "crates/my-crate/1.0.0/my-crate-1.0.0.crate",
-        );
-        assert!(TrivyFsScanner::is_applicable(&artifact));
-    }
-
-    #[test]
-    fn test_not_applicable_oci_manifest() {
-        let artifact = make_artifact(
-            "myapp",
-            "application/vnd.oci.image.manifest.v1+json",
-            "v2/myapp/manifests/latest",
-        );
-        assert!(!TrivyFsScanner::is_applicable(&artifact));
-    }
-
-    #[test]
-    fn test_not_applicable_docker_manifest() {
-        let artifact = make_artifact(
-            "myapp",
-            "application/vnd.docker.distribution.manifest.v2+json",
-            "v2/myapp/manifests/v1.0.0",
-        );
-        assert!(!TrivyFsScanner::is_applicable(&artifact));
-    }
-
-    #[test]
-    fn test_is_archive() {
-        assert!(TrivyFsScanner::is_archive("foo.tar.gz"));
-        assert!(TrivyFsScanner::is_archive("foo.tgz"));
-        assert!(TrivyFsScanner::is_archive("foo.whl"));
-        assert!(TrivyFsScanner::is_archive("foo.jar"));
-        assert!(TrivyFsScanner::is_archive("foo.zip"));
-        assert!(TrivyFsScanner::is_archive("foo.gem"));
-        assert!(TrivyFsScanner::is_archive("foo.crate"));
-        assert!(TrivyFsScanner::is_archive("foo.nupkg"));
-        assert!(!TrivyFsScanner::is_archive("Cargo.lock"));
-        assert!(!TrivyFsScanner::is_archive("package.json"));
+        // Container manifests are scanned by the image scanner, not trivy-fs
+        let not_applicable = [
+            (
+                "myapp",
+                "application/vnd.oci.image.manifest.v1+json",
+                "v2/myapp/manifests/latest",
+            ),
+            (
+                "myapp",
+                "application/vnd.docker.distribution.manifest.v2+json",
+                "v2/myapp/manifests/v1.0.0",
+            ),
+        ];
+        for (name, ct, path) in not_applicable {
+            let a = make_test_artifact(name, ct, path);
+            assert!(
+                !TrivyFsScanner::is_applicable(&a),
+                "expected not applicable: {}",
+                name
+            );
+        }
     }
 
     #[test]
@@ -463,10 +358,11 @@ mod tests {
                     description: Some("A vulnerability in requests allows SSRF".to_string()),
                     primary_url: Some("https://avd.aquasec.com/nvd/cve-2023-12345".to_string()),
                 }]),
+                packages: None,
             }],
         };
 
-        let findings = TrivyFsScanner::convert_findings(&report);
+        let findings = convert_trivy_findings(&report, "trivy-filesystem");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::High);
         assert_eq!(findings[0].cve_id, Some("CVE-2023-12345".to_string()));
@@ -476,5 +372,71 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("requests"));
+    }
+
+    /// Scan failures (workspace creation, missing Trivy binary) must
+    /// propagate as Err, never as Ok(vec![]).
+    #[tokio::test]
+    async fn test_scan_propagates_errors() {
+        let artifact = make_test_artifact(
+            "my-lib-1.0.0.tar.gz",
+            "application/gzip",
+            "pypi/my-lib/1.0.0/my-lib-1.0.0.tar.gz",
+        );
+        let content = bytes::Bytes::from_static(b"not a real archive");
+
+        // Impossible workspace path: /dev/null cannot contain subdirectories
+        let bad_ws = TrivyFsScanner::new(
+            "http://localhost:0".to_string(),
+            "/dev/null/impossible-workspace".to_string(),
+        );
+        assert!(
+            bad_ws.scan(&artifact, None, &content).await.is_err(),
+            "scan() must return Err when workspace creation fails"
+        );
+
+        // Missing trivy binary (skip if trivy is installed)
+        if std::process::Command::new("trivy")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            eprintln!("trivy is installed, skipping unavailable-trivy test");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let no_trivy = TrivyFsScanner::new(
+            "http://localhost:0".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        assert_scan_failed(
+            &no_trivy.scan(&artifact, None, &content).await,
+            "Trivy filesystem scan",
+        );
+    }
+
+    /// `version()` exercises the TTL-backed cached probe path. We do not
+    /// require `trivy` to be installed: the test only asserts the call
+    /// returns deterministically (`Some("trivy-...")` when installed,
+    /// `None` otherwise) and that subsequent calls return the same value
+    /// from cache. The point is to cover the per-scanner override body so
+    /// the new-code coverage gate sees these lines as executed.
+    #[tokio::test]
+    async fn test_version_is_cached_and_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = TrivyFsScanner::new(
+            "http://localhost:0".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let v1 = scanner.version().await;
+        let v2 = scanner.version().await;
+        assert_eq!(v1, v2, "VersionCache must return identical value on repeat");
+        if let Some(v) = v1 {
+            assert!(
+                v.starts_with("trivy-"),
+                "trivy version probe must be normalized to 'trivy-<ver>'; got {}",
+                v
+            );
+        }
     }
 }

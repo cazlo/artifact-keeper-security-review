@@ -161,6 +161,13 @@ pub struct ScanResult {
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// True when this row was synthesized by `copy_scan_results` because
+    /// `find_reusable_scan` matched a prior scan with the same checksum.
+    /// No scanner was actually invoked; counts and findings were copied.
+    pub is_reused: bool,
+    /// When `is_reused` is true, the id of the source scan whose results
+    /// were copied. None for original (non-reused) scans.
+    pub source_scan_id: Option<Uuid>,
 }
 
 /// An individual vulnerability finding within a scan.
@@ -235,6 +242,23 @@ pub struct RawFinding {
     pub fixed_version: Option<String>,
     pub source: Option<String>,
     pub source_url: Option<String>,
+}
+
+/// A package observed by a scanner during inventory enumeration, regardless
+/// of whether it has any active CVEs. Persisted into `scan_packages` and
+/// consumed by SBOM generation so an artifact's component list reflects
+/// the full dependency tree, not just the CVE-bearing subset (#903).
+///
+/// `name` is the bare package identifier (e.g. `"body-parser"`); the
+/// scanner-internal context where it was discovered lives in `source_target`
+/// (e.g. `"package-lock.json"`, `"requirements.txt"`, `"Java"`).
+#[derive(Debug, Clone, Serialize)]
+pub struct RawPackage {
+    pub name: String,
+    pub version: Option<String>,
+    pub purl: Option<String>,
+    pub license: Option<String>,
+    pub source_target: Option<String>,
 }
 
 /// Result of a policy evaluation for an artifact download.
