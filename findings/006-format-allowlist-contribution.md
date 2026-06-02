@@ -1,9 +1,23 @@
 # Contribution Idea 006 — Per-Format Enable/Disable (Format Allowlist)
 
 **Type:** Feature / hardening contribution idea  
-**Status:** Not yet implemented — no existing mechanism found  
+**Status:** Still not implemented for native format route surface
 **Lift estimate:** Medium (mostly mechanical; the router structure is already clean)  
-**Subtree commit:** `fb2fcd799c9a87b49f2170f1f46bc26bb902500f`
+**Current subtree commit:** `f670ce9a010be8ca0a9eb7146f1026e9a77151e0`
+**Original reviewed subtree commit:** `fb2fcd799c9a87b49f2170f1f46bc26bb902500f`
+
+---
+
+## 2026-06-02 Revalidation
+
+The contribution idea remains valid for the built-in/native package handlers.
+
+Current receipts:
+- [`backend/src/api/routes.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/api/routes.rs#L54-L99) still mounts every native format handler unconditionally, including `/npm`, `/maven`, `/pypi`, `/cargo`, `/incus`, `/lxc`, and `/ext`.
+- [`backend/src/config.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/config.rs) still has no instance-level native format allowlist such as `enabled_formats`.
+- [`backend/src/api/handlers/plugins.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/api/handlers/plugins.rs#L45-L58) has enable/disable routes for dynamic/plugin format handlers. That is useful, but it does not reduce the built-in native handler route surface.
+
+Assessment: not resolved. This remains a good upstream hardening PR for the home-lab/startup deployment model.
 
 ---
 
@@ -195,4 +209,3 @@ Suggested title: **"feat: optional per-format enable/disable via config allowlis
 - [005-wasm-plugin-surface.md](./005-wasm-plugin-surface.md) — the WASM plugin
   handler (`/ext` prefix) would be a natural candidate for the disabled-by-default
   list; format gating provides the mechanism to enforce that
-

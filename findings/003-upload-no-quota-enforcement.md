@@ -1,8 +1,22 @@
 # Finding 003 — Disk Exhaustion: `quota_bytes` Not Enforced in Upload Path
 
-**Status:** Confirmed deployment risk (code gap — feature exists but is not wired up)  
+**Status:** Still open in current subtree (chunked upload path)
 **Severity:** Medium (authenticated user required; can fill disk on unprotected deployments)  
-**Subtree commit:** `fb2fcd799c9a87b49f2170f1f46bc26bb902500f`
+**Current subtree commit:** `f670ce9a010be8ca0a9eb7146f1026e9a77151e0`
+**Original affected subtree commit:** `fb2fcd799c9a87b49f2170f1f46bc26bb902500f`
+
+---
+
+## 2026-06-02 Revalidation
+
+This finding is not resolved for the chunked/resumable upload API.
+
+Current receipts:
+- [`backend/src/api/handlers/upload.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/api/handlers/upload.rs) resolves only the repository ID and passes the client-declared `total_size` into `UploadService::create_session()`.
+- [`backend/src/services/upload_service.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/services/upload_service.rs) validates `total_size > 0`, validates chunk size, computes chunk count, and calls `file.set_len(total_size)`, but still does not query repository `quota_bytes` or `Config::max_upload_size_bytes`.
+- [`backend/src/config.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/config.rs) defines `max_upload_size_bytes` / `MAX_UPLOAD_SIZE`, and [`backend/src/api/routes.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/api/routes.rs#L47-L105) applies it to format-handler routes. That limit does not cover `POST /api/v1/uploads` session creation or the chunked upload service's total size.
+
+Assessment: still a confirmed authenticated resource-exhaustion issue for chunked uploads. The current code may also have an overflow edge in `total_chunks` for extremely large `total_size` values because the computed chunk count is cast to `i32`; that deserves a focused follow-up test, but the quota finding does not depend on it.
 
 ---
 
@@ -138,4 +152,3 @@ And add a sensible default maximum `total_size` even when no quota is set (e.g.,
 | **Impact** | Disk exhaustion → service unavailability |
 | **Deployment condition** | Any deployment where `quota_bytes` is NULL (the default) |
 | **Upstream PR candidate** | Yes — wire `quota_bytes` check into `CreateSession` flow |
-

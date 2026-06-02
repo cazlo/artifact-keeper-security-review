@@ -1,12 +1,28 @@
 # Finding 001 — SSRF Gap: HTTP Redirects Not Re-Validated
 
-**Status:** Confirmed code-path issue  
-**Severity:** Medium (exploitable only if an upstream server can be made to redirect)  
-**Subtree commit:** `fb2fcd799c9a87b49f2170f1f46bc26bb902500f`
+**Status:** Resolved for shared-client proxy paths in current subtree
+**Severity:** Previously Medium (exploitable only if an upstream server could be made to redirect)
+**Current subtree commit:** `f670ce9a010be8ca0a9eb7146f1026e9a77151e0`
+**Original affected subtree commit:** `fb2fcd799c9a87b49f2170f1f46bc26bb902500f`
+
+---
+
+## 2026-06-02 Revalidation
+
+The redirect-follow SSRF gap is fixed in the latest backend subtree.
+
+Current receipts:
+- [`backend/src/services/http_client.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/services/http_client.rs) installs `ssrf_redirect_policy()` in `base_client_builder()`.
+- [`backend/src/api/validation.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/api/validation.rs) exposes `is_blocked_url()` for redirect-hop validation.
+- [`backend/src/services/http_client.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/services/http_client.rs#L202-L252) includes a regression test that refuses a redirect to `http://[::ffff:127.0.0.1]/admin`.
+
+Assessment: resolved for clients built through the shared `base_client_builder()`/`default_client()` path, including the core proxy fetch path. A source search still finds an ad hoc production `reqwest::Client::new()` in S3 presigned DELETE handling, plus several test-only clients, so the redirect policy is not universal across every outbound HTTP call.
 
 ---
 
 ## Summary
+
+Historical finding at `fb2fcd799c9a87b49f2170f1f46bc26bb902500f`:
 
 The centralised SSRF guard (`validate_outbound_url`) is applied to configured upstream URLs at registration time and to OCI bearer-realm URLs at token-fetch time, but **not** to the destinations of HTTP redirects that reqwest follows automatically.
 
@@ -161,4 +177,3 @@ Alternative (simpler, more conservative): disable redirects entirely for proxy r
 | **Impact** | Cloud metadata access, internal service enumeration |
 | **Deployment condition** | Any deployment where the backend has access to IMDSv1 (EC2, GCP, Azure VMs without IMDSv2 enforcement) |
 | **Upstream PR candidate** | Yes — small, targeted fix in `http_client.rs` |
-

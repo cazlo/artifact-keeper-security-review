@@ -10,11 +10,11 @@ All code under review is included as git subtrees with full history (no `--squas
 
 | Subtree prefix | Upstream repo | Pinned commit | Description |
 |---|---|---|---|
-| `artifact-keeper/` | [artifact-keeper/artifact-keeper](https://github.com/artifact-keeper/artifact-keeper) | `fb2fcd799c9a87b49f2170f1f46bc26bb902500f` | **Rust backend** — core registry server, proxy, API, DB migrations, plugin host |
-| `artifact-keeper-web/` | [artifact-keeper/artifact-keeper-web](https://github.com/artifact-keeper/artifact-keeper-web) | `10fd8569b6e91ad174867b45a971a55880029964` | **Next.js 15 frontend** — web UI dashboard (TypeScript, React 19, Tailwind) |
-| `artifact-keeper-iac/` | [artifact-keeper/artifact-keeper-iac](https://github.com/artifact-keeper/artifact-keeper-iac) | `583adb7d3f885ccb0b5e77a894ef89af374f1f96` | **Infrastructure as Code** — Helm charts, Terraform (AWS), ArgoCD, monitoring |
-| `artifact-keeper-api/` | [artifact-keeper/artifact-keeper-api](https://github.com/artifact-keeper/artifact-keeper-api) | `4d7d207f839b81ca4e11b6fb70fc7efd35d85a7d` | **OpenAPI 3.1 spec** — auto-generated API spec + SDK generators (TS, Kotlin, Swift, Rust) |
-| `artifact-keeper-example-plugin/` | [artifact-keeper/artifact-keeper-example-plugin](https://github.com/artifact-keeper/artifact-keeper-example-plugin) | `23d495209d8761dd14b71c2468c570a8b5156d28` | **Example WASM plugins** — reference format handler plugins (Unity, RPM, PyPI) |
+| `artifact-keeper/` | [artifact-keeper/artifact-keeper](https://github.com/artifact-keeper/artifact-keeper) | `f670ce9a010be8ca0a9eb7146f1026e9a77151e0` | **Rust backend** — core registry server, proxy, API, DB migrations, plugin host |
+| `artifact-keeper-web/` | [artifact-keeper/artifact-keeper-web](https://github.com/artifact-keeper/artifact-keeper-web) | `ea664a1533364194e9c20407b8a6b1ef9eac9376` | **Next.js 15 frontend** — web UI dashboard (TypeScript, React 19, Tailwind) |
+| `artifact-keeper-iac/` | [artifact-keeper/artifact-keeper-iac](https://github.com/artifact-keeper/artifact-keeper-iac) | `1ef6b7d1873151bbc5f211da3aa322ec0bf8fe4c` | **Infrastructure as Code** — Helm charts, Terraform (AWS), ArgoCD, monitoring |
+| `artifact-keeper-api/` | [artifact-keeper/artifact-keeper-api](https://github.com/artifact-keeper/artifact-keeper-api) | `5477c9225c660cec99cdc4cc66c5b26338d11f61` | **OpenAPI 3.1 spec** — auto-generated API spec + SDK generators (TS, Kotlin, Swift, Rust) |
+| `artifact-keeper-example-plugin/` | [artifact-keeper/artifact-keeper-example-plugin](https://github.com/artifact-keeper/artifact-keeper-example-plugin) | `b0a29e866389de637fef1c480ba4b9b2ac098e63` | **Example WASM plugins** — reference format handler plugins (Unity, RPM, PyPI) |
 
 ---
 
@@ -162,4 +162,4 @@ are generally higher severity or were reviewed earlier.
 | [004-k8s-service-name-allowance.md](findings/004-k8s-service-name-allowance.md) | By-design K8s service name SSRF risk |
 | [005-wasm-plugin-surface.md](findings/005-wasm-plugin-surface.md) | WASM plugin system – high-risk optional surface |
 | [006-format-allowlist-contribution.md](findings/006-format-allowlist-contribution.md) | Contribution idea: per-format enable/disable config allowlist |
-
+| [007-compliance-fips-rbac-sso.md](findings/007-compliance-fips-rbac-sso.md) | Compliance posture: FIPS, RBAC, SSO, encryption, and audit logging |

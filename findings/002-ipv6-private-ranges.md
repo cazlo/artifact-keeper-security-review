@@ -1,12 +1,28 @@
 # Finding 002 — IPv6 Private Ranges Not Blocked in SSRF Guard
 
-**Status:** Confirmed code gap  
-**Severity:** Low–Medium (depends on whether the deployment has IPv6 connectivity to internal services)  
-**Subtree commit:** `fb2fcd799c9a87b49f2170f1f46bc26bb902500f`
+**Status:** Resolved in current subtree
+**Severity:** Previously Low–Medium (depended on IPv6 connectivity to internal services)
+**Current subtree commit:** `f670ce9a010be8ca0a9eb7146f1026e9a77151e0`
+**Original affected subtree commit:** `fb2fcd799c9a87b49f2170f1f46bc26bb902500f`
+
+---
+
+## 2026-06-02 Revalidation
+
+The IPv6 private-range bypass is fixed in the latest backend subtree.
+
+Current receipts:
+- [`backend/src/api/validation.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/api/validation.rs) now blocks IPv6 link-local `fe80::/10`, unique-local `fc00::/7`, IPv4-mapped IPv6, and IPv4-compatible IPv6 forms.
+- [`backend/tests/security_regression_tests.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/tests/security_regression_tests.rs#L104-L154) includes a regression test for IPv4-mapped metadata addresses and IPv6 link-local URLs.
+- [`backend/src/api/validation.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/api/validation.rs#L962-L1042) also tests the new private-IP allowlist behavior and confirms loopback/link-local/metadata hard blocks remain in place.
+
+Assessment: resolved for literal IPv6-address inputs. DNS rebinding and hostname-to-private-IP resolution remain separate residual SSRF concerns, explicitly noted in the current validation module comments.
 
 ---
 
 ## Summary
+
+Historical finding at `fb2fcd799c9a87b49f2170f1f46bc26bb902500f`:
 
 `validate_outbound_url` blocks IPv4 private ranges (`10.x.x.x`, `172.16.x.x`, `192.168.x.x`, `169.254.x.x`, loopback, etc.) comprehensively, but for IPv6 only blocks the loopback (`::1`) and unspecified (`::`) addresses.
 
@@ -121,4 +137,3 @@ Note: `to_ipv4_mapped()` is stable since Rust 1.63. This also handles the `::fff
 | **Impact** | Internal service enumeration / access, cloud metadata via IPv6 IMDS |
 | **Deployment condition** | IPv6-enabled infrastructure; home lab or k8s cluster with ULA addresses |
 | **Upstream PR candidate** | Yes — small additive change to `validate_outbound_url` |
-

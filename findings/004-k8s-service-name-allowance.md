@@ -2,7 +2,21 @@
 
 **Status:** Deployment risk — by design, but worth explicit operator awareness  
 **Severity:** Low (requires privileged access to configure remote repos; no code bug)  
-**Subtree commit:** `fb2fcd799c9a87b49f2170f1f46bc26bb902500f`
+**Current subtree commit:** `f670ce9a010be8ca0a9eb7146f1026e9a77151e0`
+**Original reviewed subtree commit:** `fb2fcd799c9a87b49f2170f1f46bc26bb902500f`
+
+---
+
+## 2026-06-02 Revalidation
+
+This deployment risk remains by design.
+
+Current receipts:
+- [`backend/src/api/validation.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/api/validation.rs#L853-L867) still has tests confirming `http://nexus:8081/repository/pypi` and `http://nexus.tools.svc.cluster.local:8081` are allowed.
+- The same file now adds `UPSTREAM_ALLOW_PRIVATE_IPS`, `WEBHOOK_ALLOW_PRIVATE_IPS`, and `AK_SSRF_ALLOW_PRIVATE_CIDRS` controls for literal private IPs, but those do not restrict arbitrary Kubernetes service hostnames.
+- [`artifact-keeper-iac/charts/artifact-keeper/templates/networkpolicy.yaml`](https://github.com/artifact-keeper/artifact-keeper-iac/blob/1ef6b7d1873151bbc5f211da3aa322ec0bf8fe4c/charts/artifact-keeper/templates/networkpolicy.yaml#L54-L92) includes an egress policy when NetworkPolicy is enabled, but the HTTPS egress rule is port-only and not a registry hostname/IP allowlist.
+
+Assessment: unchanged as a product/deployment risk. The app now has better literal-IP controls, but a repo-admin can still configure an upstream URL that names an in-cluster service unless deployment egress policy prevents the connection.
 
 ---
 
@@ -132,4 +146,3 @@ This would be a significant hardening improvement for internal-only deployments 
 | **Impact** | Internal service enumeration, proxying responses from non-registry services |
 | **Deployment condition** | Any k8s or multi-service deployment |
 | **Upstream PR candidate** | Yes — optional `allowed_upstream_prefixes` config |
-

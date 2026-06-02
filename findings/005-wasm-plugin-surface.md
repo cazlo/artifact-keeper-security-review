@@ -1,8 +1,23 @@
 # Finding 005 — WASM Plugin System: High-Risk Optional Surface
 
-**Status:** Deployment risk / high-risk optional feature  
-**Severity:** High (if used) / None (if disabled at deployment time)  
-**Subtree commit:** `fb2fcd799c9a87b49f2170f1f46bc26bb902500f`
+**Status:** Still open; current code shows authenticated-user plugin management surface
+**Severity:** High if plugin endpoints are reachable by non-admin users; otherwise High only if plugins are used
+**Current subtree commit:** `f670ce9a010be8ca0a9eb7146f1026e9a77151e0`
+**Original reviewed subtree commit:** `fb2fcd799c9a87b49f2170f1f46bc26bb902500f`
+
+---
+
+## 2026-06-02 Revalidation
+
+This finding is not resolved. The latest backend adds more structure and resource limits around the WASM runtime, but also makes the access-control concern concrete.
+
+Current receipts:
+- [`backend/src/api/routes.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/api/routes.rs#L525-L532) nests `/api/v1/plugins` behind `auth_middleware`, not `admin_middleware`.
+- [`backend/src/api/handlers/plugins.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/api/handlers/plugins.rs#L600-L670) accepts `Extension<AuthExtension>` for `install_from_git` and `install_from_zip`, but does not call `require_admin()`.
+- [`backend/src/api/handlers/plugins.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/api/handlers/plugins.rs#L1030-L1068) exposes a development-only local-filesystem install path, also gated by ordinary auth.
+- [`backend/src/services/wasm_runtime.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/services/wasm_runtime.rs#L81-L91) sets memory/table/instance limits but builds WASI with inherited stdio.
+
+Assessment: for the intended internal package-cache use case, the plugin system should still be disabled or blocked. A focused upstream PR candidate is to move `/plugins` mutating routes behind `admin_middleware`, remove or dev-gate `/plugins/install/local`, and add a runtime `[plugins] enabled = false` setting.
 
 ---
 
@@ -64,7 +79,7 @@ The key question for WASM security is: what host functions does `wasm_bindings.r
 
 ### 3. Admin-only? Or user-installable?
 
-From `wasm_plugin_service.rs`, plugins appear to require admin/privileged access to install. If any plugin management endpoint is accessible to non-admin users, that would be a significant escalation path. **Status:** Unverified in this pass.
+At the original reviewed commit this was left unverified. In the current subtree, plugin mutating routes are gated by ordinary `auth_middleware`, not `admin_middleware`; see the 2026-06-02 revalidation receipts above. This should be treated as a concrete access-control concern until proven harmless by another policy layer.
 
 ### 4. Plugin code runs in the server process
 
@@ -111,4 +126,3 @@ Until artifact-keeper provides a clean compile-time or runtime disable flag, the
 | **Impact (if exploitable)** | Remote code execution in server process |
 | **Deployment recommendation** | Do not install plugins; await upstream disable-flag |
 | **Upstream PR candidate** | Yes — `[plugins] enabled = false` config flag |
-

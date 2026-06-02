@@ -8,11 +8,11 @@ The preferred workflow is:
 1. All repositories from the [artifact-keeper org](https://github.com/artifact-keeper) are cloned as **git subtrees** (full history, no squash):  
    | Prefix | Repo | Pinned SHA |
    |---|---|---|
-   | `artifact-keeper/` | artifact-keeper/artifact-keeper | `fb2fcd799c9a87b49f2170f1f46bc26bb902500f` |
-   | `artifact-keeper-web/` | artifact-keeper/artifact-keeper-web | `10fd8569b6e91ad174867b45a971a55880029964` |
-   | `artifact-keeper-iac/` | artifact-keeper/artifact-keeper-iac | `583adb7d3f885ccb0b5e77a894ef89af374f1f96` |
-   | `artifact-keeper-api/` | artifact-keeper/artifact-keeper-api | `4d7d207f839b81ca4e11b6fb70fc7efd35d85a7d` |
-   | `artifact-keeper-example-plugin/` | artifact-keeper/artifact-keeper-example-plugin | `23d495209d8761dd14b71c2468c570a8b5156d28` |
+   | `artifact-keeper/` | artifact-keeper/artifact-keeper | `f670ce9a010be8ca0a9eb7146f1026e9a77151e0` |
+   | `artifact-keeper-web/` | artifact-keeper/artifact-keeper-web | `ea664a1533364194e9c20407b8a6b1ef9eac9376` |
+   | `artifact-keeper-iac/` | artifact-keeper/artifact-keeper-iac | `1ef6b7d1873151bbc5f211da3aa322ec0bf8fe4c` |
+   | `artifact-keeper-api/` | artifact-keeper/artifact-keeper-api | `5477c9225c660cec99cdc4cc66c5b26338d11f61` |
+   | `artifact-keeper-example-plugin/` | artifact-keeper/artifact-keeper-example-plugin | `b0a29e866389de637fef1c480ba4b9b2ac098e63` |
 
 2. Inspect the code locally. Do not browse GitHub per-file when the subtree is available.
 3. Write findings under the `findings/` directory — one markdown file per topic, numbered (e.g. `001-ssrf-redirects.md`).

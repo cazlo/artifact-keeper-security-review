@@ -1,13 +1,31 @@
 # Finding 007 — Compliance Posture: FIPS, RBAC, SSO, Encryption, and Audit Logging
 
-**Status:** Mixed — confirmed application code issues, IaC default gaps, deployment hardening recommendations  
-**Severity:** Critical (OIDC signature bypass), High (RBAC not enforced, gRPC reflection), Medium–Low (others)  
+**Status:** Mixed after latest subtree update — some high-risk items improved, gRPC reflection and several deployment gaps remain
+**Severity:** High (gRPC reflection; plugin/admin surface should be checked with finding 005), Medium–Low (others); original OIDC/RBAC findings are improved or partly resolved
 **Subtree commits:**
-- artifact-keeper: `fb2fcd799c9a87b49f2170f1f46bc26bb902500f`
-- artifact-keeper-iac: `583adb7d3f885ccb0b5e77a894ef89af374f1f96`
-- artifact-keeper-web: `10fd8569b6e91ad174867b45a971a55880029964`
+- artifact-keeper: `f670ce9a010be8ca0a9eb7146f1026e9a77151e0`
+- artifact-keeper-iac: `1ef6b7d1873151bbc5f211da3aa322ec0bf8fe4c`
+- artifact-keeper-web: `ea664a1533364194e9c20407b8a6b1ef9eac9376`
 
 **IaC license note:** The `artifact-keeper-iac` repo does not currently have a license file ([issue #59](https://github.com/artifact-keeper/artifact-keeper-iac/issues/59)). All IaC references below should be treated as **inspiration for your own deployment templates**, not as directly usable code, until a license is granted.
+
+---
+
+## 2026-06-02 Revalidation
+
+Current-state summary:
+
+| Area | Current status | Receipts |
+|---|---|---|
+| OIDC signature verification | Improved for the active `/api/v1/auth/sso/oidc/callback` path: it fetches JWKS and verifies ID token signature, issuer, audience, expiry, and nonce. The older `services/oidc_service.rs` still contains unsigned JWT payload parsing, but local search did not find it wired into current routes. | [`sso.rs` callback flow](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/api/handlers/sso.rs#L330-L343), [`validate_id_token`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/api/handlers/sso.rs#L991-L1060), [`oidc_service.rs` legacy decode](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/services/oidc_service.rs#L322-L412) |
+| Repository RBAC | Partly resolved: `PermissionService` now exists and `repo_visibility_middleware` enforces repo permissions when any rules exist for the target repository. It intentionally falls back to the old visibility/auth model when no rules exist. | [`permission_service.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/services/permission_service.rs#L109-L131), [`repo_visibility_middleware`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/api/middleware/auth.rs#L1325-L1378) |
+| gRPC reflection | Still open: reflection service is still added without auth interceptor, while the actual SBOM/CVE/policy services use interceptors. | [`main.rs` gRPC server setup](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/main.rs#L811-L846) |
+| Kubernetes NetworkPolicy | Improved relative to no policy, but backend egress still allows generic TCP/443 by port rather than an upstream registry allowlist. | [`networkpolicy.yaml`](https://github.com/artifact-keeper/artifact-keeper-iac/blob/1ef6b7d1873151bbc5f211da3aa322ec0bf8fe4c/charts/artifact-keeper/templates/networkpolicy.yaml#L54-L92) |
+| Upload/resource limits | `MAX_UPLOAD_SIZE` is present for format-handler routes, but chunked upload total-size/quota enforcement remains open; see finding 003. | [`routes.rs`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/api/routes.rs#L47-L105), [finding 003](./003-upload-no-quota-enforcement.md) |
+
+Assessment: the most important positive changes are OIDC verification in the active SSO flow and real repository permission enforcement. The most important remaining hardening work is gRPC reflection, plugin endpoint authorization (finding 005), chunked upload quota enforcement (finding 003), and tighter deployment egress controls (finding 004).
+
+The sections below preserve the first-pass analysis. Where they conflict with this revalidation table, the table is the current assessment.
 
 ---
 
@@ -31,7 +49,7 @@ These are code-level findings in the MIT-licensed backend. They represent bugs o
 
 ## A1. OIDC ID Token Signature Not Verified — CRITICAL
 
-**Status:** Confirmed code-path issue
+**Status:** Improved / likely resolved for active SSO route; vulnerable legacy service code remains
 
 The OIDC service decodes ID tokens by manually base64-decoding the JWT payload **without verifying the cryptographic signature** against the IdP's JWKS (JSON Web Key Set).
 
@@ -70,7 +88,7 @@ let claims: IdTokenClaims = serde_json::from_slice(&decoded).map_err(|e| {
 
 ## A2. RBAC Model Exists But Is Not Enforced — HIGH
 
-**Status:** Confirmed code-path gap
+**Status:** Partly resolved in current subtree for repository routes with permission rules
 
 The database schema and Rust models define a proper RBAC system with roles, permission grants (Read/Write/Delete/Admin), and per-repository scoping. However, **no middleware or handler code checks these permission grants**.
 
@@ -116,7 +134,7 @@ pub struct RoleAssignment {
 
 ## A3. gRPC Reflection Exposed Without Authentication — HIGH
 
-**Status:** Confirmed code-path issue
+**Status:** Still confirmed in current subtree
 
 The gRPC server (port 9090) exposes 3 services with 17 RPC methods (SBOM lifecycle, CVE tracking, security policy CRUD). All RPC methods require admin JWT authentication via an interceptor. However, **the gRPC reflection service is added without an interceptor**, allowing unauthenticated enumeration.
 
