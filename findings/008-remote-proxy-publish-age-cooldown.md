@@ -15,6 +15,8 @@ A remote PyPI/npm/Maven/Cargo proxy in front of public registries should be able
 
 Important nuance: this is not evidence of malice or a direct auth bypass. It is a missing security control in the remote proxy path.
 
+This does not appear to duplicate issue #472 / PR #714. That work added a quarantine period for uploaded artifacts: local `artifacts` rows can be held, released by scanner/admin action, or rejected. The remaining gap here is narrower: remote pull-through cache entries are served through `ProxyService`, are intentionally not inserted into `artifacts` because of the #1278 storage-routing fix, and do not appear to have a publish-age or remote-cache safety decision before they are served.
+
 ---
 
 ## Current Code Receipts
@@ -24,6 +26,11 @@ Important nuance: this is not evidence of malice or a direct auth bypass. It is 
 `quarantine_service.rs` describes the feature as applying when "newly uploaded artifacts" are held in `quarantined` state, with per-repo/global config keys:
 
 - [`backend/src/services/quarantine_service.rs#L1-L11`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/services/quarantine_service.rs#L1-L11)
+
+The PR that introduced this behavior is explicitly titled "quarantine period for uploaded artifacts" and describes upload-time quarantine, scanner release/reject transitions, and admin release/reject endpoints:
+
+- GitHub PR #714: https://github.com/artifact-keeper/artifact-keeper/pull/714
+- GitHub issue #472: https://github.com/artifact-keeper/artifact-keeper/issues/472
 
 The service computes quarantine expiry from local ingest time (`now + duration`), not from remote publish metadata:
 
@@ -131,6 +138,13 @@ However, I did not find a general admin/API workflow to purge a proxy-cached rem
 
 - [`backend/src/api/handlers/repositories.rs#L3074-L3101`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/api/handlers/repositories.rs#L3074-L3101)
 
+The public remote/virtual repository docs state that cached artifacts can be manually invalidated via the API, but in the pinned backend routes I found cache TTL endpoints and the internal invalidation helpers above, not a general exposed cache-invalidation route:
+
+- Docs: https://artifactkeeper.com/docs/advanced/remote-virtual/#cache-behavior
+- [`backend/src/api/handlers/repositories.rs#L208-L226`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/api/handlers/repositories.rs#L208-L226)
+
+If a cache-invalidation API exists elsewhere or is being added in a newer branch, it would help the manual purge side of this feature. It would still need to be connected to package identity/version, policy state, yanked/removed metadata, and stale-cache suppression for known-bad entries.
+
 There is also an important continuity/security tension. In the buffered proxy path, if the cache entry is expired and the upstream fetch fails, Artifact Keeper serves stale cached content when available:
 
 - [`backend/src/services/proxy_service.rs#L754-L825`](https://github.com/artifact-keeper/artifact-keeper/blob/f670ce9a010be8ca0a9eb7146f1026e9a77151e0/backend/src/services/proxy_service.rs#L754-L825)
@@ -205,6 +219,8 @@ The current Artifact Keeper quarantine feature appears to be upload/local-artifa
 - `quarantine_service` describes holding newly uploaded artifacts and computes `quarantine_until` from local `now + duration`.
 - `ArtifactService::create` applies quarantine after inserting a normal artifact row.
 - Local download helpers check `quarantine_status` / `quarantine_until` before serving.
+
+I do not think this duplicates #472 / #714. That work appears to implement upload quarantine for local artifact rows. This request is specifically for remote pull-through cache entries, where the proxy may fetch, cache, and serve an upstream package that was published only minutes ago.
 
 Remote proxy pull-through paths appear to go through `ProxyService` and proxy cache metadata/object storage. `cache_artifact` currently intentionally does not insert proxy-cached content into the `artifacts` table because of the #1278 storage-routing fix. That means remote proxy cache entries generally do not have a first-class quarantine state for existing release/reject APIs to manage.
 
@@ -306,6 +322,7 @@ Backend / API
 - LiteLLM incident reference: https://snyk.io/blog/poisoned-security-scanner-backdooring-litellm/
 - Axios incident reference: https://securitylabs.datadoghq.com/articles/axios-npm-supply-chain-compromise/
 - Current code has internal proxy-cache invalidation helpers, but I do not see a general admin/API workflow for package-version purge or upstream-yank-driven purge of proxy-cache-only entries.
+- The remote/virtual repository docs mention manual cache invalidation, but I could not find a general exposed invalidation route in the pinned backend routes. If one exists elsewhere, this feature could build on it, but it would still need package-version identity, policy state, and stale-cache suppression for known-bad entries.
 
 ## Willingness to help
 
