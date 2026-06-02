@@ -30,7 +30,7 @@ graph TB
         ING -->|/| WEB["Web Frontend<br/>Next.js 15"]
 
         BE --> PG["PostgreSQL"]
-        BE --> MS["Meilisearch"]
+        BE --> MS["OpenSearch"]
         BE --> TV["Trivy<br/>Vulnerability Scanner"]
         BE --> DT["Dependency-Track<br/>SBOM Analysis"]
         EDGE["Edge Replication"] --> BE
@@ -78,7 +78,7 @@ artifact-keeper-iac/
 │       ├── edge-deployment.yaml
 │       ├── edge-service.yaml
 │       ├── postgres-statefulset.yaml
-│       ├── meilisearch-deployment.yaml
+│       ├── opensearch-deployment.yaml
 │       ├── trivy-deployment.yaml
 │       ├── dtrack-deployment.yaml
 │       ├── ingress.yaml
@@ -141,7 +141,7 @@ graph LR
     subgraph DEV["Development"]
         D_BE["Backend x1"]
         D_PG["PostgreSQL<br/>In-Cluster"]
-        D_MS["Meilisearch"]
+        D_MS["OpenSearch"]
         D_TV["Trivy"]
         D_DT["DependencyTrack"]
     end
@@ -303,3 +303,7 @@ The deployment includes two open-source security scanning tools:
 | [artifact-keeper-web](https://github.com/artifact-keeper/artifact-keeper-web) | Web frontend (Next.js) |
 | [artifact-keeper-api](https://github.com/artifact-keeper/artifact-keeper-api) | OpenAPI spec + generated SDKs |
 | [artifact-keeper-site](https://github.com/artifact-keeper/artifact-keeper-site) | Documentation site |
+
+## License
+
+This repository is licensed under the [MIT License](LICENSE), matching the main [artifact-keeper](https://github.com/artifact-keeper/artifact-keeper) project.

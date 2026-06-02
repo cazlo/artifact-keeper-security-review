@@ -27,8 +27,10 @@ backend:
 web:
   replicaCount: 2
 
+# Edge replication: disabled by default until the artifact-keeper-edge image
+# ships on ghcr.io. See the note in values.yaml. Re-enable once published.
 edge:
-  enabled: true
+  enabled: false
   replicaCount: 1
 
 postgres:
@@ -36,9 +38,22 @@ postgres:
   auth:
     password: ""  # Override via --set or external secret
 
-meilisearch:
-  masterKey: ""  # Override via --set or external secret
-  env: "production"
+opensearch:
+  enabled: true
+  replicaCount: 1
+  disableSecurityPlugin: true
+  allowInvalidCerts: true
+  javaOpts: "-Xms1g -Xmx1g"
+  persistence:
+    enabled: true
+    size: 10Gi
+  resources:
+    requests:
+      cpu: 250m
+      memory: 2Gi
+    limits:
+      cpu: "1"
+      memory: 2Gi
 
 ingress:
   host: staging.artifactkeeper.com

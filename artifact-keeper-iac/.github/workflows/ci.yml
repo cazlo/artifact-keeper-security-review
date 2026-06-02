@@ -10,9 +10,29 @@ on:
 jobs:
   # Helm CI moved to .github/workflows/helm-ci.yml
 
+  detect-changes:
+    name: Detect Changes
+    runs-on: ak-ci-runners
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      terraform: ${{ steps.filter.outputs.terraform }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4
+        id: filter
+        with:
+          filters: |
+            terraform:
+              - 'terraform/**'
+              - '.github/workflows/ci.yml'
+
   terraform-validate:
     name: Terraform Validate (${{ matrix.env }})
-    runs-on: ubuntu-latest
+    runs-on: ak-ci-runners
+    needs: detect-changes
+    if: needs.detect-changes.outputs.terraform == 'true'
     permissions:
       contents: read
     strategy:
@@ -24,6 +44,11 @@ jobs:
 
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@5e8dbf3c6d9deaf4193ca7a8fb23f2ac83bb6c85 # v4.0.0
+        with:
+          # ARC runners do not ship Node.js. The action's wrapper shim is
+          # a Node script and fails with "env: 'node': No such file or directory".
+          # Disable the wrapper so later steps invoke the terraform binary directly.
+          terraform_wrapper: false
 
       - name: Terraform init
         run: terraform init -backend=false
@@ -35,7 +60,9 @@ jobs:
 
   terraform-fmt:
     name: Terraform Format Check
-    runs-on: ubuntu-latest
+    runs-on: ak-ci-runners
+    needs: detect-changes
+    if: needs.detect-changes.outputs.terraform == 'true'
     permissions:
       contents: read
     steps:
@@ -43,13 +70,22 @@ jobs:
 
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@5e8dbf3c6d9deaf4193ca7a8fb23f2ac83bb6c85 # v4.0.0
+        with:
+          # See note above: ARC runners lack Node.js, so the Node-based
+          # wrapper cannot run. Invoke terraform directly.
+          terraform_wrapper: false
 
       - name: Check formatting
         run: terraform fmt -check -recursive terraform/
 
   sonarcloud:
     name: SonarCloud Scan
-    runs-on: ubuntu-latest
+    runs-on: ak-ci-runners
+    # Skip on dependabot PRs: GitHub withholds secrets from dependabot
+    # runs for security reasons, so SONAR_TOKEN is empty and the scan
+    # always fails. SonarCloud provides no useful signal on dependency
+    # bumps anyway. Push events to main and human PRs still run it.
+    if: github.actor != 'dependabot[bot]'
     # SonarCloud Automatic Analysis may be enabled at the org level.
     # Until it is disabled in the SonarCloud UI (Administration > Analysis Method),
     # CI-based analysis will conflict and fail. Allow this job to fail gracefully
@@ -63,6 +99,6 @@ jobs:
           fetch-depth: 0
 
       - name: SonarCloud Scan
-        uses: SonarSource/sonarqube-scan-action@a31c9398be7ace6bbfaf30c0bd5d415f843d45e9 # v7.0.0
+        uses: SonarSource/sonarqube-scan-action@299e4b793aaa83bf2aba7c9c14bedbb485688ec4 # v7.1.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

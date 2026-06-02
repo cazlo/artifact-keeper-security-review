@@ -1,44 +1,60 @@
-# ARC v2 Runner Scale Set for E2E Tests (with Docker-in-Docker)
+# ARC v2 Runner Scale Set for heavy jobs (with privileged DinD sidecar)
 #
-# Provides Docker capability so CI jobs can run docker-compose
-# based E2E test stacks (postgres + backend + test containers).
+# Purpose
+# -------
+# Some CI jobs (helm install smoke tests against k3d, full docker-compose
+# stacks, Docker image builds with large dep trees) do not fit inside the
+# 4 CPU / 8 Gi envelope of ak-ci-runners or ak-e2e-runners. This scale set
+# gives those jobs a larger pod to run in without slowing down the rest of
+# CI or saturating the regular pools.
+#
+# Opt jobs in by setting `runs-on: ak-beefy-runners` in the workflow.
 #
 # DOCKER HUB PULL-THROUGH AND AUTH
 # --------------------------------
-# Two layers, applied independently:
-#
-# 1. dind sidecar mounts /etc/docker/daemon.json from the
-#    `dind-registry-mirror` ConfigMap (e2e/dind-registry-mirror-configmap.yaml)
-#    so dockerd routes docker.io pulls through the in-cluster
-#    artifact-keeper registry-cache where possible.
-#
-# 2. The runner container mounts the `dockerhub-pull` Secret at
-#    ~/.docker/config.json. When dockerd falls back to docker.io
-#    directly (the cache cannot serve dockerd-mirror style requests
-#    until the DOCKER_HUB_MIRROR_REPO backend feature ships), the auth
-#    raises the rate limit from 100 anonymous pulls / 6h per IP to a
-#    per-user budget. See argocd/dockerhub-pull-secret.example.yaml for
-#    how to create the Secret.
+# Mirrors the ak-ci-runners setup:
+#  1. dind sidecar mounts /etc/docker/daemon.json from the
+#     `dind-registry-mirror` ConfigMap so pulls route through the
+#     in-cluster artifact-keeper registry-cache when possible.
+#  2. The runner container mounts the `dockerhub-pull` Secret at
+#     ~/.docker/config.json so authenticated docker.io pulls bypass
+#     the anonymous rate limit when the cache cannot serve a request.
 #
 # Deployed via:
 #   kubectl apply -f e2e/dind-registry-mirror-configmap.yaml
 #   kubectl -n arc-runners create secret docker-registry dockerhub-pull ...
 #     (see argocd/dockerhub-pull-secret.example.yaml)
-#   helm upgrade --install ak-e2e-runners \
+#   helm upgrade --install ak-beefy-runners \
 #     --namespace arc-runners \
 #     --version 0.13.1 \
-#     -f argocd/arc-e2e-runners-values.yaml \
+#     -f argocd/arc-beefy-runners-values.yaml \
 #     oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
 #
-# NOTE: pin --version 0.13.1 to match the ARC controller version
-# already running on the cluster (arc-systems namespace).
+# NOTE: pin --version 0.13.1 to match the ARC controller version already
+# running on the cluster (arc-systems namespace). Chart 0.14.x renders an
+# incompatible AutoscalingRunnerSet CR that the 0.13.x controller silently
+# drops.
 #
-# Requires secret "github-token-secret" in arc-runners namespace with
-# key "github_token".
+# Requires secret "github-token-secret" in arc-runners namespace with key "github_token"
+#
+# Shape mirrors ak-ci-runners (known working) with doubled resources:
+#   - dind sidecar placed in initContainers with restartPolicy: Always
+#     (K8s native sidecar pattern, required for the 0.13 chart)
+#   - dockerd explicit args: --storage-driver=vfs (nested containers) and
+#     --group=123 (for /var/run/docker.sock ACL to the runner user)
+#   - dind-var mounted at /var/run in both runner and sidecar so the runner
+#     can talk to the socket
+#
+# Capacity check
+# --------------
+# Per-pod: 4 CPU request / 8 CPU limit, 8 Gi request / 16 Gi limit.
+# maxRunners: 5 -> peak 20 CPU / 40 Gi requested across this pool, well
+# within Rocky's 88 CPU / 164 Gi allocatable even with ak-ci-runners and
+# ak-e2e-runners fully saturated.
 
 githubConfigUrl: "https://github.com/artifact-keeper"
 githubConfigSecret: "github-token-secret"
-runnerScaleSetName: "ak-e2e-runners"
+runnerScaleSetName: "ak-beefy-runners"
 
 minRunners: 0
 maxRunners: 5
@@ -50,11 +66,16 @@ template:
       - name: dockerhub-pull
     containers:
       - name: runner
-        image: ghcr.io/artifact-keeper/ak-runner-e2e:latest
-        command: ["/home/runner/run.sh"]
+        image: ghcr.io/actions/actions-runner:latest
+        command:
+          - /bin/bash
+          - -c
+          - umask 0000 && /home/runner/run.sh
         env:
           - name: DOCKER_HOST
             value: unix:///var/run/docker.sock
+          - name: RUNNER_WAIT_FOR_DOCKER_IN_SECONDS
+            value: "120"
         volumeMounts:
           - name: work
             mountPath: /home/runner/_work
@@ -66,11 +87,11 @@ template:
             mountPath: /home/runner/.docker
         resources:
           requests:
-            cpu: "2"
-            memory: "4Gi"
-          limits:
             cpu: "4"
             memory: "8Gi"
+          limits:
+            cpu: "8"
+            memory: "16Gi"
     initContainers:
       - name: init-dockerhub-creds
         # Copy the dockerhub-pull Secret's dockerconfigjson into a
@@ -102,7 +123,7 @@ template:
           - name: docker-config-dir
             mountPath: /home/runner/.docker
       - name: init-dind-externals
-        image: ghcr.io/artifact-keeper/ak-runner-e2e:latest
+        image: ghcr.io/actions/actions-runner:latest
         command:
           - cp
           - -r
@@ -112,15 +133,12 @@ template:
           - name: dind-externals
             mountPath: /home/runner/tmpDir
       - name: dind
-        image: docker:dind
+        image: docker:27-dind
         args:
           - dockerd
           - --host=unix:///var/run/docker.sock
           - --storage-driver=vfs
           - --group=123
-        env:
-          - name: DOCKER_GROUP_GID
-            value: "123"
         restartPolicy: Always
         securityContext:
           privileged: true
@@ -129,9 +147,9 @@ template:
             command:
               - docker
               - info
-          failureThreshold: 24
-          initialDelaySeconds: 5
-          periodSeconds: 5
+          failureThreshold: 30
+          initialDelaySeconds: 3
+          periodSeconds: 3
         volumeMounts:
           - name: work
             mountPath: /home/runner/_work

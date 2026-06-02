@@ -90,11 +90,25 @@ app.kubernetes.io/component: postgres
 {{- end }}
 
 {{/*
-Meilisearch selector labels
+OpenSearch selector labels
 */}}
-{{- define "artifact-keeper.meilisearch.selectorLabels" -}}
+{{- define "artifact-keeper.opensearch.selectorLabels" -}}
 {{ include "artifact-keeper.selectorLabels" . }}
-app.kubernetes.io/component: meilisearch
+app.kubernetes.io/component: opensearch
+{{- end }}
+
+{{/*
+OpenSearch initial cluster manager nodes (comma-separated list of pod names)
+Used only when replicaCount > 1 to bootstrap a multi-node cluster.
+*/}}
+{{- define "artifact-keeper.opensearch.initialMasterNodes" -}}
+{{- $fullName := include "artifact-keeper.fullname" . -}}
+{{- $replicaCount := int .Values.opensearch.replicaCount -}}
+{{- $nodes := list -}}
+{{- range $i, $_ := until $replicaCount -}}
+{{- $nodes = append $nodes (printf "%s-opensearch-%d" $fullName $i) -}}
+{{- end -}}
+{{- join "," $nodes -}}
 {{- end }}
 
 {{/*
@@ -134,3 +148,17 @@ ServiceAccount name
 {{- default "default" .Values.backend.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{- define "artifact-keeper.validateSecrets" -}}
+{{- if not .Values.externalSecrets.enabled -}}
+{{- if eq .Values.secrets.jwtSecret "" -}}
+{{- fail "secrets.jwtSecret is required when externalSecrets is not enabled. Set it with --set secrets.jwtSecret=<value>" -}}
+{{- end -}}
+{{- if and .Values.postgres.enabled (eq .Values.postgres.auth.password "") -}}
+{{- fail "postgres.auth.password is required when postgres is enabled. Set it with --set postgres.auth.password=<value>" -}}
+{{- end -}}
+{{- if and .Values.opensearch.enabled (not .Values.opensearch.disableSecurityPlugin) (eq .Values.opensearch.auth.password "") -}}
+{{- fail "opensearch.auth.password is required when opensearch is enabled and disableSecurityPlugin is false. Set it with --set opensearch.auth.password=<value>" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
