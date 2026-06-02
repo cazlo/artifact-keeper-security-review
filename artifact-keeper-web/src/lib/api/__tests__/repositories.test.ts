@@ -1,15 +1,29 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const mockApiFetch = vi.fn();
+const mockAssertData = vi.fn(<T,>(d: T) => d);
 vi.mock("../fetch", () => ({
   apiFetch: (...args: unknown[]) => mockApiFetch(...args),
+  assertData: <T,>(d: T) => mockAssertData(d),
+  narrowEnum: <T extends string>(
+    value: string,
+    allowed: ReadonlySet<T>,
+    fallback: T,
+    warn?: string,
+  ): T => {
+    if (allowed.has(value as T)) return value as T;
+    if (warn) console.warn(warn);
+    return fallback;
+  },
 }));
 
 // Mock the SDK imports that repositoriesApi uses for other methods
+const mockGetRepository = vi.fn();
+const mockCreateRepository = vi.fn();
 vi.mock("@artifact-keeper/sdk", () => ({
   listRepositories: vi.fn(),
-  getRepository: vi.fn(),
-  createRepository: vi.fn(),
+  getRepository: (...args: unknown[]) => mockGetRepository(...args),
+  createRepository: (...args: unknown[]) => mockCreateRepository(...args),
   updateRepository: vi.fn(),
   deleteRepository: vi.fn(),
   listVirtualMembers: vi.fn(),
@@ -164,5 +178,132 @@ describe("repositoriesApi.testUpstream", () => {
     await expect(
       repositoriesApi.testUpstream("npm-proxy")
     ).rejects.toThrow("API error 500: Internal Server Error");
+  });
+});
+
+describe("repositoriesApi.create — upstream auth forwarding (regression #407)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // Minimum SDK response shape needed for `adaptRepository` after create.
+  const successResponse = {
+    data: {
+      id: "r1",
+      key: "maven-proxy",
+      name: "Maven Proxy",
+      description: null,
+      format: "maven",
+      repo_type: "remote",
+      is_public: false,
+      storage_used_bytes: 0,
+      quota_bytes: null,
+      upstream_url: "https://repo.maven.apache.org/maven2/",
+      upstream_auth_type: "basic",
+      upstream_auth_configured: true,
+      created_at: "2025-01-01",
+      updated_at: "2025-01-01",
+    },
+    error: undefined,
+  };
+
+  it("forwards upstream_auth_type/username/password to the SDK when basic auth is supplied", async () => {
+    mockCreateRepository.mockResolvedValue(successResponse);
+
+    await repositoriesApi.create({
+      key: "maven-proxy",
+      name: "Maven Proxy",
+      format: "maven",
+      repo_type: "remote",
+      upstream_url: "https://repo.maven.apache.org/maven2/",
+      upstream_auth_type: "basic",
+      upstream_username: "deploy",
+      upstream_password: "s3cret",
+    });
+
+    expect(mockCreateRepository).toHaveBeenCalledTimes(1);
+    const call = mockCreateRepository.mock.calls[0]?.[0] as { body: Record<string, unknown> };
+    expect(call).toBeDefined();
+    expect(call.body).toMatchObject({
+      upstream_auth_type: "basic",
+      upstream_username: "deploy",
+      upstream_password: "s3cret",
+    });
+  });
+
+  it("forwards upstream_auth_type/password for bearer auth (no username)", async () => {
+    mockCreateRepository.mockResolvedValue(successResponse);
+
+    await repositoriesApi.create({
+      key: "npm-proxy",
+      name: "NPM Proxy",
+      format: "npm",
+      repo_type: "remote",
+      upstream_url: "https://registry.npmjs.org/",
+      upstream_auth_type: "bearer",
+      upstream_password: "token-abc",
+    });
+
+    expect(mockCreateRepository).toHaveBeenCalledTimes(1);
+    const call = mockCreateRepository.mock.calls[0]?.[0] as { body: Record<string, unknown> };
+    expect(call.body).toMatchObject({
+      upstream_auth_type: "bearer",
+      upstream_password: "token-abc",
+    });
+  });
+
+  it("does not include auth fields when no auth is supplied", async () => {
+    mockCreateRepository.mockResolvedValue(successResponse);
+
+    await repositoriesApi.create({
+      key: "maven-anon",
+      name: "Anon Maven",
+      format: "maven",
+      repo_type: "remote",
+      upstream_url: "https://repo.maven.apache.org/maven2/",
+    });
+
+    expect(mockCreateRepository).toHaveBeenCalledTimes(1);
+    const call = mockCreateRepository.mock.calls[0]?.[0] as { body: Record<string, unknown> };
+    // These keys may be omitted entirely or set to undefined — either is fine.
+    expect(call.body.upstream_auth_type).toBeUndefined();
+    expect(call.body.upstream_username).toBeUndefined();
+    expect(call.body.upstream_password).toBeUndefined();
+  });
+});
+
+describe("repositoriesApi.narrowFormat (via get)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("warns and defaults to 'generic' when SDK reports an unknown format", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mockGetRepository.mockResolvedValue({
+      data: {
+        id: "r1",
+        key: "test-repo",
+        name: "Test",
+        description: null,
+        format: "shiny-new-format",
+        repo_type: "local",
+        is_public: false,
+        storage_used_bytes: 0,
+        quota_bytes: null,
+        upstream_url: null,
+        upstream_auth_type: null,
+        upstream_auth_configured: false,
+        created_at: "2025-01-01",
+        updated_at: "2025-01-01",
+      },
+      error: undefined,
+    });
+
+    const result = await repositoriesApi.get("test-repo");
+    expect(result.format).toBe("generic");
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringMatching(/unknown repository format "shiny-new-format"/)
+    );
+    warn.mockRestore();
   });
 });

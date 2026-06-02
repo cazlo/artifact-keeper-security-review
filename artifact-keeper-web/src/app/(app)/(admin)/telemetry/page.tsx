@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { useAuth } from "@/providers/auth-provider";
 import telemetryApi from "@/lib/api/telemetry";
+import { mutationErrorToast } from "@/lib/error-utils";
 import type { CrashReport, TelemetrySettings } from "@/types/telemetry";
 import { PageHeader } from "@/components/common/page-header";
 import { StatCard } from "@/components/common/stat-card";
@@ -103,7 +104,7 @@ export default function TelemetryPage() {
       toast.success("Settings updated");
       queryClient.invalidateQueries({ queryKey: ["telemetry-settings"] });
     },
-    onError: () => toast.error("Failed to update settings"),
+    onError: mutationErrorToast("Failed to update settings"),
   });
 
   const submitMutation = useMutation({
@@ -113,7 +114,7 @@ export default function TelemetryPage() {
       queryClient.invalidateQueries({ queryKey: ["telemetry-crashes"] });
       queryClient.invalidateQueries({ queryKey: ["telemetry-pending"] });
     },
-    onError: () => toast.error("Failed to submit crash reports"),
+    onError: mutationErrorToast("Failed to submit crash reports"),
   });
 
   const deleteMutation = useMutation({
@@ -124,7 +125,7 @@ export default function TelemetryPage() {
       queryClient.invalidateQueries({ queryKey: ["telemetry-pending"] });
       setDeleteTarget(null);
     },
-    onError: () => toast.error("Failed to delete crash report"),
+    onError: mutationErrorToast("Failed to delete crash report"),
   });
 
   function handleToggle(field: keyof TelemetrySettings, value: boolean) {
@@ -219,7 +220,7 @@ export default function TelemetryPage() {
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <div>
-                  <Label className="text-sm font-medium">
+                  <Label htmlFor="telemetry-enabled" className="text-sm font-medium">
                     Enable Telemetry
                   </Label>
                   <p className="text-xs text-muted-foreground">
@@ -227,6 +228,7 @@ export default function TelemetryPage() {
                   </p>
                 </div>
                 <Switch
+                  id="telemetry-enabled"
                   checked={settings.enabled}
                   onCheckedChange={(v) => handleToggle("enabled", v)}
                 />
@@ -234,7 +236,7 @@ export default function TelemetryPage() {
               <Separator />
               <div className="flex items-center justify-between">
                 <div>
-                  <Label className="text-sm font-medium">
+                  <Label htmlFor="telemetry-review-before-send" className="text-sm font-medium">
                     Review Before Send
                   </Label>
                   <p className="text-xs text-muted-foreground">
@@ -242,6 +244,7 @@ export default function TelemetryPage() {
                   </p>
                 </div>
                 <Switch
+                  id="telemetry-review-before-send"
                   checked={settings.review_before_send}
                   onCheckedChange={(v) =>
                     handleToggle("review_before_send", v)
@@ -251,12 +254,13 @@ export default function TelemetryPage() {
               <Separator />
               <div className="flex items-center justify-between">
                 <div>
-                  <Label className="text-sm font-medium">Include Logs</Label>
+                  <Label htmlFor="telemetry-include-logs" className="text-sm font-medium">Include Logs</Label>
                   <p className="text-xs text-muted-foreground">
                     Attach recent log lines to crash reports.
                   </p>
                 </div>
                 <Switch
+                  id="telemetry-include-logs"
                   checked={settings.include_logs}
                   onCheckedChange={(v) => handleToggle("include_logs", v)}
                 />
@@ -400,7 +404,7 @@ export default function TelemetryPage() {
                             onClick={() =>
                               submitMutation.mutate([crash.id])
                             }
-                            title="Submit"
+                            aria-label={`Submit ${crash.error_type} crash report`}
                           >
                             <Send className="size-4" />
                           </Button>
@@ -409,7 +413,7 @@ export default function TelemetryPage() {
                           variant="ghost"
                           size="sm"
                           onClick={() => setDeleteTarget(crash)}
-                          title="Delete"
+                          aria-label={`Delete ${crash.error_type} crash report`}
                         >
                           <Trash2 className="size-4 text-destructive" />
                         </Button>

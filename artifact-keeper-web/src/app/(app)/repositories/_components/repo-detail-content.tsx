@@ -1,10 +1,11 @@
 "use client";
 
 import { useState, useCallback } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowLeft,
+  Bell,
   Download,
   Trash2,
   Search,
@@ -15,19 +16,32 @@ import {
   HeartPulse,
   Layers,
   Package as PackageIcon,
+  Settings,
 } from "lucide-react";
 
 import { repositoriesApi } from "@/lib/api/repositories";
 import { artifactsApi } from "@/lib/api/artifacts";
 import securityApi from "@/lib/api/security";
-import { toUserMessage } from "@/lib/error-utils";
+import { mutationErrorToast } from "@/lib/error-utils";
+import { isActivelyQuarantined } from "@/lib/quarantine";
 import type { Artifact } from "@/types";
 import type { UpsertScanConfigRequest } from "@/types/security";
 import { SbomTabContent } from "./sbom-tab-content";
 import { SecurityTabContent } from "./security-tab-content";
 import { HealthTabContent } from "./health-tab-content";
+import { NotificationsTabContent } from "./notifications-tab-content";
 import { VirtualMembersPanel } from "./virtual-members-panel";
 import { PackagesTabContent } from "./packages-tab-content";
+import {
+  ArtifactBrowserToggle,
+  supportsGrouping,
+  type ArtifactViewMode,
+} from "./artifact-browser-toggle";
+import { MavenComponentList } from "./maven-component-list";
+import { DockerTagList } from "./docker-tag-list";
+import { QuarantineBadge } from "@/components/common/quarantine-badge";
+import { QuarantineBanner } from "@/components/common/quarantine-banner";
+import { RepoSettingsTab } from "./repo-settings-tab";
 import { formatBytes, REPO_TYPE_COLORS } from "@/lib/utils";
 import { useAuth } from "@/providers/auth-provider";
 import { toast } from "sonner";
@@ -78,6 +92,7 @@ interface RepoDetailContentProps {
 
 export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailContentProps) {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const queryClient = useQueryClient();
   const { isAuthenticated, user } = useAuth();
 
@@ -85,6 +100,14 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
   const [searchQuery, setSearchQuery] = useState("");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
+
+  // Grouped vs flat artifact-browser view (issues #254, #330).  The URL
+  // `?view=flat|grouped` query param is the source of truth so the choice
+  // survives a refresh and is shareable.  Absence falls back to the
+  // per-format default.
+  const urlView = searchParams.get("view");
+  const viewModeOverride: ArtifactViewMode | null =
+    urlView === "flat" || urlView === "grouped" ? urlView : null;
 
   // artifact detail dialog
   const [detailOpen, setDetailOpen] = useState(false);
@@ -100,13 +123,51 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
     enabled: !!repoKey,
   });
 
+  const repoFormat = repository?.format;
+  // Derive effective view mode: explicit user choice wins; otherwise default
+  // to `grouped` for formats that support grouping.
+  const viewMode: ArtifactViewMode =
+    viewModeOverride ??
+    (repoFormat && supportsGrouping(repoFormat) ? "grouped" : "flat");
+  // Server-side grouping is currently only Maven/Gradle (#254).  Docker
+  // grouping (#330) is performed client-side over the flat artifact list.
+  const useServerGrouping =
+    viewMode === "grouped" &&
+    (repoFormat === "maven" || repoFormat === "gradle");
+  const isDockerGrouped = viewMode === "grouped" && repoFormat === "docker";
+  // For Docker grouping we need all artifacts on one page so the client
+  // aggregation sees everything.  Bound by a high cap to avoid runaway
+  // responses on huge registries.
+  const effectivePageSize = isDockerGrouped ? 500 : pageSize;
+  const effectivePage = isDockerGrouped ? 1 : page;
+
+  const handleViewModeChange = useCallback(
+    (next: ArtifactViewMode) => {
+      const params = new URLSearchParams(searchParams.toString());
+      params.set("view", next);
+      // `replace` avoids polluting browser history with each toggle.
+      // `scroll: false` keeps the user anchored on the artifacts tab.
+      router.replace(`?${params.toString()}`, { scroll: false });
+      setPage(1);
+    },
+    [router, searchParams],
+  );
+
   const { data: artifactsData, isLoading: artifactsLoading } = useQuery({
-    queryKey: ["artifacts", repoKey, searchQuery, page, pageSize],
+    queryKey: [
+      "artifacts",
+      repoKey,
+      searchQuery,
+      effectivePage,
+      effectivePageSize,
+      useServerGrouping ? "grouped:maven" : "flat",
+    ],
     queryFn: () =>
-      artifactsApi.list(repoKey, {
+      artifactsApi.listGrouped(repoKey, {
         q: searchQuery || undefined,
-        per_page: pageSize,
-        page,
+        per_page: effectivePageSize,
+        page: effectivePage,
+        ...(useServerGrouping ? { group_by: "maven_component" as const } : {}),
       }),
     enabled: !!repoKey,
   });
@@ -137,9 +198,7 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
       setSelectedArtifact(null);
       toast.success("Artifact deleted");
     },
-    onError: (err: unknown) => {
-      toast.error(toUserMessage(err, "Failed to delete artifact"));
-    },
+    onError: mutationErrorToast("Failed to delete artifact"),
   });
 
   const scanArtifactMutation = useMutation({
@@ -148,9 +207,7 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
     onSuccess: (res) => {
       toast.success(`Scan queued for ${res.artifacts_queued} artifact(s).`);
     },
-    onError: (err: unknown) => {
-      toast.error(toUserMessage(err, "Failed to trigger scan"));
-    },
+    onError: mutationErrorToast("Failed to trigger scan"),
   });
 
   const scanRepoMutation = useMutation({
@@ -159,9 +216,7 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
     onSuccess: (res) => {
       toast.success(`Scan queued for ${res.artifacts_queued} artifact(s).`);
     },
-    onError: (err: unknown) => {
-      toast.error(toUserMessage(err, "Failed to trigger scan"));
-    },
+    onError: mutationErrorToast("Failed to trigger scan"),
   });
 
   const updateSecurityMutation = useMutation({
@@ -172,9 +227,7 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
       setSecForm(null); // reset to refetched defaults
       toast.success("Security settings saved");
     },
-    onError: (err: unknown) => {
-      toast.error(toUserMessage(err, "Failed to save security settings"));
-    },
+    onError: mutationErrorToast("Failed to save security settings"),
   });
 
   // --- handlers ---
@@ -211,6 +264,11 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
     [repoKey, queryClient]
   );
 
+  const handleChunkedComplete = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: ["artifacts", repoKey] });
+    queryClient.invalidateQueries({ queryKey: ["repository", repoKey] });
+  }, [repoKey, queryClient]);
+
   const showDetail = useCallback((artifact: Artifact) => {
     setSelectedArtifact(artifact);
     setDetailOpen(true);
@@ -224,16 +282,24 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
       accessor: (a) => a.name,
       sortable: true,
       cell: (a) => (
-        <button
-          className="flex items-center gap-2 text-sm font-medium text-primary hover:underline"
-          onClick={(e) => {
-            e.stopPropagation();
-            showDetail(a);
-          }}
-        >
-          <FileIcon className="size-4 text-muted-foreground" />
-          {a.name}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            className="flex items-center gap-2 text-sm font-medium text-primary hover:underline"
+            onClick={(e) => {
+              e.stopPropagation();
+              showDetail(a);
+            }}
+          >
+            <FileIcon className="size-4 text-muted-foreground" />
+            {a.name}
+          </button>
+          {isActivelyQuarantined(a) && (
+            <QuarantineBadge
+              reason={a.quarantine_reason}
+              quarantineUntil={a.quarantine_until}
+            />
+          )}
+        </div>
       ),
     },
     {
@@ -511,11 +577,23 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
               Security
             </TabsTrigger>
           )}
+          {user?.is_admin && (
+            <TabsTrigger value="notifications">
+              <Bell className="size-3.5 mr-1" />
+              Notifications
+            </TabsTrigger>
+          )}
+          {user?.is_admin && (
+            <TabsTrigger value="settings">
+              <Settings className="size-3.5 mr-1" />
+              Settings
+            </TabsTrigger>
+          )}
         </TabsList>
 
         {/* --- Artifacts Tab --- */}
         <TabsContent value="artifacts" className="mt-4 space-y-4">
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <div className="relative max-w-sm flex-1">
               <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
               <Input
@@ -528,6 +606,13 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
                 }}
               />
             </div>
+            {repoFormat && supportsGrouping(repoFormat) && (
+              <ArtifactBrowserToggle
+                value={viewMode}
+                onChange={handleViewModeChange}
+                format={repoFormat}
+              />
+            )}
             {user?.is_admin && (
               <Button
                 variant="outline"
@@ -541,22 +626,55 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
             )}
           </div>
 
-          <DataTable
-            columns={artifactColumns}
-            data={artifactsData?.items ?? []}
-            total={artifactsData?.pagination?.total}
-            page={page}
-            pageSize={pageSize}
-            onPageChange={setPage}
-            onPageSizeChange={(s) => {
-              setPageSize(s);
-              setPage(1);
-            }}
-            loading={artifactsLoading}
-            emptyMessage="No artifacts in this repository."
-            rowKey={(a) => a.id}
-            onRowClick={showDetail}
-          />
+          {/*
+            M4: SR users get an announcement when the toggle changes the
+            view mode.  `role=status` + `aria-live=polite` queues the
+            update without interrupting current speech, and `sr-only`
+            keeps it visually invisible.
+          */}
+          <div role="status" aria-live="polite" className="sr-only">
+            {viewMode === "grouped"
+              ? `Showing grouped ${repoFormat === "docker" ? "tag" : "component"} view`
+              : "Showing flat list view"}
+          </div>
+
+          {useServerGrouping ? (
+            <MavenComponentList
+              components={artifactsData?.components ?? []}
+              loading={artifactsLoading}
+              total={artifactsData?.pagination?.total}
+              emptyMessage="No Maven components could be grouped — switch to flat view to see raw files."
+            />
+          ) : isDockerGrouped ? (
+            <DockerTagList
+              artifacts={artifactsData?.items ?? []}
+              loading={artifactsLoading}
+              onTagClick={showDetail}
+              onScan={
+                user?.is_admin
+                  ? (manifest) => scanArtifactMutation.mutate(manifest.id)
+                  : undefined
+              }
+              scanPending={scanArtifactMutation.isPending}
+            />
+          ) : (
+            <DataTable
+              columns={artifactColumns}
+              data={artifactsData?.items ?? []}
+              total={artifactsData?.pagination?.total}
+              page={page}
+              pageSize={pageSize}
+              onPageChange={setPage}
+              onPageSizeChange={(s) => {
+                setPageSize(s);
+                setPage(1);
+              }}
+              loading={artifactsLoading}
+              emptyMessage="No artifacts in this repository."
+              rowKey={(a) => a.id}
+              onRowClick={showDetail}
+            />
+          )}
         </TabsContent>
 
         {/* --- Packages Tab --- */}
@@ -574,7 +692,12 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
               <h3 className="text-sm font-medium mb-4">
                 Upload an artifact to {repository.key}
               </h3>
-              <FileUpload onUpload={handleUpload} showPathInput />
+              <FileUpload
+                onUpload={handleUpload}
+                showPathInput
+                repositoryKey={repoKey}
+                onChunkedComplete={handleChunkedComplete}
+              />
             </div>
           </TabsContent>
         )}
@@ -677,6 +800,20 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
             )}
           </TabsContent>
         )}
+
+        {/* --- Notifications Tab --- */}
+        {user?.is_admin && (
+          <TabsContent value="notifications" className="mt-4">
+            <NotificationsTabContent repositoryId={repository.id} />
+          </TabsContent>
+        )}
+
+        {/* --- Settings Tab --- */}
+        {user?.is_admin && (
+          <TabsContent value="settings" className="mt-4">
+            <RepoSettingsTab repository={repository} />
+          </TabsContent>
+        )}
       </Tabs>
 
       {/* --- Artifact Detail Dialog --- */}
@@ -688,6 +825,12 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
               {selectedArtifact?.name ?? "Artifact Details"}
             </DialogTitle>
           </DialogHeader>
+          {selectedArtifact && isActivelyQuarantined(selectedArtifact) && (
+            <QuarantineBanner
+              reason={selectedArtifact.quarantine_reason}
+              quarantineUntil={selectedArtifact.quarantine_until}
+            />
+          )}
           {selectedArtifact && (
             <Tabs defaultValue="details" className="flex-1 overflow-hidden flex flex-col">
               <TabsList variant="line" className="shrink-0">
@@ -728,6 +871,20 @@ export function RepoDetailContent({ repoKey, standalone = false }: RepoDetailCon
                     label="Downloads"
                     value={selectedArtifact.download_count.toLocaleString()}
                   />
+                  {isActivelyQuarantined(selectedArtifact) && (
+                    <>
+                      <DetailRow
+                        label="Quarantine"
+                        value={selectedArtifact.quarantine_reason || "Active"}
+                      />
+                      {selectedArtifact.quarantine_until && (
+                        <DetailRow
+                          label="Quarantine Until"
+                          value={new Date(selectedArtifact.quarantine_until).toLocaleString()}
+                        />
+                      )}
+                    </>
+                  )}
                   <DetailRow
                     label="Created"
                     value={new Date(selectedArtifact.created_at).toLocaleString()}

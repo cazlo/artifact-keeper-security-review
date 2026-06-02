@@ -14,6 +14,7 @@ import {
 import { toast } from "sonner";
 
 import { serviceAccountsApi } from "@/lib/api/service-accounts";
+import { mutationErrorToast } from "@/lib/error-utils";
 import type {
   ServiceAccount,
   ServiceAccountToken,
@@ -145,7 +146,7 @@ export default function ServiceAccountsPage() {
       setCreateDescription("");
       toast.success("Service account created");
     },
-    onError: () => toast.error("Failed to create service account"),
+    onError: mutationErrorToast("Failed to create service account"),
   });
 
   const updateMutation = useMutation({
@@ -164,7 +165,7 @@ export default function ServiceAccountsPage() {
       setEditAccount(null);
       toast.success("Service account updated");
     },
-    onError: () => toast.error("Failed to update service account"),
+    onError: mutationErrorToast("Failed to update service account"),
   });
 
   const deleteMutation = useMutation({
@@ -175,7 +176,7 @@ export default function ServiceAccountsPage() {
       setDeleteAccount(null);
       toast.success("Service account deleted");
     },
-    onError: () => toast.error("Failed to delete service account"),
+    onError: mutationErrorToast("Failed to delete service account"),
   });
 
   const createTokenMutation = useMutation({
@@ -193,7 +194,7 @@ export default function ServiceAccountsPage() {
       setTokenRepoSelector({});
       toast.success("Token created");
     },
-    onError: () => toast.error("Failed to create token"),
+    onError: mutationErrorToast("Failed to create token"),
   });
 
   const revokeTokenMutation = useMutation({
@@ -207,7 +208,7 @@ export default function ServiceAccountsPage() {
       setRevokeTokenId(null);
       toast.success("Token revoked");
     },
-    onError: () => toast.error("Failed to revoke token"),
+    onError: mutationErrorToast("Failed to revoke token"),
   });
 
   // Handlers

@@ -20,6 +20,7 @@ import {
 
 import { useAuth } from "@/providers/auth-provider";
 import { ssoApi } from "@/lib/api/sso";
+import { toUserMessage, mutationErrorToast } from "@/lib/error-utils";
 import type {
   OidcConfig,
   LdapConfig,
@@ -102,7 +103,7 @@ function OidcTab() {
       toast.success("OIDC provider created successfully");
       closeDialog();
     },
-    onError: () => toast.error("Failed to create OIDC provider"),
+    onError: mutationErrorToast("Failed to create OIDC provider"),
   });
 
   const updateMutation = useMutation({
@@ -113,7 +114,7 @@ function OidcTab() {
       toast.success("OIDC provider updated successfully");
       closeDialog();
     },
-    onError: () => toast.error("Failed to update OIDC provider"),
+    onError: mutationErrorToast("Failed to update OIDC provider"),
   });
 
   const deleteMutation = useMutation({
@@ -123,7 +124,7 @@ function OidcTab() {
       toast.success("OIDC provider deleted");
       setDeleteTarget(null);
     },
-    onError: () => toast.error("Failed to delete OIDC provider"),
+    onError: mutationErrorToast("Failed to delete OIDC provider"),
   });
 
   const toggleMutation = useMutation({
@@ -131,9 +132,9 @@ function OidcTab() {
       enabled ? ssoApi.disableOidc(id) : ssoApi.enableOidc(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sso"] });
-      toast.success("Provider status updated");
+      toast.success("OIDC provider status updated");
     },
-    onError: () => toast.error("Failed to toggle provider"),
+    onError: mutationErrorToast("Failed to toggle OIDC provider"),
   });
 
   function resetForm() {
@@ -179,7 +180,15 @@ function OidcTab() {
   }
 
   function handleSubmit() {
+    // #406: When editing an existing provider, preserve attribute_mapping
+    // entries the form doesn't render (e.g. backend-managed keys set via
+    // env vars such as the OIDC redirect_uri claim). The form only knows
+    // about five fields, but the column is a JSONB blob — without the
+    // spread, the PUT wipes everything else server-side.
+    //
+    // On create there's nothing to preserve, so start fresh.
     const attributeMapping: Record<string, string> = {
+      ...(editTarget?.attribute_mapping ?? {}),
       username: usernameClaim,
       email: emailClaim,
       display_name: displayNameClaim,
@@ -187,6 +196,10 @@ function OidcTab() {
     };
     if (adminGroup) {
       attributeMapping.admin_group = adminGroup;
+    } else {
+      // Empty admin_group means the operator deliberately cleared it —
+      // drop the key so it isn't carried over from the previous state.
+      delete attributeMapping.admin_group;
     }
 
     const scopeList = scopes
@@ -281,7 +294,7 @@ function OidcTab() {
                           variant="ghost"
                           size="icon"
                           className="size-8"
-                          title={config.is_enabled ? "Disable" : "Enable"}
+                          aria-label={`${config.is_enabled ? "Disable" : "Enable"} OIDC provider ${config.name}`}
                           onClick={() =>
                             toggleMutation.mutate({
                               id: config.id,
@@ -299,6 +312,7 @@ function OidcTab() {
                           variant="ghost"
                           size="icon"
                           className="size-8"
+                          aria-label={`Edit OIDC provider ${config.name}`}
                           onClick={() => openEdit(config)}
                         >
                           <Pencil className="size-4" />
@@ -307,6 +321,7 @@ function OidcTab() {
                           variant="ghost"
                           size="icon"
                           className="size-8 text-destructive hover:text-destructive"
+                          aria-label={`Delete OIDC provider ${config.name}`}
                           onClick={() => setDeleteTarget(config)}
                         >
                           <Trash2 className="size-4" />
@@ -405,12 +420,13 @@ function OidcTab() {
 
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
-                <Label>Auto Create Users</Label>
+                <Label htmlFor="oidc-auto-create-users">Auto Create Users</Label>
                 <p className="text-xs text-muted-foreground">
                   Automatically create user accounts on first login.
                 </p>
               </div>
               <Switch
+                id="oidc-auto-create-users"
                 checked={autoCreateUsers}
                 onCheckedChange={setAutoCreateUsers}
               />
@@ -542,7 +558,7 @@ function LdapTab() {
       toast.success("LDAP provider created successfully");
       closeDialog();
     },
-    onError: () => toast.error("Failed to create LDAP provider"),
+    onError: mutationErrorToast("Failed to create LDAP provider"),
   });
 
   const updateMutation = useMutation({
@@ -553,7 +569,7 @@ function LdapTab() {
       toast.success("LDAP provider updated successfully");
       closeDialog();
     },
-    onError: () => toast.error("Failed to update LDAP provider"),
+    onError: mutationErrorToast("Failed to update LDAP provider"),
   });
 
   const deleteMutation = useMutation({
@@ -563,7 +579,7 @@ function LdapTab() {
       toast.success("LDAP provider deleted");
       setDeleteTarget(null);
     },
-    onError: () => toast.error("Failed to delete LDAP provider"),
+    onError: mutationErrorToast("Failed to delete LDAP provider"),
   });
 
   const toggleMutation = useMutation({
@@ -571,9 +587,9 @@ function LdapTab() {
       enabled ? ssoApi.disableLdap(id) : ssoApi.enableLdap(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sso"] });
-      toast.success("Provider status updated");
+      toast.success("LDAP provider status updated");
     },
-    onError: () => toast.error("Failed to toggle provider"),
+    onError: mutationErrorToast("Failed to toggle LDAP provider"),
   });
 
   const testMutation = useMutation({
@@ -589,8 +605,8 @@ function LdapTab() {
       }
       setTestingId(null);
     },
-    onError: () => {
-      toast.error("Failed to test LDAP connection");
+    onError: (err: unknown) => {
+      toast.error(toUserMessage(err, "Failed to test LDAP connection"));
       setTestingId(null);
     },
   });
@@ -751,7 +767,7 @@ function LdapTab() {
                           variant="ghost"
                           size="icon"
                           className="size-8"
-                          title="Test Connection"
+                          aria-label={`Test LDAP connection ${config.name}`}
                           disabled={testingId === config.id}
                           onClick={() => testMutation.mutate(config.id)}
                         >
@@ -765,7 +781,7 @@ function LdapTab() {
                           variant="ghost"
                           size="icon"
                           className="size-8"
-                          title={config.is_enabled ? "Disable" : "Enable"}
+                          aria-label={`${config.is_enabled ? "Disable" : "Enable"} LDAP provider ${config.name}`}
                           onClick={() =>
                             toggleMutation.mutate({
                               id: config.id,
@@ -783,6 +799,7 @@ function LdapTab() {
                           variant="ghost"
                           size="icon"
                           className="size-8"
+                          aria-label={`Edit LDAP provider ${config.name}`}
                           onClick={() => openEdit(config)}
                         >
                           <Pencil className="size-4" />
@@ -791,6 +808,7 @@ function LdapTab() {
                           variant="ghost"
                           size="icon"
                           className="size-8 text-destructive hover:text-destructive"
+                          aria-label={`Delete LDAP provider ${config.name}`}
                           onClick={() => setDeleteTarget(config)}
                         >
                           <Trash2 className="size-4" />
@@ -899,12 +917,12 @@ function LdapTab() {
 
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
-                <Label>Use STARTTLS</Label>
+                <Label htmlFor="ldap-use-starttls">Use STARTTLS</Label>
                 <p className="text-xs text-muted-foreground">
                   Upgrade the connection to TLS after connecting.
                 </p>
               </div>
-              <Switch checked={useStarttls} onCheckedChange={setUseStarttls} />
+              <Switch id="ldap-use-starttls" checked={useStarttls} onCheckedChange={setUseStarttls} />
             </div>
 
             <Separator />
@@ -1073,7 +1091,7 @@ function SamlTab() {
       toast.success("SAML provider created successfully");
       closeDialog();
     },
-    onError: () => toast.error("Failed to create SAML provider"),
+    onError: mutationErrorToast("Failed to create SAML provider"),
   });
 
   const updateMutation = useMutation({
@@ -1084,7 +1102,7 @@ function SamlTab() {
       toast.success("SAML provider updated successfully");
       closeDialog();
     },
-    onError: () => toast.error("Failed to update SAML provider"),
+    onError: mutationErrorToast("Failed to update SAML provider"),
   });
 
   const deleteMutation = useMutation({
@@ -1094,7 +1112,7 @@ function SamlTab() {
       toast.success("SAML provider deleted");
       setDeleteTarget(null);
     },
-    onError: () => toast.error("Failed to delete SAML provider"),
+    onError: mutationErrorToast("Failed to delete SAML provider"),
   });
 
   const toggleMutation = useMutation({
@@ -1102,9 +1120,9 @@ function SamlTab() {
       enabled ? ssoApi.disableSaml(id) : ssoApi.enableSaml(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["sso"] });
-      toast.success("Provider status updated");
+      toast.success("SAML provider status updated");
     },
-    onError: () => toast.error("Failed to toggle provider"),
+    onError: mutationErrorToast("Failed to toggle SAML provider"),
   });
 
   function resetForm() {
@@ -1156,7 +1174,14 @@ function SamlTab() {
   }
 
   function handleSubmit() {
+    // #406: Same wholesale-overwrite hazard as the OIDC tab — the SAML
+    // attribute_mapping column is a JSONB blob, so rebuilding it from only
+    // the four form-rendered claim inputs (username/email/display_name/
+    // groups) would wipe any extra keys the backend may have written. Spread
+    // editTarget.attribute_mapping first so unknown keys round-trip.
+    // On create there's nothing to preserve, so the spread is a no-op.
     const attributeMapping: Record<string, string> = {
+      ...(editTarget?.attribute_mapping ?? {}),
       username: usernameClaim,
       email: emailClaim,
       display_name: displayNameClaim,
@@ -1258,7 +1283,7 @@ function SamlTab() {
                           variant="ghost"
                           size="icon"
                           className="size-8"
-                          title={config.is_enabled ? "Disable" : "Enable"}
+                          aria-label={`${config.is_enabled ? "Disable" : "Enable"} SAML provider ${config.name}`}
                           onClick={() =>
                             toggleMutation.mutate({
                               id: config.id,
@@ -1276,6 +1301,7 @@ function SamlTab() {
                           variant="ghost"
                           size="icon"
                           className="size-8"
+                          aria-label={`Edit SAML provider ${config.name}`}
                           onClick={() => openEdit(config)}
                         >
                           <Pencil className="size-4" />
@@ -1284,6 +1310,7 @@ function SamlTab() {
                           variant="ghost"
                           size="icon"
                           className="size-8 text-destructive hover:text-destructive"
+                          aria-label={`Delete SAML provider ${config.name}`}
                           onClick={() => setDeleteTarget(config)}
                         >
                           <Trash2 className="size-4" />
@@ -1415,22 +1442,23 @@ function SamlTab() {
 
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
-                <Label>Sign Requests</Label>
+                <Label htmlFor="saml-sign-requests">Sign Requests</Label>
                 <p className="text-xs text-muted-foreground">
                   Sign authentication requests sent to the IdP.
                 </p>
               </div>
-              <Switch checked={signRequests} onCheckedChange={setSignRequests} />
+              <Switch id="saml-sign-requests" checked={signRequests} onCheckedChange={setSignRequests} />
             </div>
 
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
-                <Label>Require Signed Assertions</Label>
+                <Label htmlFor="saml-require-signed-assertions">Require Signed Assertions</Label>
                 <p className="text-xs text-muted-foreground">
                   Require the IdP to sign SAML assertions.
                 </p>
               </div>
               <Switch
+                id="saml-require-signed-assertions"
                 checked={requireSignedAssertions}
                 onCheckedChange={setRequireSignedAssertions}
               />

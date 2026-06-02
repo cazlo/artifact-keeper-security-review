@@ -11,6 +11,7 @@ import {
 import { toast } from "sonner";
 
 import { profileApi } from "@/lib/api/profile";
+import { mutationErrorToast } from "@/lib/error-utils";
 import type {
   ApiKey,
   AccessToken,
@@ -19,6 +20,7 @@ import type {
   CreateApiKeyResponse,
   CreateAccessTokenResponse,
 } from "@/lib/api/profile";
+import type { RepoSelector } from "@/lib/api/service-accounts";
 import { useAuth } from "@/providers/auth-provider";
 import { SCOPES } from "@/lib/constants/token";
 
@@ -76,6 +78,37 @@ function TokenPrefix({ prefix }: { prefix: string }) {
   );
 }
 
+export function renderRepoAccess(token: AccessToken) {
+  if (token.repo_selector) {
+    const parts: string[] = [];
+    if (token.repo_selector.match_formats?.length) {
+      parts.push(`${token.repo_selector.match_formats.length} format(s)`);
+    }
+    if (token.repo_selector.match_pattern) {
+      parts.push(token.repo_selector.match_pattern);
+    }
+    const labelCount = Object.keys(token.repo_selector.match_labels ?? {}).length;
+    if (labelCount > 0) {
+      parts.push(`${labelCount} label(s)`);
+    }
+    return (
+      <Badge variant="secondary" className="text-xs">
+        {parts.join(", ") || "Selector"}
+      </Badge>
+    );
+  }
+  if (token.repository_ids && token.repository_ids.length > 0) {
+    return (
+      <Badge variant="secondary" className="text-xs">
+        {token.repository_ids.length} repo(s)
+      </Badge>
+    );
+  }
+  return (
+    <span className="text-xs text-muted-foreground">All repos</span>
+  );
+}
+
 export default function AccessTokensPage() {
   const { user } = useAuth();
   const queryClient = useQueryClient();
@@ -96,6 +129,7 @@ export default function AccessTokensPage() {
   const [tokenName, setTokenName] = useState("");
   const [tokenExpiry, setTokenExpiry] = useState("90");
   const [tokenScopes, setTokenScopes] = useState<string[]>(["read"]);
+  const [tokenRepoSelector, setTokenRepoSelector] = useState<RepoSelector>({});
   const [newlyCreatedToken, setNewlyCreatedToken] = useState<string | null>(
     null
   );
@@ -123,7 +157,7 @@ export default function AccessTokensPage() {
       setKeyExpiry("90");
       toast.success("API key created");
     },
-    onError: () => toast.error("Failed to create API key"),
+    onError: mutationErrorToast("Failed to create API key"),
   });
 
   const revokeKeyMutation = useMutation({
@@ -133,7 +167,7 @@ export default function AccessTokensPage() {
       setRevokeKeyId(null);
       toast.success("API key revoked");
     },
-    onError: () => toast.error("Failed to revoke API key"),
+    onError: mutationErrorToast("Failed to revoke API key"),
   });
 
   const createTokenMutation = useMutation({
@@ -147,9 +181,10 @@ export default function AccessTokensPage() {
       setTokenName("");
       setTokenScopes(["read"]);
       setTokenExpiry("90");
+      setTokenRepoSelector({});
       toast.success("Access token created");
     },
-    onError: () => toast.error("Failed to create access token"),
+    onError: mutationErrorToast("Failed to create access token"),
   });
 
   const revokeTokenMutation = useMutation({
@@ -161,7 +196,7 @@ export default function AccessTokensPage() {
       setRevokeTokenId(null);
       toast.success("Access token revoked");
     },
-    onError: () => toast.error("Failed to revoke access token"),
+    onError: mutationErrorToast("Failed to revoke access token"),
   });
 
   // Column definitions
@@ -221,6 +256,7 @@ export default function AccessTokensPage() {
     },
     { id: "prefix", header: "Token Prefix", cell: (t) => <TokenPrefix prefix={t.token_prefix} /> },
     { id: "scopes", header: "Scopes", cell: (t) => <ScopeBadges scopes={t.scopes} /> },
+    { id: "repo_access", header: "Repo Access", cell: renderRepoAccess },
     { id: "expires", header: "Expires", accessor: (t) => t.expires_at ?? "", cell: (t) => <DateCell value={t.expires_at} /> },
     { id: "last_used", header: "Last Used", accessor: (t) => t.last_used_at ?? "", cell: (t) => <DateCell value={t.last_used_at} /> },
     { id: "created", header: "Created", accessor: (t) => t.created_at, sortable: true, cell: (t) => <DateCell value={t.created_at} /> },
@@ -304,7 +340,7 @@ export default function AccessTokensPage() {
             <div>
               <h2 className="text-lg font-semibold">Access Tokens</h2>
               <p className="text-sm text-muted-foreground">
-                Personal access tokens for CLI and CI/CD authentication.
+                Personal access tokens for CLI and CI/CD authentication. Tokens can be scoped to specific repositories.
               </p>
             </div>
             <Button onClick={() => setCreateTokenOpen(true)}>
@@ -392,11 +428,12 @@ export default function AccessTokensPage() {
             setTokenName("");
             setTokenScopes(["read"]);
             setTokenExpiry("90");
+            setTokenRepoSelector({});
             setNewlyCreatedToken(null);
           }
         }}
       >
-        <DialogContent className="sm:max-w-md">
+        <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-y-auto">
           {newlyCreatedToken ? (
             <TokenCreatedAlert
               title="Access Token Created"
@@ -420,16 +457,24 @@ export default function AccessTokensPage() {
               onScopesChange={setTokenScopes}
               availableScopes={availableScopes}
               isPending={createTokenMutation.isPending}
-              onSubmit={() =>
+              onSubmit={() => {
+                const hasSelector =
+                  (tokenRepoSelector.match_formats?.length ?? 0) > 0 ||
+                  Object.keys(tokenRepoSelector.match_labels ?? {}).length > 0 ||
+                  !!tokenRepoSelector.match_pattern;
                 createTokenMutation.mutate({
                   name: tokenName,
                   expires_in_days:
                     tokenExpiry === "0" ? undefined : Number(tokenExpiry),
                   scopes: tokenScopes,
-                })
-              }
+                  repo_selector: hasSelector ? tokenRepoSelector : undefined,
+                });
+              }}
               onCancel={() => setCreateTokenOpen(false)}
               submitLabel="Create Token"
+              showRepoSelector
+              repoSelector={tokenRepoSelector}
+              onRepoSelectorChange={setTokenRepoSelector}
             />
           )}
         </DialogContent>

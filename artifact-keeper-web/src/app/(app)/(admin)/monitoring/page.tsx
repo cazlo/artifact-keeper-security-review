@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { useAuth } from "@/providers/auth-provider";
 import monitoringApi from "@/lib/api/monitoring";
+import { mutationErrorToast } from "@/lib/error-utils";
 import type { AlertState } from "@/types/monitoring";
 import { PageHeader } from "@/components/common/page-header";
 import { EmptyState } from "@/components/common/empty-state";
@@ -106,7 +107,7 @@ export default function MonitoringPage() {
       queryClient.invalidateQueries({ queryKey: ["monitoring-alerts"] });
       queryClient.invalidateQueries({ queryKey: ["monitoring-log"] });
     },
-    onError: () => toast.error("Health check failed"),
+    onError: mutationErrorToast("Health check failed"),
   });
 
   const suppressMutation = useMutation({
@@ -117,7 +118,7 @@ export default function MonitoringPage() {
       queryClient.invalidateQueries({ queryKey: ["monitoring-alerts"] });
       setSuppressTarget(null);
     },
-    onError: () => toast.error("Failed to suppress alert"),
+    onError: mutationErrorToast("Failed to suppress alert"),
   });
 
   function handleSuppress() {
@@ -231,7 +232,7 @@ export default function MonitoringPage() {
                         variant="ghost"
                         size="sm"
                         onClick={() => setSuppressTarget(alert)}
-                        title="Suppress alerts"
+                        aria-label={`Suppress alerts for ${alert.service_name}`}
                       >
                         <BellOff className="size-4" />
                       </Button>
@@ -378,8 +379,9 @@ export default function MonitoringPage() {
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2 py-2">
-            <Label>Suppress for (hours)</Label>
+            <Label htmlFor="suppress-hours">Suppress for (hours)</Label>
             <Input
+              id="suppress-hours"
               type="number"
               min={1}
               max={168}

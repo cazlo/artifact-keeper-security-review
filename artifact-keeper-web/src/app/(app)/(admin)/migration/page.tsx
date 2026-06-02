@@ -23,9 +23,12 @@ import {
 import { toast } from "sonner";
 
 import { migrationApi } from "@/lib/api/migration";
+import { mutationErrorToast } from "@/lib/error-utils";
 import { formatBytes } from "@/lib/utils";
 import type {
+  AuthType,
   SourceConnection,
+  SourceType,
   CreateConnectionRequest,
   MigrationJob,
   MigrationItem,
@@ -112,19 +115,31 @@ function formatDuration(seconds: number): string {
 
 // -- page --
 
+// Default to Artifactory to preserve the prior backend default behavior;
+// the user can switch to Nexus before submitting.
+const INITIAL_CONN_FORM: {
+  name: string;
+  url: string;
+  auth_type: AuthType;
+  source_type: SourceType;
+  username: string;
+  token: string;
+} = {
+  name: "",
+  url: "",
+  auth_type: "api_token",
+  source_type: "artifactory",
+  username: "",
+  token: "",
+};
+
 export default function MigrationPage() {
   const queryClient = useQueryClient();
 
   // -- Connection state --
   const [createConnOpen, setCreateConnOpen] = useState(false);
   const [deleteConnId, setDeleteConnId] = useState<string | null>(null);
-  const [connForm, setConnForm] = useState({
-    name: "",
-    url: "",
-    auth_type: "api_token" as "api_token" | "basic_auth",
-    username: "",
-    token: "",
-  });
+  const [connForm, setConnForm] = useState(INITIAL_CONN_FORM);
 
   // -- Migration state --
   const [createMigOpen, setCreateMigOpen] = useState(false);
@@ -218,16 +233,10 @@ export default function MigrationPage() {
         queryKey: ["migration", "connections"],
       });
       setCreateConnOpen(false);
-      setConnForm({
-        name: "",
-        url: "",
-        auth_type: "api_token",
-        username: "",
-        token: "",
-      });
+      setConnForm(INITIAL_CONN_FORM);
       toast.success("Connection created");
     },
-    onError: () => toast.error("Failed to create connection"),
+    onError: mutationErrorToast("Failed to create connection"),
   });
 
   const deleteConnMutation = useMutation({
@@ -239,7 +248,7 @@ export default function MigrationPage() {
       setDeleteConnId(null);
       toast.success("Connection deleted");
     },
-    onError: () => toast.error("Failed to delete connection"),
+    onError: mutationErrorToast("Failed to delete connection"),
   });
 
   const testConnMutation = useMutation({
@@ -253,7 +262,7 @@ export default function MigrationPage() {
         toast.error(`Connection failed: ${result.message}`);
       }
     },
-    onError: () => toast.error("Failed to test connection"),
+    onError: mutationErrorToast("Failed to test connection"),
   });
 
   // -- Migration mutations --
@@ -270,7 +279,7 @@ export default function MigrationPage() {
       });
       toast.success("Migration job created");
     },
-    onError: () => toast.error("Failed to create migration"),
+    onError: mutationErrorToast("Failed to create migration"),
   });
 
   const startMigMutation = useMutation({
@@ -280,7 +289,7 @@ export default function MigrationPage() {
       startStream(job.id);
       toast.success("Migration started");
     },
-    onError: () => toast.error("Failed to start migration"),
+    onError: mutationErrorToast("Failed to start migration"),
   });
 
   const pauseMigMutation = useMutation({
@@ -289,7 +298,7 @@ export default function MigrationPage() {
       queryClient.invalidateQueries({ queryKey: ["migration", "jobs"] });
       toast.success("Migration paused");
     },
-    onError: () => toast.error("Failed to pause migration"),
+    onError: mutationErrorToast("Failed to pause migration"),
   });
 
   const resumeMigMutation = useMutation({
@@ -299,7 +308,7 @@ export default function MigrationPage() {
       startStream(job.id);
       toast.success("Migration resumed");
     },
-    onError: () => toast.error("Failed to resume migration"),
+    onError: mutationErrorToast("Failed to resume migration"),
   });
 
   const cancelMigMutation = useMutation({
@@ -308,7 +317,7 @@ export default function MigrationPage() {
       queryClient.invalidateQueries({ queryKey: ["migration", "jobs"] });
       toast.success("Migration cancelled");
     },
-    onError: () => toast.error("Failed to cancel migration"),
+    onError: mutationErrorToast("Failed to cancel migration"),
   });
 
   const deleteMigMutation = useMutation({
@@ -318,7 +327,7 @@ export default function MigrationPage() {
       setDeleteMigId(null);
       toast.success("Migration deleted");
     },
-    onError: () => toast.error("Failed to delete migration"),
+    onError: mutationErrorToast("Failed to delete migration"),
   });
 
   // -- Connection columns --
@@ -667,6 +676,7 @@ export default function MigrationPage() {
               <Button
                 variant="outline"
                 size="icon"
+                aria-label="Refresh migration data"
                 onClick={() => {
                   queryClient.invalidateQueries({
                     queryKey: ["migration"],
@@ -781,14 +791,7 @@ export default function MigrationPage() {
         open={createConnOpen}
         onOpenChange={(o) => {
           setCreateConnOpen(o);
-          if (!o)
-            setConnForm({
-              name: "",
-              url: "",
-              auth_type: "api_token",
-              username: "",
-              token: "",
-            });
+          if (!o) setConnForm(INITIAL_CONN_FORM);
         }}
       >
         <DialogContent className="sm:max-w-md">
@@ -806,6 +809,7 @@ export default function MigrationPage() {
                 name: connForm.name,
                 url: connForm.url,
                 auth_type: connForm.auth_type,
+                source_type: connForm.source_type,
                 credentials:
                   connForm.auth_type === "api_token"
                     ? { token: connForm.token }
@@ -842,14 +846,28 @@ export default function MigrationPage() {
               />
             </div>
             <div className="space-y-2">
+              <Label htmlFor="conn-source-type">Source Type</Label>
+              <Select
+                value={connForm.source_type}
+                onValueChange={(v) =>
+                  setConnForm((f) => ({ ...f, source_type: v as SourceType }))
+                }
+              >
+                <SelectTrigger id="conn-source-type" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="artifactory">Artifactory</SelectItem>
+                  <SelectItem value="nexus">Nexus</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
               <Label>Authentication Type</Label>
               <Select
                 value={connForm.auth_type}
                 onValueChange={(v) =>
-                  setConnForm((f) => ({
-                    ...f,
-                    auth_type: v as "api_token" | "basic_auth",
-                  }))
+                  setConnForm((f) => ({ ...f, auth_type: v as AuthType }))
                 }
               >
                 <SelectTrigger className="w-full">

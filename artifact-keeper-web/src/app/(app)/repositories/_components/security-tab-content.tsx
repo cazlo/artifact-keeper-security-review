@@ -19,7 +19,8 @@ import { toast } from "sonner";
 
 import sbomApi from "@/lib/api/sbom";
 import dtApi from "@/lib/api/dependency-track";
-import { toUserMessage } from "@/lib/error-utils";
+import { mutationErrorToast } from "@/lib/error-utils";
+import { ArtifactScansSection } from "./artifact-scans-section";
 import type { CveHistoryEntry, CveStatus } from "@/types/sbom";
 import type { Artifact } from "@/types";
 import type {
@@ -39,6 +40,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { DataTable, type DataTableColumn } from "@/components/common/data-table";
+import { VulnIdLink } from "@/components/common/vuln-id-link";
 
 // ---------------------------------------------------------------------------
 // Props
@@ -137,9 +139,7 @@ export function SecurityTabContent({ artifact }: SecurityTabContentProps) {
       queryClient.invalidateQueries({ queryKey: ["cve-history", artifact.id] });
       toast.success("CVE status updated");
     },
-    onError: (err: unknown) => {
-      toast.error(toUserMessage(err, "Failed to update CVE status"));
-    },
+    onError: mutationErrorToast("Failed to update CVE status"),
   });
 
   // -------------------------------------------------------------------------
@@ -196,9 +196,7 @@ export function SecurityTabContent({ artifact }: SecurityTabContentProps) {
       queryClient.invalidateQueries({ queryKey: ["dt-project-metrics", dtProjectUuid] });
       toast.success("Dependency-Track analysis updated");
     },
-    onError: (err: unknown) => {
-      toast.error(toUserMessage(err, "Failed to update analysis"));
-    },
+    onError: mutationErrorToast("Failed to update analysis"),
   });
 
   // -------------------------------------------------------------------------
@@ -249,10 +247,10 @@ export function SecurityTabContent({ artifact }: SecurityTabContentProps) {
   const columns: DataTableColumn<CveHistoryEntry>[] = [
     {
       id: "cve_id",
-      header: "CVE ID",
+      header: "Advisory",
       accessor: (c) => c.cve_id,
       sortable: true,
-      cell: (c) => <span className="font-medium text-sm font-mono">{c.cve_id}</span>,
+      cell: (c) => <VulnIdLink id={c.cve_id} />,
     },
     {
       id: "severity",
@@ -370,14 +368,14 @@ export function SecurityTabContent({ artifact }: SecurityTabContentProps) {
   const dtFindingsColumns: DataTableColumn<DtFinding>[] = [
     {
       id: "vulnId",
-      header: "Vuln ID",
+      header: "Advisory",
       accessor: (f) => f.vulnerability.vulnId,
       sortable: true,
       cell: (f) => (
-        <div>
-          <span className="font-medium text-sm font-mono">{f.vulnerability.vulnId}</span>
-          <span className="ml-1.5 text-xs text-muted-foreground">{f.vulnerability.source}</span>
-        </div>
+        <VulnIdLink
+          id={f.vulnerability.vulnId}
+          source={f.vulnerability.source}
+        />
       ),
     },
     {
@@ -592,6 +590,13 @@ export function SecurityTabContent({ artifact }: SecurityTabContentProps) {
           />
         </>
       )}
+
+      {/* Native scan_findings (#368) — pre-#368 the per-artifact Security
+          tab never queried scan_findings, so a user who triggered a scan
+          had to navigate to /security/scans to find it. Mounting the
+          dedicated section here makes the tab a true single-pane-of-glass. */}
+      <Separator />
+      <ArtifactScansSection artifactId={artifact.id} />
 
       {/* ----------------------------------------------------------------- */}
       {/* Dependency-Track Findings Section */}

@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import { useAuth } from "@/providers/auth-provider";
 import qualityGatesApi from "@/lib/api/quality-gates";
+import { mutationErrorToast } from "@/lib/error-utils";
 import type {
   QualityGate,
   CreateQualityGateRequest,
@@ -261,8 +262,9 @@ function GateFormDialog({
         <div className="space-y-5 py-2">
           {/* Name */}
           <div className="space-y-2">
-            <Label>Name</Label>
+            <Label htmlFor="gate-name">Name</Label>
             <Input
+              id="gate-name"
               value={form.name}
               onChange={(e) => setForm({ ...form, name: e.target.value })}
               placeholder="e.g., Production Release Gate"
@@ -271,8 +273,9 @@ function GateFormDialog({
 
           {/* Description */}
           <div className="space-y-2">
-            <Label>Description</Label>
+            <Label htmlFor="gate-description">Description</Label>
             <Input
+              id="gate-description"
               value={form.description}
               onChange={(e) => setForm({ ...form, description: e.target.value })}
               placeholder="Optional description"
@@ -284,8 +287,9 @@ function GateFormDialog({
             <Label className="text-sm font-medium">Minimum Score Thresholds (0-100)</Label>
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">Health Score</Label>
+                <Label htmlFor="gate-min-health-score" className="text-xs text-muted-foreground">Health Score</Label>
                 <Input
+                  id="gate-min-health-score"
                   type="number"
                   min={0}
                   max={100}
@@ -295,8 +299,9 @@ function GateFormDialog({
                 />
               </div>
               <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">Security Score</Label>
+                <Label htmlFor="gate-min-security-score" className="text-xs text-muted-foreground">Security Score</Label>
                 <Input
+                  id="gate-min-security-score"
                   type="number"
                   min={0}
                   max={100}
@@ -306,8 +311,9 @@ function GateFormDialog({
                 />
               </div>
               <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">Quality Score</Label>
+                <Label htmlFor="gate-min-quality-score" className="text-xs text-muted-foreground">Quality Score</Label>
                 <Input
+                  id="gate-min-quality-score"
                   type="number"
                   min={0}
                   max={100}
@@ -317,8 +323,9 @@ function GateFormDialog({
                 />
               </div>
               <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">Metadata Score</Label>
+                <Label htmlFor="gate-min-metadata-score" className="text-xs text-muted-foreground">Metadata Score</Label>
                 <Input
+                  id="gate-min-metadata-score"
                   type="number"
                   min={0}
                   max={100}
@@ -335,8 +342,9 @@ function GateFormDialog({
             <Label className="text-sm font-medium">Maximum Issue Counts</Label>
             <div className="grid grid-cols-3 gap-3">
               <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">Critical</Label>
+                <Label htmlFor="gate-max-critical" className="text-xs text-muted-foreground">Critical</Label>
                 <Input
+                  id="gate-max-critical"
                   type="number"
                   min={0}
                   value={form.max_critical_issues}
@@ -345,8 +353,9 @@ function GateFormDialog({
                 />
               </div>
               <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">High</Label>
+                <Label htmlFor="gate-max-high" className="text-xs text-muted-foreground">High</Label>
                 <Input
+                  id="gate-max-high"
                   type="number"
                   min={0}
                   value={form.max_high_issues}
@@ -355,8 +364,9 @@ function GateFormDialog({
                 />
               </div>
               <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">Medium</Label>
+                <Label htmlFor="gate-max-medium" className="text-xs text-muted-foreground">Medium</Label>
                 <Input
+                  id="gate-max-medium"
                   type="number"
                   min={0}
                   value={form.max_medium_issues}
@@ -418,6 +428,7 @@ function GateFormDialog({
                   </p>
                 </div>
                 <Switch
+                  aria-label="Enforce on Promotion"
                   checked={form.enforce_on_promotion}
                   onCheckedChange={(checked) =>
                     setForm({ ...form, enforce_on_promotion: checked })
@@ -432,6 +443,7 @@ function GateFormDialog({
                   </p>
                 </div>
                 <Switch
+                  aria-label="Enforce on Download"
                   checked={form.enforce_on_download}
                   onCheckedChange={(checked) =>
                     setForm({ ...form, enforce_on_download: checked })
@@ -492,7 +504,7 @@ export default function QualityGatesPage() {
       setCreateOpen(false);
       setCreateForm(emptyForm);
     },
-    onError: () => toast.error("Failed to create quality gate"),
+    onError: mutationErrorToast("Failed to create quality gate"),
   });
 
   const updateMutation = useMutation({
@@ -503,7 +515,7 @@ export default function QualityGatesPage() {
       queryClient.invalidateQueries({ queryKey: ["quality-gates"] });
       setEditTarget(null);
     },
-    onError: () => toast.error("Failed to update quality gate"),
+    onError: mutationErrorToast("Failed to update quality gate"),
   });
 
   const deleteMutation = useMutation({
@@ -513,7 +525,7 @@ export default function QualityGatesPage() {
       queryClient.invalidateQueries({ queryKey: ["quality-gates"] });
       setDeleteTarget(null);
     },
-    onError: () => toast.error("Failed to delete quality gate"),
+    onError: mutationErrorToast("Failed to delete quality gate"),
   });
 
   const toggleMutation = useMutation({
@@ -522,7 +534,7 @@ export default function QualityGatesPage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["quality-gates"] });
     },
-    onError: () => toast.error("Failed to update quality gate"),
+    onError: mutationErrorToast("Failed to update quality gate"),
   });
 
   // -- Helpers --
@@ -856,6 +868,7 @@ export default function QualityGatesPage() {
                     </TableCell>
                     <TableCell>
                       <Switch
+                        aria-label={`${gate.is_enabled ? "Disable" : "Enable"} gate ${gate.name}`}
                         checked={gate.is_enabled}
                         onCheckedChange={(checked) =>
                           toggleMutation.mutate({
@@ -872,7 +885,7 @@ export default function QualityGatesPage() {
                           variant="ghost"
                           size="sm"
                           onClick={() => openEdit(gate)}
-                          title="Edit"
+                          aria-label={`Edit gate ${gate.name}`}
                         >
                           <Pencil className="size-4" />
                         </Button>
@@ -880,7 +893,7 @@ export default function QualityGatesPage() {
                           variant="ghost"
                           size="sm"
                           onClick={() => setDeleteTarget(gate)}
-                          title="Delete"
+                          aria-label={`Delete gate ${gate.name}`}
                         >
                           <Trash2 className="size-4 text-destructive" />
                         </Button>

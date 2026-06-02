@@ -26,6 +26,7 @@ import {
 } from "@artifact-keeper/sdk";
 import { adminApi } from "@/lib/api/admin";
 import type { ApiKey } from "@/lib/api/profile";
+import { mutationErrorToast } from "@/lib/error-utils";
 import { invalidateGroup } from "@/lib/query-keys";
 import { useAuth } from "@/providers/auth-provider";
 import type { User, CreateUserResponse } from "@/types";
@@ -53,8 +54,10 @@ import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert";
 import { PageHeader } from "@/components/common/page-header";
 import { DataTable, type DataTableColumn } from "@/components/common/data-table";
 import { StatusBadge } from "@/components/common/status-badge";
+import { AuthSourceBadge, getAuthProviderLabel } from "@/components/common/auth-source-badge";
 import { ConfirmDialog } from "@/components/common/confirm-dialog";
 import { EmptyState } from "@/components/common/empty-state";
+import { PasswordPolicyHint } from "@/components/common/password-policy-hint";
 
 // -- helpers --
 
@@ -158,9 +161,7 @@ export default function UsersPage() {
         toast.success("User created successfully");
       }
     },
-    onError: () => {
-      toast.error("Failed to create user");
-    },
+    onError: mutationErrorToast("Failed to create user"),
   });
 
   const updateMutation = useMutation({
@@ -183,9 +184,7 @@ export default function UsersPage() {
       setEditOpen(false);
       setSelectedUser(null);
     },
-    onError: () => {
-      toast.error("Failed to update user");
-    },
+    onError: mutationErrorToast("Failed to update user"),
   });
 
   const toggleStatusMutation = useMutation({
@@ -200,9 +199,7 @@ export default function UsersPage() {
       toast.success(`User ${vars.is_active ? "enabled" : "disabled"} successfully`);
       invalidateGroup(queryClient, "users");
     },
-    onError: () => {
-      toast.error("Failed to update user status");
-    },
+    onError: mutationErrorToast("Failed to update user status"),
   });
 
   const resetPasswordMutation = useMutation({
@@ -220,9 +217,7 @@ export default function UsersPage() {
       setPasswordOpen(true);
       queryClient.invalidateQueries({ queryKey: ["admin-users"] });
     },
-    onError: () => {
-      toast.error("Failed to reset password");
-    },
+    onError: mutationErrorToast("Failed to reset password"),
   });
 
   const deleteMutation = useMutation({
@@ -236,9 +231,7 @@ export default function UsersPage() {
       setDeleteOpen(false);
       setSelectedUser(null);
     },
-    onError: () => {
-      toast.error("Failed to delete user");
-    },
+    onError: mutationErrorToast("Failed to delete user"),
   });
 
   // -- user tokens query (for the selected user) --
@@ -262,9 +255,7 @@ export default function UsersPage() {
       });
       setRevokeTokenId(null);
     },
-    onError: () => {
-      toast.error("Failed to revoke token");
-    },
+    onError: mutationErrorToast("Failed to revoke token"),
   });
 
   // -- handlers --
@@ -380,6 +371,13 @@ export default function UsersPage() {
       ),
     },
     {
+      id: "auth_source",
+      header: "Auth Source",
+      accessor: (u) => getAuthProviderLabel(u.auth_provider),
+      sortable: true,
+      cell: (u) => <AuthSourceBadge provider={u.auth_provider} />,
+    },
+    {
       id: "actions",
       header: "",
       cell: (u) => (
@@ -389,7 +387,7 @@ export default function UsersPage() {
         >
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon-xs" aria-label="View Tokens" onClick={() => handleViewTokens(u)}>
+              <Button variant="ghost" size="icon-xs" aria-label={`View tokens for ${u.username}`} onClick={() => handleViewTokens(u)}>
                 <Key className="size-3.5" />
               </Button>
             </TooltipTrigger>
@@ -397,7 +395,7 @@ export default function UsersPage() {
           </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon-xs" aria-label="Edit" onClick={() => handleEdit(u)}>
+              <Button variant="ghost" size="icon-xs" aria-label={`Edit user ${u.username}`} onClick={() => handleEdit(u)}>
                 <Pencil className="size-3.5" />
               </Button>
             </TooltipTrigger>
@@ -408,7 +406,7 @@ export default function UsersPage() {
               <Button
                 variant="ghost"
                 size="icon-xs"
-                aria-label="Reset Password"
+                aria-label={`Reset password for ${u.username}`}
                 onClick={() => handleResetPassword(u)}
                 disabled={isSelf(u)}
               >
@@ -422,7 +420,7 @@ export default function UsersPage() {
               <Button
                 variant="ghost"
                 size="icon-xs"
-                aria-label={u.is_active !== false ? "Disable" : "Enable"}
+                aria-label={`${u.is_active !== false ? "Disable" : "Enable"} user ${u.username}`}
                 onClick={() => handleToggleStatus(u)}
                 disabled={isSelf(u)}
               >
@@ -442,7 +440,7 @@ export default function UsersPage() {
               <Button
                 variant="ghost"
                 size="icon-xs"
-                aria-label="Delete"
+                aria-label={`Delete user ${u.username}`}
                 className="text-destructive hover:text-destructive"
                 onClick={() => handleDelete(u)}
                 disabled={isSelf(u)}
@@ -590,31 +588,34 @@ export default function UsersPage() {
                 </div>
               </div>
               {!createForm.auto_generate && (
-                <div className="flex gap-2">
-                  <Input
-                    id="create-password"
-                    type="text"
-                    placeholder="Enter password"
-                    value={createForm.password}
-                    onChange={(e) =>
-                      setCreateForm((f) => ({ ...f, password: e.target.value }))
-                    }
-                    required
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() =>
-                      setCreateForm((f) => ({
-                        ...f,
-                        password: generateRandomPassword(),
-                      }))
-                    }
-                  >
-                    Generate
-                  </Button>
-                </div>
+                <>
+                  <div className="flex gap-2">
+                    <Input
+                      id="create-password"
+                      type="text"
+                      placeholder="Enter password"
+                      value={createForm.password}
+                      onChange={(e) =>
+                        setCreateForm((f) => ({ ...f, password: e.target.value }))
+                      }
+                      required
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() =>
+                        setCreateForm((f) => ({
+                          ...f,
+                          password: generateRandomPassword(),
+                        }))
+                      }
+                    >
+                      Generate
+                    </Button>
+                  </div>
+                  <PasswordPolicyHint password={createForm.password} />
+                </>
               )}
             </div>
             <div className="flex items-center gap-3">
@@ -670,6 +671,12 @@ export default function UsersPage() {
               }
             }}
           >
+            <div className="space-y-2">
+              <Label>Auth Source</Label>
+              <div data-testid="edit-auth-source">
+                <AuthSourceBadge provider={selectedUser?.auth_provider} />
+              </div>
+            </div>
             <div className="space-y-2">
               <Label htmlFor="edit-email">Email</Label>
               <Input

@@ -15,6 +15,7 @@ import { toast } from "sonner";
 
 import { groupsApi } from "@/lib/api/groups";
 import { adminApi } from "@/lib/api/admin";
+import { mutationErrorToast } from "@/lib/error-utils";
 import { invalidateGroup } from "@/lib/query-keys";
 import { useAuth } from "@/providers/auth-provider";
 import type { Group, GroupMember } from "@/types/groups";
@@ -112,7 +113,7 @@ export default function GroupsPage() {
       setCreateOpen(false);
       setForm(EMPTY_FORM);
     },
-    onError: () => toast.error("Failed to create group"),
+    onError: mutationErrorToast("Failed to create group"),
   });
 
   const updateMutation = useMutation({
@@ -124,7 +125,7 @@ export default function GroupsPage() {
       setEditOpen(false);
       setSelectedGroup(null);
     },
-    onError: () => toast.error("Failed to update group"),
+    onError: mutationErrorToast("Failed to update group"),
   });
 
   const deleteMutation = useMutation({
@@ -135,7 +136,7 @@ export default function GroupsPage() {
       setDeleteOpen(false);
       setSelectedGroup(null);
     },
-    onError: () => toast.error("Failed to delete group"),
+    onError: mutationErrorToast("Failed to delete group"),
   });
 
   const addMemberMutation = useMutation({
@@ -149,7 +150,7 @@ export default function GroupsPage() {
       invalidateGroup(queryClient, "groups");
       setAddUserId("");
     },
-    onError: () => toast.error("Failed to add member"),
+    onError: mutationErrorToast("Failed to add member"),
   });
 
   const removeMemberMutation = useMutation({
@@ -162,7 +163,7 @@ export default function GroupsPage() {
       });
       invalidateGroup(queryClient, "groups");
     },
-    onError: () => toast.error("Failed to remove member"),
+    onError: mutationErrorToast("Failed to remove member"),
   });
 
   // -- handlers --
@@ -540,6 +541,7 @@ export default function GroupsPage() {
                 <div className="relative w-48">
                   <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground" />
                   <Input
+                    aria-label="Filter members"
                     placeholder="Filter members..."
                     className="pl-8 h-8 text-xs"
                     value={memberSearch}

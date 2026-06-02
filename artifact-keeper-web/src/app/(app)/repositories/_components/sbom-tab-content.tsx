@@ -18,10 +18,11 @@ import {
 import { toast } from "sonner";
 
 import sbomApi from "@/lib/api/sbom";
-import { toUserMessage } from "@/lib/error-utils";
+import { mutationErrorToast } from "@/lib/error-utils";
 import type { SbomComponent, SbomFormat, CveHistoryEntry } from "@/types/sbom";
 import type { Artifact } from "@/types";
 
+import { VulnIdLink } from "@/components/common/vuln-id-link";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -93,9 +94,7 @@ export function SbomTabContent({ artifact }: SbomTabContentProps) {
       queryClient.invalidateQueries({ queryKey: ["sboms", artifact.id] });
       toast.success("SBOM generated successfully");
     },
-    onError: (err: unknown) => {
-      toast.error(toUserMessage(err, "Failed to generate SBOM"));
-    },
+    onError: mutationErrorToast("Failed to generate SBOM"),
   });
 
   // Download SBOM as JSON
@@ -414,7 +413,7 @@ function CveHistoryRow({ cve }: { cve: CveHistoryEntry }) {
       />
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
-          <span className="font-medium text-sm">{cve.cve_id}</span>
+          <VulnIdLink id={cve.cve_id} />
           {cve.severity && (
             <Badge
               variant="outline"

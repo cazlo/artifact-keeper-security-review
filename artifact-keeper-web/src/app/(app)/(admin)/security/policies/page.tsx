@@ -6,6 +6,7 @@ import { Plus, Pencil, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import securityApi from "@/lib/api/security";
+import { mutationErrorToast } from "@/lib/error-utils";
 import type {
   ScanPolicy,
   CreatePolicyRequest,
@@ -224,6 +225,7 @@ export default function SecurityPoliciesPage() {
       setCreateForm({ ...DEFAULT_FORM });
       toast.success("Policy created.");
     },
+    onError: mutationErrorToast("Failed to create policy"),
   });
 
   const updateMutation = useMutation({
@@ -235,6 +237,7 @@ export default function SecurityPoliciesPage() {
       setSelectedPolicy(null);
       toast.success("Policy updated.");
     },
+    onError: mutationErrorToast("Failed to update policy"),
   });
 
   const deleteMutation = useMutation({
@@ -245,6 +248,7 @@ export default function SecurityPoliciesPage() {
       setSelectedPolicy(null);
       toast.success("Policy deleted.");
     },
+    onError: mutationErrorToast("Failed to delete policy"),
   });
 
   const handleEdit = useCallback((policy: ScanPolicy) => {
